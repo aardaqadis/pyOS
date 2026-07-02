@@ -1,6 +1,6 @@
 # pyOS
 
-pyOS is a Python desktop environment containing a graphical desktop, command center, virtual drives, file tools, media applications, Sticky Notes, an image viewer, and a MIDI composer.
+pyOS is a Python desktop environment containing a graphical desktop, command center, virtual drives, file tools, media applications, Sticky Notes and an image viewer.
 
 ## Install
 
@@ -79,7 +79,6 @@ Taskbar shortcuts display a small icon with their name below it.
 - Directories open in File Manager.
 - Images open in Image Viewer.
 - Audio and video open in Media Player.
-- MIDI files open in MIDI Composer.
 - Other files open in Text Editor.
 
 Click the taskbar clock to open a movable analogue clock and calendar. Use `<` and `>` to navigate between months.
@@ -138,21 +137,6 @@ Plays common audio and video formats with VLC.
 - Open, play/pause, stop, seek, mute, and adjust volume.
 - VLC Media Player and the `python-vlc` package must both be installed.
 - Setup can install VLC automatically on Windows through `winget`.
-
-### MIDI Composer
-
-Compose and play Standard MIDI files using a piano-roll interface.
-
-- Full MIDI note range: 0-127
-- Dynamically extending timeline
-- Horizontal and vertical scrolling
-- Up to 16 channel tracks
-- Independent instrument per track
-- MIDI Format 1 import/export
-- Hardware MIDI input recording
-- Hardware or Windows synthesizer output
-
-Use **+ Track** and **- Track** to manage tracks. Select a track before choosing its instrument. Use **+ 64 Steps** to extend the timeline manually; editing near its right edge also extends it automatically.
 
 ### Python IDE
 
@@ -251,10 +235,6 @@ winget install --id VideoLAN.VLC --exact
 ```
 
 Restart pyOS after installation.
-
-### MIDI Composer Is Silent
-
-Open MIDI Composer and verify an output is selected. On Windows, `Microsoft MIDI Mapper` or `Microsoft GS Wavetable Synth` should connect automatically. Use **Refresh** and **Connect** after changing devices.
 
 ### Browser Does Not Render HTML
 

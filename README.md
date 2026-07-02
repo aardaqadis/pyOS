@@ -2,6 +2,9 @@
 
 pyOS is a Python desktop environment containing a graphical desktop, command center, virtual drives, file tools, media applications, Sticky Notes and an image viewer.
 
+https://img.shields.io/badge/latest-releases-green%3Flogo%3Dgithub?link=https%3A%2F%2Fgithub.com%2Faardaqadis%2FpyOS%2Freleases%2F
+
+
 ## Install
 
 Python 3.10 or newer is recommended. On Windows, launch the setup wizard from PowerShell:

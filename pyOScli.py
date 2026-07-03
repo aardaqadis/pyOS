@@ -25,6 +25,7 @@ from pyos_config import (
     get_drive_b_dir,
     get_gui_settings_path,
 )
+from pyos_auth import authenticate, change_credentials_dialog, has_account
 
 def check_psutil():
     """Dynamically check if psutil is available"""
@@ -125,6 +126,8 @@ class PythonOS:
         self.current_directory = str(Path.home())
         self.command_history = []
         self.history_index = -1
+        self.authenticated = False
+        self.authenticated_username = None
         
         # Virtual Drives
         self.drive_a = VirtualDrive("A", is_temporary=True)  # Temporary storage
@@ -182,6 +185,8 @@ class PythonOS:
         settings_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Settings", menu=settings_menu)
         settings_menu.add_command(label="Theme Settings", command=self.open_theme_settings)
+        settings_menu.add_command(label="Change Account", command=self.change_cli_account)
+        settings_menu.add_command(label="Lock CLI", command=self.lock_cli)
         settings_menu.add_separator()
         settings_menu.add_command(label="Reset Theme", command=self.reset_theme)
         
@@ -201,7 +206,7 @@ class PythonOS:
         self.drive_var = tk.StringVar(value="Drive: C:")
         ttk.Label(status_frame, textvariable=self.drive_var, font=("Courier", 9, "bold")).pack(side=tk.LEFT, padx=5)
         
-        self.user_var = tk.StringVar(value=f"User: {os.getenv('USERNAME')}")
+        self.user_var = tk.StringVar(value="User: Locked" if has_account() else "User: Not configured")
         ttk.Label(status_frame, textvariable=self.user_var).pack(side=tk.LEFT, padx=20)
         
         self.time_var = tk.StringVar()
@@ -373,6 +378,37 @@ class PythonOS:
         self.theme.reset_to_defaults()
         self.apply_theme_changes()
         self.log_message("Theme reset to defaults!\n")
+
+    def ensure_authenticated(self):
+        """Authenticate once for the current CLI session."""
+        if self.authenticated:
+            return True
+        username = authenticate(self.root, cancellable=True)
+        if not username:
+            return False
+        self.authenticated = True
+        self.authenticated_username = username
+        self.user_var.set(f"User: {username}")
+        self.log_message(f"Authenticated as {username}.\n")
+        return True
+
+    def lock_cli(self):
+        """Require authentication again before the next command."""
+        self.authenticated = False
+        self.authenticated_username = None
+        self.user_var.set("User: Locked")
+        self.log_message("CLI locked. The next command requires authentication.\n")
+
+    def change_cli_account(self):
+        """Create or change the persistent pyOS account."""
+        if has_account() and not self.ensure_authenticated():
+            return
+        username = change_credentials_dialog(self.root)
+        if username:
+            self.authenticated = True
+            self.authenticated_username = username
+            self.user_var.set(f"User: {username}")
+            self.log_message("Account credentials changed.\n")
     
     def format_display_path(self, full_path):
         """Format path for display (replace drive root with 'root\\')"""
@@ -577,6 +613,8 @@ class PythonOS:
         """Execute command from input"""
         command = self.input_var.get().strip()
         if not command:
+            return
+        if not self.ensure_authenticated():
             return
         
         self.log_message(f"{self.format_display_path(self.current_directory)}> {command}\n")

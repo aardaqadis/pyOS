@@ -17,6 +17,7 @@ import functools
 from pathlib import Path
 
 from pyos_config import get_downloads_dir, get_drive_b_dir, get_gui_settings_path
+from pyos_auth import authenticate, change_credentials_dialog, get_username
 
 AUDIO_EXTENSIONS = {
     ".aac", ".aiff", ".flac", ".m4a", ".mid", ".midi", ".mp3", ".ogg", ".opus", ".wav", ".wma",
@@ -433,6 +434,7 @@ class DesktopGUI:
     """Windows-like desktop GUI"""
     def __init__(self, root):
         self.root = root
+        self.username = None
         self.settings_path = get_gui_settings_path()
         self.preferences = self.load_preferences()
         self.windows = []
@@ -505,6 +507,11 @@ class DesktopGUI:
         self.background_label.bind("<Button-1>", self.show_desktop_menu)
 
         self.apply_preferences()
+
+    def lock_desktop(self):
+        """Block all desktop interaction until valid credentials are supplied."""
+        self.username = authenticate(self.root, cancellable=False)
+        return self.username
 
     def resize_icon_layer(self, event):
         """Keep the draggable launcher area fitted to the desktop canvas."""
@@ -2652,9 +2659,11 @@ Features:
         appearance = tk.Frame(notebook, bg="white")
         clock = tk.Frame(notebook, bg="white")
         files = tk.Frame(notebook, bg="white")
+        security = tk.Frame(notebook, bg="white")
         notebook.add(appearance, text="Appearance")
         notebook.add(clock, text="Clock")
         notebook.add(files, text="Files")
+        notebook.add(security, text="Security")
 
         tk.Label(appearance, text="BACKGROUND", font=("Courier New", 11, "bold"), anchor=tk.W).pack(
             fill=tk.X, padx=16, pady=(10, 3)
@@ -2746,6 +2755,32 @@ Features:
             anchor=tk.W,
         ).pack(fill=tk.X, padx=16, pady=8)
 
+        account_name = tk.StringVar(value=get_username() or "Not configured")
+        tk.Label(security, text="PYOS ACCOUNT", font=("Courier New", 11, "bold"), anchor=tk.W).pack(
+            fill=tk.X, padx=16, pady=(18, 8)
+        )
+        tk.Label(security, textvariable=account_name, anchor=tk.W).pack(fill=tk.X, padx=16, pady=4)
+        tk.Label(
+            security,
+            text="Changing the account requires the current password.\nThe new credentials apply to both the desktop and CLI.",
+            justify=tk.LEFT,
+            anchor=tk.W,
+        ).pack(fill=tk.X, padx=16, pady=8)
+
+        def change_account_settings():
+            username = change_credentials_dialog(self.root)
+            if username:
+                self.username = username
+                account_name.set(username)
+                status.set("Account credentials changed.")
+
+        tk.Button(security, text="Change Username / Password", command=change_account_settings).pack(
+            anchor=tk.W, padx=16, pady=5
+        )
+        tk.Button(security, text="Lock Desktop Now", command=self.lock_desktop).pack(
+            anchor=tk.W, padx=16, pady=5
+        )
+
         def apply_settings():
             try:
                 selected_size = max(8, min(14, int(font_size.get())))
@@ -2834,6 +2869,7 @@ Created with Python & Tkinter
         context_menu.add_command(label="Open Media Player", command=self.open_media_player)
         context_menu.add_command(label="Open Calculator", command=self.open_calculator)
         context_menu.add_separator()
+        context_menu.add_command(label="Lock Desktop", command=self.lock_desktop)
         context_menu.add_command(label="Refresh", command=self.refresh_desktop)
         context_menu.add_command(label="About", command=self.show_about)
         
@@ -2848,6 +2884,8 @@ def main():
     """Main entry point"""
     root = tk.Tk()
     app = DesktopGUI(root)
+    root.update_idletasks()
+    app.lock_desktop()
     root.mainloop()
 
 

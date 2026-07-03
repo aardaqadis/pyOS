@@ -53,6 +53,16 @@ To run directly from this project:
 .venv\Scripts\python.exe pyOScli.py
 ```
 
+## Authentication
+
+On first use, pyOS asks you to create a username and password. The account is stored permanently in the configured shared data directory (or in your home directory when running without setup). Passwords are stored as salted PBKDF2-SHA256 hashes, not as plain text.
+
+- The desktop starts locked and cannot be used until the correct credentials are entered.
+- Use **Settings > Security** or the desktop context menu to lock the desktop again.
+- The CLI requests credentials immediately before it sends the first command. Authentication remains valid for that CLI session.
+- Use **Settings > Lock CLI** to require the password before the next command.
+- Username and password changes are available from the desktop Security settings and the CLI Settings menu. The current password is required.
+
 ## Desktop Basics
 
 - Click a desktop launcher to open its application.

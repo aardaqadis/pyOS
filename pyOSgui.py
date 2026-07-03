@@ -4241,6 +4241,27 @@ Created with Python & Tkinter
         messagebox.showinfo("Refresh", "Desktop refreshed!")
 
 
+DESKTOP_APP_LAUNCHERS = {
+    "files": "open_default_file_manager",
+    "games": "open_games_suite",
+    "snake": "open_snake",
+    "sudoku": "open_sudoku",
+    "chess": "open_chess",
+    "messenger": "open_messenger",
+    "calculator": "open_calculator",
+    "images": "open_image_viewer",
+    "notepad": "open_notepad",
+    "editor": "open_text_editor",
+    "media": "open_media_player",
+    "ide": "open_python_ide",
+    "browser": "open_browser",
+    "drive-a": "open_drive_a",
+    "drive-b": "open_drive_b",
+    "settings": "open_settings",
+    "about": "show_about",
+}
+
+
 def main():
     """Main entry point"""
     relaunch_in_configured_environment(__file__)
@@ -4249,6 +4270,12 @@ def main():
     root.update_idletasks()
     app.lock_desktop()
     app.start_notifications()
+    if len(sys.argv) >= 3 and sys.argv[1] == "--app":
+        launcher = DESKTOP_APP_LAUNCHERS.get(sys.argv[2].casefold())
+        if launcher:
+            root.after(0, getattr(app, launcher))
+        else:
+            messagebox.showerror("pyOS", f"Unknown desktop application: {sys.argv[2]}")
     root.mainloop()
 
 

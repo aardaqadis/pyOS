@@ -175,6 +175,26 @@ class PythonOS:
         apps_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Apps", menu=apps_menu)
         apps_menu.add_command(label="Desktop GUI", command=self.open_desktop_gui)
+        apps_menu.add_separator()
+        for label, app_name in (
+            ("File Manager", "files"),
+            ("Games Suite", "games"),
+            ("Snake", "snake"),
+            ("Sudoku", "sudoku"),
+            ("Automated Chess", "chess"),
+            ("Messenger", "messenger"),
+            ("Calculator", "calculator"),
+            ("Image Viewer", "images"),
+            ("Notepad", "notepad"),
+            ("Text Editor", "editor"),
+            ("Media Player", "media"),
+            ("Python IDE", "ide"),
+            ("Internet Browser", "browser"),
+        ):
+            apps_menu.add_command(
+                label=label,
+                command=lambda name=app_name: self.open_desktop_app(name),
+            )
         apps_menu.add_command(label="Browser Inspector", command=self.open_browser_inspector)
         apps_menu.add_command(label="Open Current Folder", command=lambda: self._open_explorer(self.current_directory))
         
@@ -695,6 +715,26 @@ class PythonOS:
                     self.log_message("Usage: play <audio-or-video-file>\n")
                 else:
                     self._play_media(" ".join(command_args))
+
+            elif command_name in {
+                "apps", "games", "snake", "sudoku", "chess", "messenger", "calculator",
+                "calc", "images", "imageviewer", "notepad", "editor", "ide",
+                "filemanager", "desktop_browser", "desktop_media", "pyos_settings",
+            }:
+                aliases = {
+                    "calc": "calculator", "imageviewer": "images", "filemanager": "files",
+                    "desktop_browser": "browser", "desktop_media": "media",
+                    "pyos_settings": "settings",
+                }
+                if command_name == "apps":
+                    self.log_message(
+                        "Desktop apps: filemanager, games, snake, sudoku, chess, messenger, "
+                        "calculator, images, notepad, editor, desktop_media, ide, "
+                        "desktop_browser, pyos_settings\n"
+                    )
+                else:
+                    app_name = aliases.get(command_name, command_name)
+                    self.root.after(0, lambda name=app_name: self.open_desktop_app(name))
 
             elif command_name == "browser":
                 url = " ".join(command_args) if command_args else "https://www.google.com"
@@ -1755,6 +1795,16 @@ class PythonOS:
             self.log_message("Desktop GUI opening in new window...\n")
         except Exception as e:
             self.log_message(f"Error opening desktop GUI: {e}\n")
+
+    def open_desktop_app(self, app_name):
+        """Open one pyOS desktop application directly from the command center."""
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        gui_path = os.path.join(script_dir, "pyOSgui.py")
+        try:
+            subprocess.Popen([sys.executable, gui_path, "--app", app_name])
+            self.log_message(f"Opening pyOS {app_name.replace('-', ' ')}...\n")
+        except Exception as error:
+            self.log_message(f"Could not open pyOS {app_name}: {error}\n")
     
     def show_commands_legacy(self):
         """Show available commands"""
@@ -1870,6 +1920,18 @@ FILES
   extract <file.zip>        Extract a ZIP archive
 
 APPLICATIONS
+  apps                      List pyOS desktop applications
+  filemanager               Open the pyOS file manager
+  games                     Open the games suite
+  snake | sudoku | chess    Open an individual game
+  messenger                 Open peer-to-peer Messenger
+  calculator | calc         Open the graphing calculator
+  images | imageviewer      Open the image viewer
+  notepad | editor          Open a note or text editor
+  desktop_media             Open the embedded media player
+  ide                       Open the Python IDE
+  desktop_browser           Open the embedded internet browser
+  pyos_settings             Open desktop settings
   play | media <file>       Play audio or video using VLC/default player
   browser [url]             Open the page source inspector
   browse <url>              Open a URL in the system browser

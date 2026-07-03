@@ -318,6 +318,13 @@ download <url>            Download to the configured downloads directory
 play <file>               Play audio or video
 ```
 
+### Desktop Applications
+
+The Command Center's **Apps** menu and CLI commands can launch every pyOS desktop
+application directly. Run `apps` to list them, or use commands such as
+`calculator`, `messenger`, `games`, `ide`, `notepad`, `images`,
+`desktop_browser`, and `desktop_media`.
+
 ### System and Console
 
 ```text

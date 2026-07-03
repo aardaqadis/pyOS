@@ -529,7 +529,12 @@ class PythonOS:
                 self.current_directory = full_path
             else:
                 try:
-                    os.startfile(full_path) if os.name == 'nt' else subprocess.Popen(['xdg-open', full_path])
+                    if os.name == 'nt':
+                        os.startfile(full_path)
+                    elif sys.platform == "darwin":
+                        subprocess.Popen(["open", full_path])
+                    else:
+                        subprocess.Popen(["xdg-open", full_path])
                     self.log_message(f"Opening: {full_path}\n")
                 except Exception as e:
                     self.log_message(f"Error opening file: {e}\n")

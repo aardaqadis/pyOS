@@ -6,7 +6,10 @@ pyOS is a Python desktop environment containing a graphical desktop, command cen
 
 ## Install
 
-Python 3.10 or newer is recommended. On Windows, launch the setup wizard from PowerShell:
+To get started, either download the source code from the releases page for the latest safe build, or the source code of the latest commit.
+Python 3.10 or newer is recommended. 
+
+On Windows, launch the setup wizard from PowerShell:
 
 ```powershell
 python setup.py
@@ -91,6 +94,8 @@ Click the taskbar clock to open a movable analogue clock and calendar. Use `<` a
 
 ### File Manager
 
+<img width="827" height="532" alt="image" src="https://github.com/user-attachments/assets/04271260-6e98-4659-84be-9463cbcd7269" />
+
 Browse the home directory and virtual drives. Toolbar shortcuts provide direct access to:
 
 - **Home**: your user home directory
@@ -101,9 +106,13 @@ Double-click a directory to enter it or a file to open it in the appropriate pyO
 
 ### Text Editor
 
+<img width="810" height="525" alt="image" src="https://github.com/user-attachments/assets/9e0c1956-97f8-4e99-8094-b98668db7339" />
+
 Opens text and arbitrary binary files using replacement characters for undecodable bytes. It supports new, open, save, undo, and `Ctrl+S`.
 
 ### Sticky Notes
+
+<img width="338" height="333" alt="image" src="https://github.com/user-attachments/assets/719e01e9-983d-4655-ac41-3edf614027a5" />
 
 Creates independent memory-only notes.
 
@@ -116,6 +125,8 @@ Creates independent memory-only notes.
 
 ### Internet Browser
 
+<img width="874" height="583" alt="image" src="https://github.com/user-attachments/assets/8aebe4dc-3b38-442f-aeeb-893aca27c23b" />
+
 Enter a URL and select **Go**. The browser can render HTML/CSS when `tkinterweb` is available.
 
 - **Inspect**: displays HTML source, final URL, HTTP status, response headers, and page size.
@@ -125,6 +136,8 @@ Enter a URL and select **Go**. The browser can render HTML/CSS when `tkinterweb`
 Page inspection is limited to 10 MB.
 
 ### Image Viewer
+
+<img width="848" height="589" alt="image" src="https://github.com/user-attachments/assets/63bad579-c314-49d2-8a3e-a66e6edd37f2" />
 
 Supports PNG, JPEG, BMP, ICO, TIFF, WebP, APNG, and animated GIF files.
 
@@ -136,6 +149,8 @@ Supports PNG, JPEG, BMP, ICO, TIFF, WebP, APNG, and animated GIF files.
 
 ### Media Player
 
+<img width="866" height="585" alt="image" src="https://github.com/user-attachments/assets/67f6fccc-d4a8-49d2-96dc-2f9662b883a2" />
+
 Plays common audio and video formats with VLC.
 
 - Open, play/pause, stop, seek, mute, and adjust volume.
@@ -143,6 +158,8 @@ Plays common audio and video formats with VLC.
 - Setup can install VLC automatically on Windows through `winget`.
 
 ### Python IDE
+
+<img width="952" height="666" alt="image" src="https://github.com/user-attachments/assets/5fb7b94e-fd0f-4ece-ad11-6a7c50d69bd2" />
 
 Edit, run, stop, and debug Python scripts. Program output appears in the embedded output console.
 
@@ -158,6 +175,8 @@ Settings are saved in the data directory selected by setup.
 - **Defaults** restores the monochrome color scheme
 
 ### Clock
+
+<img width="598" height="410" alt="image" src="https://github.com/user-attachments/assets/f3019cf1-907c-4b40-a767-37305253056b" />
 
 - 12-hour or 24-hour format
 - Optional seconds display
@@ -180,6 +199,8 @@ The shared setup configuration is stored in:
 ```
 
 ## Command Center
+
+<img width="1186" height="792" alt="image" src="https://github.com/user-attachments/assets/f5dc74e4-159e-4929-b3a3-d27b6e70e74c" />
 
 Run `help` in pyOS CLI for the complete command reference.
 

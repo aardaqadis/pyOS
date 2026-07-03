@@ -208,6 +208,8 @@ Run basic arithmetic and interactive graphical calculations.
 
 ### Peer-to-Peer Messenger
 
+<img width="892" height="617" alt="image" src="https://github.com/user-attachments/assets/04d51dc6-9917-493f-b703-2dd09ba54639" />
+
 Messenger discovers other running pyOS Messenger instances by their shared pyOS username on the same local network.
 
 - Send text and images directly to an online username.
@@ -218,6 +220,9 @@ Messenger discovers other running pyOS Messenger instances by their shared pyOS 
 Messenger is LAN-only: discovery uses local broadcasts and messages use direct TCP connections. Messages are not end-to-end encrypted. Connecting exposes your username, IP address, and online status to peers, and hackers or malicious peers could obtain information or send harmful content. Only use Messenger on trusted networks and only open images from people you trust.
 
 ### Notifications
+
+<img width="361" height="108" alt="image" src="https://github.com/user-attachments/assets/fdbe465b-017e-4ca8-80aa-1874e4f1e4ab" />
+
 
 pyOS displays dismissible desktop toasts for system events, Messenger messages, and rotating usage tips. Toasts close automatically and stack above the taskbar.
 

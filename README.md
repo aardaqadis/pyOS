@@ -175,6 +175,7 @@ Edit, run, stop, and debug Python scripts. Program output appears in the embedde
 
 ### Calculator
 
+<img width="1023" height="597" alt="image" src="https://github.com/user-attachments/assets/4f6d2f90-d459-4337-9328-9c29f3fd4054" />
 
 
 Run basic and graphic calculations.

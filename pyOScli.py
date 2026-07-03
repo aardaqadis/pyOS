@@ -269,7 +269,7 @@ class PythonOS:
         
         self.refresh_files()
         self.log_message("Type 'help' for commands\n")
-        self.log_message("pyOS - developed by Beckett\n\n")
+        self.log_message("pyOS - v1.0.1a\n\n")
         self.command_input.focus()
     
     def update_time(self):

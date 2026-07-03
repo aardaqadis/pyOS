@@ -12,6 +12,8 @@ import threading
 import sys
 import calendar
 import math
+import ast
+import functools
 from pathlib import Path
 
 from pyos_config import get_downloads_dir, get_drive_b_dir, get_gui_settings_path
@@ -26,6 +28,91 @@ MEDIA_EXTENSIONS = AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
 IMAGE_EXTENSIONS = {
     ".apng", ".bmp", ".gif", ".ico", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp",
 }
+
+CALCULATOR_FUNCTIONS = {
+    "abs": abs,
+    "sqrt": math.sqrt,
+    "sin": math.sin,
+    "cos": math.cos,
+    "tan": math.tan,
+    "asin": math.asin,
+    "acos": math.acos,
+    "atan": math.atan,
+    "log": math.log,
+    "log10": math.log10,
+    "exp": math.exp,
+    "floor": math.floor,
+    "ceil": math.ceil,
+}
+CALCULATOR_CONSTANTS = {"pi": math.pi, "e": math.e, "tau": math.tau}
+
+
+@functools.lru_cache(maxsize=256)
+def _parse_calculator_expression(expression):
+    try:
+        return ast.parse(expression, mode="eval")
+    except SyntaxError as error:
+        raise ValueError("Invalid expression.") from error
+
+
+def evaluate_calculator_expression(expression, x=None, variables=None):
+    """Evaluate a restricted mathematical expression without Python eval()."""
+    expression = expression.strip().replace("^", "**")
+    if not expression:
+        raise ValueError("Enter an expression.")
+    if len(expression) > 200:
+        raise ValueError("Expression is too long.")
+    tree = _parse_calculator_expression(expression)
+
+    binary_operators = {
+        ast.Add: lambda left, right: left + right,
+        ast.Sub: lambda left, right: left - right,
+        ast.Mult: lambda left, right: left * right,
+        ast.Div: lambda left, right: left / right,
+        ast.Mod: lambda left, right: left % right,
+        ast.Pow: lambda left, right: left ** right,
+    }
+    unary_operators = {ast.UAdd: lambda value: value, ast.USub: lambda value: -value}
+
+    def visit(node):
+        if isinstance(node, ast.Expression):
+            return visit(node.body)
+        if isinstance(node, ast.Constant) and type(node.value) in {int, float}:
+            return node.value
+        if isinstance(node, ast.Name):
+            if node.id == "x" and x is not None:
+                return x
+            if variables is not None and node.id in variables:
+                return variables[node.id]
+            if node.id in CALCULATOR_CONSTANTS:
+                return CALCULATOR_CONSTANTS[node.id]
+            raise ValueError(f"Unknown value: {node.id}")
+        if isinstance(node, ast.UnaryOp) and type(node.op) in unary_operators:
+            return unary_operators[type(node.op)](visit(node.operand))
+        if isinstance(node, ast.BinOp) and type(node.op) in binary_operators:
+            left = visit(node.left)
+            right = visit(node.right)
+            if isinstance(node.op, ast.Pow) and abs(right) > 1000:
+                raise ValueError("Exponent is too large.")
+            return binary_operators[type(node.op)](left, right)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            function = CALCULATOR_FUNCTIONS.get(node.func.id)
+            if function is None or node.keywords:
+                raise ValueError("Unsupported function.")
+            return function(*(visit(argument) for argument in node.args))
+        raise ValueError("Unsupported expression.")
+
+    try:
+        result = visit(tree)
+    except (ArithmeticError, OverflowError, TypeError) as error:
+        raise ValueError(str(error) or "Calculation failed.") from error
+    try:
+        finite = not isinstance(result, complex) and math.isfinite(float(result))
+    except (OverflowError, TypeError, ValueError):
+        finite = False
+    if not finite:
+        raise ValueError("Result is not a finite real number.")
+    return result
 
 class DesktopIcon:
     """A text-only desktop launcher styled like an early desktop OS."""
@@ -704,6 +791,14 @@ class DesktopGUI:
             self.open_image_viewer,
             10, 84
         )
+
+        self.calculator_icon = DesktopIcon(
+            self.icon_container,
+            "Calculator",
+            "calculator",
+            self.open_calculator,
+            120, 84
+        )
     
     def open_cli(self):
         """Open CLI application in its own process."""
@@ -1111,6 +1206,477 @@ class DesktopGUI:
 
         file_list.bind("<Double-Button-1>", open_selected)
         populate()
+
+    def open_calculator(self):
+        """Open a basic and graphing calculator."""
+        window = self.create_window("Calculator", width=700, height=560)
+        background = self.preferences.get("surface_bg", "#ffffff")
+        foreground = self.preferences.get("text_fg", "#000000")
+        chrome = self.preferences.get("chrome_bg", "#000000")
+
+        notebook = ttk.Notebook(window.content)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        basic = tk.Frame(notebook, bg=background)
+        graph = tk.Frame(notebook, bg=background)
+        notebook.add(basic, text="Basic")
+        notebook.add(graph, text="Graph")
+
+        variable_values = {
+            letter: tk.StringVar(value=str(math.e) if letter == "e" else "0")
+            for letter in "abcdefghijklmnopqrstuvwxyz"
+        }
+        variable_limits = {
+            letter: {"min": tk.StringVar(value="-10"), "max": tk.StringVar(value="10")}
+            for letter in "abcdefghijklmnopqrstuvwxyz"
+        }
+
+        def read_variables():
+            values = {}
+            for letter, variable in variable_values.items():
+                try:
+                    value = float(variable.get())
+                except ValueError as error:
+                    raise ValueError(f"Variable {letter} must be a number.") from error
+                if not math.isfinite(value):
+                    raise ValueError(f"Variable {letter} must be finite.")
+                values[letter] = value
+            return values
+
+        expression = tk.StringVar()
+        result_text = tk.StringVar(value="Ready")
+        display = tk.Entry(
+            basic,
+            textvariable=expression,
+            justify=tk.RIGHT,
+            font=("Courier New", 18),
+            bg=background,
+            fg=foreground,
+            insertbackground=foreground,
+            relief=tk.SUNKEN,
+            bd=2,
+        )
+        display.pack(fill=tk.X, padx=12, pady=(14, 4), ipady=8)
+        tk.Label(basic, textvariable=result_text, bg=background, fg=foreground, anchor=tk.E).pack(
+            fill=tk.X, padx=14, pady=(0, 8)
+        )
+
+        def calculate(event=None):
+            try:
+                value = evaluate_calculator_expression(expression.get(), variables=read_variables())
+                rendered = f"{value:.12g}"
+                expression.set(rendered)
+                result_text.set(f"= {rendered}")
+            except ValueError as error:
+                result_text.set(f"Error: {error}")
+            return "break"
+
+        def press(value):
+            if value == "C":
+                expression.set("")
+                result_text.set("Ready")
+            elif value == "DEL":
+                expression.set(expression.get()[:-1])
+            elif value == "=":
+                calculate()
+            else:
+                display.insert(tk.INSERT, value)
+                display.focus_set()
+
+        keypad = tk.Frame(basic, bg=background)
+        keypad.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
+        buttons = (
+            ("C", "DEL", "(", ")", "/"),
+            ("7", "8", "9", "*", "sqrt("),
+            ("4", "5", "6", "-", "^"),
+            ("1", "2", "3", "+", "pi"),
+            ("0", ".", "%", "e", "="),
+        )
+        for row_index, row in enumerate(buttons):
+            keypad.rowconfigure(row_index, weight=1)
+            for column_index, label in enumerate(row):
+                keypad.columnconfigure(column_index, weight=1)
+                tk.Button(
+                    keypad,
+                    text=label,
+                    command=lambda value=label: press(value),
+                    bg=background,
+                    fg=foreground,
+                    activebackground=chrome,
+                    activeforeground=self.preferences.get("chrome_fg", "#ffffff"),
+                    font=("Courier New", 11, "bold"),
+                ).grid(row=row_index, column=column_index, sticky="nsew", padx=2, pady=2)
+        display.bind("<Return>", calculate)
+
+        palette = ("#d32f2f", "#1976d2", "#388e3c", "#7b1fa2", "#f57c00", "#0097a7", "#c2185b")
+        graph_rows = []
+        redraw_after = {"id": None}
+        graph_status = tk.StringVar(value="Expressions may be written as y = ... or just ...")
+        ranges = {
+            "x min": tk.StringVar(value="-10"), "x max": tk.StringVar(value="10"),
+            "y min": tk.StringVar(value="-5"), "y max": tk.StringVar(value="5"),
+        }
+
+        graph_panes = tk.PanedWindow(graph, orient=tk.HORIZONTAL, sashwidth=5, bg=foreground)
+        graph_panes.pack(fill=tk.BOTH, expand=True)
+        sidebar = tk.Frame(graph_panes, bg=background, width=245)
+        graph_panes.add(sidebar, minsize=210)
+        plot_area = tk.Frame(graph_panes, bg=background)
+        graph_panes.add(plot_area, minsize=280)
+
+        side_tabs = ttk.Notebook(sidebar)
+        side_tabs.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        expressions_tab = tk.Frame(side_tabs, bg=background)
+        variables_tab = tk.Frame(side_tabs, bg=background)
+        side_tabs.add(expressions_tab, text="Expressions")
+        side_tabs.add(variables_tab, text="Variables")
+
+        expression_canvas = tk.Canvas(expressions_tab, bg=background, highlightthickness=0)
+        expression_scroll = ttk.Scrollbar(expressions_tab, orient=tk.VERTICAL, command=expression_canvas.yview)
+        expression_list = tk.Frame(expression_canvas, bg=background)
+        expression_window = expression_canvas.create_window((0, 0), window=expression_list, anchor=tk.NW)
+        expression_canvas.configure(yscrollcommand=expression_scroll.set)
+        expression_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        expression_canvas.pack(fill=tk.BOTH, expand=True)
+        expression_list.bind(
+            "<Configure>", lambda event: expression_canvas.configure(scrollregion=expression_canvas.bbox("all"))
+        )
+        expression_canvas.bind(
+            "<Configure>", lambda event: expression_canvas.itemconfigure(expression_window, width=event.width)
+        )
+
+        variable_canvas = tk.Canvas(variables_tab, bg=background, highlightthickness=0)
+        variable_scroll = ttk.Scrollbar(variables_tab, orient=tk.VERTICAL, command=variable_canvas.yview)
+        variable_list = tk.Frame(variable_canvas, bg=background)
+        variable_window = variable_canvas.create_window((0, 0), window=variable_list, anchor=tk.NW)
+        variable_canvas.configure(yscrollcommand=variable_scroll.set)
+        variable_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        variable_canvas.pack(fill=tk.BOTH, expand=True)
+        variable_list.bind(
+            "<Configure>", lambda event: variable_canvas.configure(scrollregion=variable_canvas.bbox("all"))
+        )
+        variable_canvas.bind(
+            "<Configure>", lambda event: variable_canvas.itemconfigure(variable_window, width=event.width)
+        )
+
+        tk.Label(
+            variable_list, text="Drag a slider or enter a value.\nMin/max set each slider's threshold.\nx is replaced by the graph position.",
+            bg=background, fg=foreground, justify=tk.LEFT,
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=6, pady=6)
+        variable_scales = {}
+
+        def apply_slider_bounds(letter, event=None):
+            try:
+                minimum = float(variable_limits[letter]["min"].get())
+                maximum = float(variable_limits[letter]["max"].get())
+                if not math.isfinite(minimum) or not math.isfinite(maximum) or minimum >= maximum:
+                    raise ValueError
+            except ValueError:
+                graph_status.set(f"Variable {letter}: min must be less than max.")
+                return "break"
+            scale = variable_scales[letter]
+            scale.configure(from_=minimum, to=maximum, resolution=max((maximum - minimum) / 500, 1e-9))
+            try:
+                current = float(variable_values[letter].get())
+            except ValueError:
+                current = minimum
+            variable_values[letter].set(f"{max(minimum, min(maximum, current)):.12g}")
+            schedule_graph()
+            return "break"
+
+        for index, letter in enumerate("abcdefghijklmnopqrstuvwxyz"):
+            row = index * 2 + 1
+            tk.Label(variable_list, text=f"{letter} =", bg=background, fg=foreground).grid(
+                row=row, column=0, sticky="e", padx=(6, 2), pady=(5, 0)
+            )
+            scale = tk.Scale(
+                variable_list, from_=-10, to=10, resolution=0.04, orient=tk.HORIZONTAL,
+                showvalue=False, variable=variable_values[letter], bg=background, fg=foreground,
+                highlightthickness=0, troughcolor="#d0d0d0",
+            )
+            scale.grid(row=row, column=1, sticky="ew", pady=(5, 0))
+            variable_scales[letter] = scale
+            entry = tk.Entry(
+                variable_list, textvariable=variable_values[letter], width=7,
+                bg=background, fg=foreground, insertbackground=foreground,
+            )
+            entry.grid(row=row, column=2, sticky="ew", padx=(3, 6), pady=(5, 0))
+            limits = tk.Frame(variable_list, bg=background)
+            limits.grid(row=row + 1, column=1, columnspan=2, sticky="ew", padx=(0, 6), pady=(0, 3))
+            tk.Label(limits, text="min", bg=background, fg=foreground).pack(side=tk.LEFT)
+            minimum_entry = tk.Entry(
+                limits, textvariable=variable_limits[letter]["min"], width=7,
+                bg=background, fg=foreground, insertbackground=foreground,
+            )
+            minimum_entry.pack(side=tk.LEFT, padx=(2, 8))
+            tk.Label(limits, text="max", bg=background, fg=foreground).pack(side=tk.LEFT)
+            maximum_entry = tk.Entry(
+                limits, textvariable=variable_limits[letter]["max"], width=7,
+                bg=background, fg=foreground, insertbackground=foreground,
+            )
+            maximum_entry.pack(side=tk.LEFT, padx=2)
+            for limit_entry in (minimum_entry, maximum_entry):
+                limit_entry.bind("<Return>", lambda event, name=letter: apply_slider_bounds(name, event))
+                limit_entry.bind("<FocusOut>", lambda event, name=letter: apply_slider_bounds(name, event))
+        variable_list.columnconfigure(1, weight=1)
+
+        range_bar = tk.Frame(plot_area, bg=background)
+        range_bar.pack(fill=tk.X, padx=6, pady=(6, 2))
+        for index, (label, variable) in enumerate(ranges.items()):
+            tk.Label(range_bar, text=label, bg=background, fg=foreground).grid(row=0, column=index * 2)
+            tk.Entry(range_bar, textvariable=variable, width=6, bg=background, fg=foreground).grid(
+                row=0, column=index * 2 + 1, padx=(2, 6)
+            )
+        tk.Label(
+            plot_area, text="Drag the graph to pan. Use the mouse wheel to zoom at the pointer.",
+            bg=background, fg=foreground, anchor=tk.W,
+        ).pack(fill=tk.X, padx=8)
+        tk.Label(plot_area, textvariable=graph_status, bg=background, fg=foreground, anchor=tk.W).pack(
+            fill=tk.X, padx=8
+        )
+        plot = tk.Canvas(plot_area, bg=background, highlightthickness=1, highlightbackground=foreground)
+        plot.pack(fill=tk.BOTH, expand=True, padx=7, pady=(2, 7))
+
+        def normalized_expression(text):
+            text = text.strip()
+            if "=" in text:
+                left, right = text.split("=", 1)
+                if left.strip().lower() != "y":
+                    raise ValueError("Equations must use the form y = expression.")
+                text = right.strip()
+            return text
+
+        def draw_graph(event=None):
+            redraw_after["id"] = None
+            plot.delete("all")
+            width, height = max(2, plot.winfo_width()), max(2, plot.winfo_height())
+            try:
+                xmin, xmax, ymin, ymax = (
+                    float(ranges[name].get()) for name in ("x min", "x max", "y min", "y max")
+                )
+                if not all(math.isfinite(value) for value in (xmin, xmax, ymin, ymax)):
+                    raise ValueError("Ranges must be finite numbers.")
+                if xmin >= xmax or ymin >= ymax:
+                    raise ValueError("Minimum ranges must be less than maximum ranges.")
+                if not math.isfinite(xmax - xmin) or not math.isfinite(ymax - ymin):
+                    raise ValueError("Ranges are too large.")
+                variables = read_variables()
+            except ValueError as error:
+                graph_status.set(f"Error: {error}")
+                return "break"
+
+            screen_x = lambda value: (value - xmin) / (xmax - xmin) * width
+            screen_y = lambda value: height - (value - ymin) / (ymax - ymin) * height
+
+            def grid_step(span):
+                rough_step = span / 10
+                magnitude = 10 ** math.floor(math.log10(rough_step))
+                normalized = rough_step / magnitude
+                if normalized <= 1:
+                    multiplier = 1
+                elif normalized <= 2:
+                    multiplier = 2
+                elif normalized <= 5:
+                    multiplier = 5
+                else:
+                    multiplier = 10
+                return multiplier * magnitude
+
+            x_step, y_step = grid_step(xmax - xmin), grid_step(ymax - ymin)
+            x_grid = math.ceil(xmin / x_step) * x_step
+            while x_grid <= xmax + x_step * 1e-9:
+                pixel = screen_x(x_grid)
+                plot.create_line(pixel, 0, pixel, height, fill="#b0b0b0", dash=(2, 4))
+                x_grid += x_step
+            y_grid = math.ceil(ymin / y_step) * y_step
+            while y_grid <= ymax + y_step * 1e-9:
+                pixel = screen_y(y_grid)
+                plot.create_line(0, pixel, width, pixel, fill="#b0b0b0", dash=(2, 4))
+                y_grid += y_step
+            if xmin <= 0 <= xmax:
+                plot.create_line(screen_x(0), 0, screen_x(0), height, fill=foreground, width=2)
+            if ymin <= 0 <= ymax:
+                plot.create_line(0, screen_y(0), width, screen_y(0), fill=foreground, width=2)
+
+            rendered, errors = 0, []
+            for row_number, row in enumerate(graph_rows, 1):
+                if not row["enabled"].get() or not row["expression"].get().strip():
+                    continue
+                try:
+                    formula = normalized_expression(row["expression"].get())
+                    validation_error = None
+                    for sample_x in (xmin, (xmin + xmax) / 2, xmax):
+                        try:
+                            evaluate_calculator_expression(formula, sample_x, variables)
+                            validation_error = None
+                            break
+                        except ValueError as error:
+                            validation_error = error
+                    if validation_error is not None:
+                        raise validation_error
+                except ValueError as error:
+                    errors.append(f"{row_number}: {error}")
+                    continue
+                previous = None
+                segment = []
+
+                def flush_segment():
+                    nonlocal rendered
+                    if len(segment) >= 4:
+                        plot.create_line(*segment, fill=row["color"], width=2, smooth=False)
+                        rendered += 1
+                    segment.clear()
+
+                for pixel_x in range(width):
+                    value_x = xmin + pixel_x / max(1, width - 1) * (xmax - xmin)
+                    try:
+                        value_y = float(evaluate_calculator_expression(formula, value_x, variables))
+                        pixel_y = screen_y(value_y)
+                        current = (pixel_x, pixel_y)
+                        if previous is not None and abs(pixel_y - previous[1]) < height * 1.5:
+                            if not segment:
+                                segment.extend(previous)
+                            segment.extend(current)
+                        else:
+                            flush_segment()
+                        if -height * 2 <= pixel_y <= height * 3:
+                            previous = current
+                        else:
+                            flush_segment()
+                            previous = None
+                    except (ValueError, OverflowError):
+                        flush_segment()
+                        previous = None
+                flush_segment()
+            if errors:
+                graph_status.set("Error " + "; ".join(errors[:2]))
+            else:
+                graph_status.set(f"Rendered {sum(r['enabled'].get() for r in graph_rows)} expression(s).")
+            return "break"
+
+        def schedule_graph(*args):
+            if redraw_after["id"] is not None:
+                self.root.after_cancel(redraw_after["id"])
+            redraw_after["id"] = self.root.after(16, draw_graph)
+
+        pan_state = {"start": None}
+
+        def current_ranges():
+            values = tuple(float(ranges[name].get()) for name in ("x min", "x max", "y min", "y max"))
+            if not all(math.isfinite(value) for value in values):
+                raise ValueError
+            return values
+
+        def set_ranges(xmin, xmax, ymin, ymax):
+            for name, value in zip(("x min", "x max", "y min", "y max"), (xmin, xmax, ymin, ymax)):
+                ranges[name].set(f"{value:.12g}")
+
+        def start_pan(event):
+            try:
+                pan_state["start"] = (event.x, event.y, *current_ranges())
+                plot.configure(cursor="fleur")
+            except ValueError:
+                pan_state["start"] = None
+
+        def pan_graph(event):
+            if pan_state["start"] is None:
+                return
+            start_x, start_y, xmin, xmax, ymin, ymax = pan_state["start"]
+            width, height = max(1, plot.winfo_width()), max(1, plot.winfo_height())
+            x_shift = -(event.x - start_x) / width * (xmax - xmin)
+            y_shift = (event.y - start_y) / height * (ymax - ymin)
+            set_ranges(xmin + x_shift, xmax + x_shift, ymin + y_shift, ymax + y_shift)
+
+        def finish_pan(event=None):
+            pan_state["start"] = None
+            plot.configure(cursor="crosshair")
+
+        def zoom_graph(event):
+            try:
+                xmin, xmax, ymin, ymax = current_ranges()
+            except ValueError:
+                return "break"
+            direction = event.delta if getattr(event, "delta", 0) else (1 if event.num == 4 else -1)
+            factor = 0.8 if direction > 0 else 1.25
+            width, height = max(1, plot.winfo_width()), max(1, plot.winfo_height())
+            center_x = xmin + event.x / width * (xmax - xmin)
+            center_y = ymax - event.y / height * (ymax - ymin)
+            new_xmin = center_x + (xmin - center_x) * factor
+            new_xmax = center_x + (xmax - center_x) * factor
+            new_ymin = center_y + (ymin - center_y) * factor
+            new_ymax = center_y + (ymax - center_y) * factor
+            set_ranges(new_xmin, new_xmax, new_ymin, new_ymax)
+            return "break"
+
+        def cancel_redraw(event):
+            if event.widget is plot and redraw_after["id"] is not None:
+                self.root.after_cancel(redraw_after["id"])
+                redraw_after["id"] = None
+
+        def remove_expression(row):
+            if len(graph_rows) == 1:
+                row["expression"].set("")
+            else:
+                graph_rows.remove(row)
+                row["frame"].destroy()
+            schedule_graph()
+
+        def cycle_color(row):
+            index = (palette.index(row["color"]) + 1) % len(palette)
+            row["color"] = palette[index]
+            row["color_button"].configure(bg=row["color"], activebackground=row["color"])
+            schedule_graph()
+
+        def add_expression(initial=""):
+            row = {
+                "expression": tk.StringVar(value=initial),
+                "enabled": tk.BooleanVar(value=True),
+                "color": palette[len(graph_rows) % len(palette)],
+            }
+            frame = tk.Frame(expression_list, bg=background, relief=tk.GROOVE, bd=1)
+            frame.pack(fill=tk.X, padx=3, pady=3)
+            row["frame"] = frame
+            tk.Checkbutton(
+                frame, variable=row["enabled"], bg=background, command=schedule_graph,
+                activebackground=background,
+            ).pack(side=tk.LEFT)
+            color_button = tk.Button(frame, width=2, bg=row["color"], activebackground=row["color"])
+            color_button.configure(command=lambda item=row: cycle_color(item))
+            color_button.pack(side=tk.LEFT, padx=(0, 3), pady=4)
+            row["color_button"] = color_button
+            entry = tk.Entry(
+                frame, textvariable=row["expression"], bg=background, fg=foreground,
+                insertbackground=foreground, font=("Courier New", 10),
+            )
+            entry.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=4)
+            entry.bind("<Return>", draw_graph)
+            entry.bind("<KeyRelease>", schedule_graph)
+            tk.Button(frame, text="x", width=2, command=lambda item=row: remove_expression(item)).pack(
+                side=tk.RIGHT, padx=3, pady=3
+            )
+            graph_rows.append(row)
+            entry.focus_set()
+            schedule_graph()
+
+        footer = tk.Frame(expressions_tab, bg=background)
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        tk.Button(footer, text="+ Add expression", command=add_expression).pack(
+            side=tk.LEFT, padx=4, pady=4
+        )
+        tk.Button(footer, text="Plot", command=draw_graph).pack(side=tk.RIGHT, padx=4, pady=4)
+        for variable in (*variable_values.values(), *ranges.values()):
+            variable.trace_add("write", schedule_graph)
+        plot.bind("<Configure>", schedule_graph)
+        plot.bind("<Destroy>", cancel_redraw)
+        plot.bind("<ButtonPress-1>", start_pan)
+        plot.bind("<B1-Motion>", pan_graph)
+        plot.bind("<ButtonRelease-1>", finish_pan)
+        plot.bind("<MouseWheel>", zoom_graph)
+        plot.bind("<Button-4>", zoom_graph)
+        plot.bind("<Button-5>", zoom_graph)
+        plot.configure(cursor="crosshair")
+        add_expression("y = sin(x)")
+        add_expression("y = x^2 / 5")
+        display.focus_set()
 
     def open_image_viewer(self, path=None):
         """Open an embedded image viewer for a file path."""
@@ -2266,6 +2832,7 @@ Created with Python & Tkinter
         context_menu.add_command(label="Open Internet Browser", command=self.open_browser)
         context_menu.add_command(label="Open Python IDE", command=self.open_python_ide)
         context_menu.add_command(label="Open Media Player", command=self.open_media_player)
+        context_menu.add_command(label="Open Calculator", command=self.open_calculator)
         context_menu.add_separator()
         context_menu.add_command(label="Refresh", command=self.refresh_desktop)
         context_menu.add_command(label="About", command=self.show_about)

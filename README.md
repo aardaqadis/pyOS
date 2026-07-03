@@ -163,6 +163,13 @@ Plays common audio and video formats with VLC.
 
 Edit, run, stop, and debug Python scripts. Program output appears in the embedded output console.
 
+### Calculator
+
+
+
+Run basic and graphic calculations.
+Supports functions such as sqrt, sin, cos, tan and logarithms, and holds constants pi, e and tau along with variables a-z.
+
 ## Settings
 
 Settings are saved in the data directory selected by setup.

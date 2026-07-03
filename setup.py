@@ -17,7 +17,9 @@ from pyos_config import CONFIG_FILE, save_config
 
 
 SOURCE_DIR = Path(__file__).resolve().parent
-APPLICATION_FILES = ("pyOSgui.py", "pyOScli.py", "pyos_config.py", "setup.py", "README.md")
+APPLICATION_FILES = (
+    "pyOSgui.py", "pyOScli.py", "pyos_config.py", "pyos_auth.py", "setup.py", "README.md"
+)
 PYTHON_PACKAGES = (
     "Pillow>=12.0",
     "mido>=1.3",
@@ -63,7 +65,7 @@ class InstallerCore:
         return self.venv_dir / "bin" / "python"
 
     def validate(self):
-        missing = [name for name in APPLICATION_FILES[:4] if not (SOURCE_DIR / name).is_file()]
+        missing = [name for name in APPLICATION_FILES[:5] if not (SOURCE_DIR / name).is_file()]
         if missing:
             raise FileNotFoundError(f"Setup source files are missing: {', '.join(missing)}")
         for path in (self.install_dir, self.data_dir, self.downloads_dir):

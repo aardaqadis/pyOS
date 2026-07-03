@@ -228,6 +228,8 @@ pyOS displays dismissible desktop toasts for system events, Messenger messages, 
 
 ### Games Suite
 
+<img width="1452" height="724" alt="image" src="https://github.com/user-attachments/assets/03c87b83-4acf-4873-bbb4-2f55bd2cec7f" />
+
 Open **Games Suite** from its desktop launcher or the desktop context menu.
 
 - **Snake**: control the snake with the arrow keys or WASD, collect food, and avoid walls and your own body. The game accelerates as the snake grows.

@@ -294,7 +294,7 @@ class DesktopWindow:
             text="◢",
             bg=surface_bg,
             fg=text_fg,
-            cursor="size_nw_se",
+            cursor="sizing",
             font=("Courier New", 10),
             width=2,
         )

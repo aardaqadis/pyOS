@@ -1,6 +1,6 @@
 # pyOS
 
-pyOS is a Python desktop environment containing a graphical desktop, authenticated command center, virtual drives, file tools, media applications, notifications, a graphing calculator, and peer-to-peer messaging.
+pyOS is a Python desktop environment containing a graphical desktop, authenticated command center, virtual drives, file tools, media applications, notifications, a games suite, a graphing calculator, and peer-to-peer messaging.
 
 <img width="685" height="387" alt="pyOS" src="https://github.com/user-attachments/assets/16bfe9df-7f53-4034-93d6-840e2414adef" />
 
@@ -79,6 +79,17 @@ On first use, pyOS asks you to create a username and password. The account is st
 
 The default appearance is monochrome. Open **Settings > Appearance** to change system colors or use a solid/image desktop background. Animated GIF backgrounds are supported.
 
+## System Bar
+
+The persistent top bar provides pyOS-wide controls:
+
+- **pyOS**: About, Lock Desktop, Run Setup, Restart pyOS, Restart and Run Setup, and Shut Down pyOS
+- **Applications**: shortcuts to core pyOS applications and Settings
+- **Window**: minimize all windows, restore all windows, or raise an individual open window
+- **Help**: display a usage tip or open About
+
+Restart and shutdown actions require confirmation. **Shut Down pyOS** closes the pyOS environment and its internal applications; it does not shut down the host operating system. **Restart and Run Setup** closes pyOS, runs the setup wizard, and relaunches pyOS after setup exits.
+
 ## Desktop Menu
 
 Left-click empty desktop space to access:
@@ -148,8 +159,10 @@ Enter a URL and select **Go**. The browser can render HTML/CSS when `tkinterweb`
 - **Inspect**: displays HTML source, final URL, HTTP status, response headers, and page size.
 - **Save Page**: downloads the loaded response.
 - **Network**: shows network traffic information when `psutil` is available.
+- **JavaScript**: enables experimental SpiderMonkey scripting and supported DOM events for the current browser window. It is off by default and should only be enabled for trusted websites.
 
 Page inspection is limited to 10 MB.
+JavaScript support is not equivalent to Chromium: modern sites may still fail because TkinterWeb implements a limited HTML/CSS and DOM environment.
 
 ### Image Viewer
 
@@ -207,6 +220,16 @@ Messenger is LAN-only: discovery uses local broadcasts and messages use direct T
 ### Notifications
 
 pyOS displays dismissible desktop toasts for system events, Messenger messages, and rotating usage tips. Toasts close automatically and stack above the taskbar.
+
+### Games Suite
+
+Open **Games Suite** from its desktop launcher or the desktop context menu.
+
+- **Snake**: control the snake with the arrow keys or WASD, collect food, and avoid walls and your own body. The game accelerates as the snake grows.
+- **Sudoku**: play generated 9 x 9 puzzles, validate entries, and highlight incorrect cells without exposing the solution.
+- **Automated Chess**: play White against a computer opponent. Legal movement, check, checkmate, castling, promotion, and draw rules are provided by the `chess` package installed through setup.
+
+All games run in movable, resizable, and minimizable pyOS windows.
 
 ## Settings
 
@@ -323,10 +346,10 @@ Restart pyOS after installation.
 Install the renderer:
 
 ```powershell
-.venv\Scripts\python.exe -m pip install tkinterweb
+.venv\Scripts\python.exe -m pip install "tkinterweb[javascript]>=4.25,<5.0"
 ```
 
-The source inspector remains available when rendering is unavailable.
+The source inspector remains available when rendering is unavailable. The JavaScript extra includes PythonMonkey's SpiderMonkey runtime and may take longer to install than the base renderer.
 
 ### Passkey Is Unavailable
 

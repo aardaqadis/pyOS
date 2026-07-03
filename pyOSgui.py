@@ -21,6 +21,8 @@ import time
 import uuid
 import queue
 import io
+import random
+import ipaddress
 from pathlib import Path
 
 from pyos_config import (
@@ -53,6 +55,35 @@ IMAGE_EXTENSIONS = {
 MESSENGER_DISCOVERY_PORT = 54545
 MESSENGER_MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MESSENGER_MAX_PACKET_BYTES = 8 * 1024 * 1024
+
+
+def browser_input_to_url(raw_value):
+    """Convert an address-bar value into a URL or a web-search URL."""
+    value = raw_value.strip()
+    if not value:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except ValueError:
+        parsed = None
+    if parsed and parsed.scheme.lower() in {"http", "https", "ftp", "file"}:
+        return value
+    looks_like_host = False
+    if not any(character.isspace() for character in value) and "@" not in value:
+        try:
+            host = urllib.parse.urlsplit("//" + value).hostname or ""
+            looks_like_host = host.casefold() == "localhost" or "." in host
+            if not looks_like_host and host:
+                try:
+                    ipaddress.ip_address(host)
+                    looks_like_host = True
+                except ValueError:
+                    pass
+        except ValueError:
+            looks_like_host = False
+    if looks_like_host:
+        return "https://" + value
+    return "https://www.bing.com/search?" + urllib.parse.urlencode({"q": value})
 
 
 class PeerMessenger:
@@ -747,6 +778,8 @@ class DesktopGUI:
         style.theme_use("clam")
         style.configure("TScale", background="white", troughcolor="white", bordercolor="black")
         style.configure("TScrollbar", background="white", troughcolor="white", bordercolor="black")
+
+        self.create_system_bar()
         
         # Desktop background
         self.desktop_canvas = tk.Canvas(self.root, bg="white", highlightthickness=0)
@@ -795,8 +828,163 @@ class DesktopGUI:
 
     def lock_desktop(self):
         """Block all desktop interaction until valid credentials are supplied."""
+        self.system_user_var.set("Locked")
         self.username = authenticate(self.root, cancellable=False)
+        self.system_user_var.set(self.username or "Locked")
         return self.username
+
+    def create_system_bar(self):
+        """Create the persistent top bar and its system menus."""
+        chrome = self.preferences.get("chrome_bg", "#000000")
+        chrome_text = self.preferences.get("chrome_fg", "#ffffff")
+        self.system_bar = tk.Frame(self.root, bg=chrome, height=32, relief=tk.RAISED, bd=1)
+        self.system_bar.pack(side=tk.TOP, fill=tk.X)
+        self.system_bar.pack_propagate(False)
+        self.system_menu_buttons = []
+
+        def add_menu(label, postcommand=None):
+            button = tk.Button(
+                self.system_bar, text=label, bg=chrome, fg=chrome_text,
+                activebackground=self.preferences.get("surface_bg", "#ffffff"),
+                activeforeground=self.preferences.get("text_fg", "#000000"),
+                relief=tk.FLAT, padx=10,
+            )
+            menu = tk.Menu(button, tearoff=0, postcommand=postcommand)
+            def post_menu(owner=button, target=menu):
+                target.post(owner.winfo_rootx(), owner.winfo_rooty() + owner.winfo_height())
+            button.configure(command=post_menu)
+            button._system_menu = menu
+            button.pack(side=tk.LEFT, fill=tk.Y)
+            self.system_menu_buttons.append(button)
+            return menu
+
+        system_menu = add_menu("pyOS")
+        system_menu.add_command(label="About pyOS", command=self.show_about)
+        system_menu.add_separator()
+        system_menu.add_command(label="Lock Desktop", command=self.lock_desktop)
+        system_menu.add_separator()
+        system_menu.add_command(label="Run Setup...", command=self.run_setup)
+        system_menu.add_command(label="Restart pyOS...", command=self.restart_pyos)
+        system_menu.add_command(label="Restart and Run Setup...", command=self.restart_and_setup)
+        system_menu.add_separator()
+        system_menu.add_command(label="Shut Down pyOS...", command=self.shutdown_pyos)
+
+        applications_menu = add_menu("Applications")
+        applications_menu.add_command(label="File Manager", command=self.open_default_file_manager)
+        applications_menu.add_command(label="Text Editor", command=self.open_text_editor)
+        applications_menu.add_command(label="Internet Browser", command=self.open_browser)
+        applications_menu.add_command(label="Messenger", command=self.open_messenger)
+        applications_menu.add_command(label="Calculator", command=self.open_calculator)
+        applications_menu.add_command(label="Games Suite", command=self.open_games_suite)
+        applications_menu.add_separator()
+        applications_menu.add_command(label="Settings", command=self.open_settings)
+
+        self.window_menu = add_menu("Window", self.rebuild_window_menu)
+
+        help_menu = add_menu("Help")
+        help_menu.add_command(label="Show a Tip", command=self.show_tip_now)
+        help_menu.add_command(label="About pyOS", command=self.show_about)
+
+        self.system_user_var = tk.StringVar(value="Locked")
+        self.system_user_label = tk.Label(
+            self.system_bar, textvariable=self.system_user_var, bg=chrome, fg=chrome_text,
+            font=("Courier New", 9, "bold"), padx=10,
+        )
+        self.system_user_label.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def rebuild_window_menu(self):
+        self.window_menu.delete(0, tk.END)
+        self.window_menu.add_command(label="Minimize All", command=self.minimize_all_windows)
+        self.window_menu.add_command(label="Restore All", command=self.restore_all_windows)
+        self.window_menu.add_separator()
+        if not self.windows:
+            self.window_menu.add_command(label="No Open Windows", state=tk.DISABLED)
+            return
+        for window in self.windows:
+            label = ("Restore " if window.minimized else "Show ") + window.title
+            self.window_menu.add_command(label=label, command=window.restore)
+
+    def minimize_all_windows(self):
+        for window in list(self.windows):
+            window.minimize()
+
+    def restore_all_windows(self):
+        for window in list(self.windows):
+            window.restore()
+
+    def show_tip_now(self):
+        tips = (
+            "Use the _ button to minimize apps into the taskbar.",
+            "Open the pyOS menu for lock, restart, setup, and shutdown controls.",
+            "The Window menu can minimize or restore every open pyOS app.",
+        )
+        self.show_notification("pyOS Tip", random.choice(tips), kind="system", duration=8000)
+
+    def _stop_services(self):
+        if self.messenger_service:
+            self.messenger_service.stop()
+
+    def shutdown_pyos(self):
+        if not messagebox.askyesno(
+            "Shut Down pyOS", "Close pyOS and all open pyOS applications?",
+            parent=self.root,
+        ):
+            return
+        self._stop_services()
+        self.root.destroy()
+
+    def restart_pyos(self):
+        if not messagebox.askyesno(
+            "Restart pyOS", "Close and restart pyOS now?", parent=self.root
+        ):
+            return
+        try:
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve())])
+        except OSError as error:
+            messagebox.showerror("Restart pyOS", f"Could not restart pyOS: {error}", parent=self.root)
+            return
+        self._stop_services()
+        self.root.destroy()
+
+    def run_setup(self):
+        setup_path = Path(__file__).resolve().with_name("setup.py")
+        if not setup_path.is_file():
+            messagebox.showerror("pyOS Setup", f"Setup was not found at:\n{setup_path}", parent=self.root)
+            return
+        try:
+            subprocess.Popen([sys.executable, str(setup_path)])
+            self.show_notification("pyOS System", "Setup opened in a separate window.")
+        except OSError as error:
+            messagebox.showerror("pyOS Setup", f"Could not open setup: {error}", parent=self.root)
+
+    def restart_and_setup(self):
+        if not messagebox.askyesno(
+            "Restart and Run Setup",
+            "Close pyOS, run setup, then launch pyOS again after setup closes?",
+            parent=self.root,
+        ):
+            return
+        setup_path = Path(__file__).resolve().with_name("setup.py")
+        if not setup_path.is_file():
+            messagebox.showerror("pyOS Setup", f"Setup was not found at:\n{setup_path}", parent=self.root)
+            return
+        helper = (
+            "import subprocess,sys; "
+            "subprocess.run([sys.argv[1],sys.argv[2]]); "
+            "subprocess.Popen([sys.argv[1],sys.argv[3]])"
+        )
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        try:
+            subprocess.Popen(
+                [sys.executable, "-c", helper, sys.executable, str(setup_path),
+                 str(Path(__file__).resolve())],
+                creationflags=creationflags,
+            )
+        except OSError as error:
+            messagebox.showerror("pyOS Setup", f"Could not start setup: {error}", parent=self.root)
+            return
+        self._stop_services()
+        self.root.destroy()
 
     def _shutdown_messenger(self, event):
         if event.widget is self.root and self.messenger_service:
@@ -1007,6 +1195,20 @@ class DesktopGUI:
         chrome_bg = self.preferences["chrome_bg"]
         chrome_fg = self.preferences["chrome_fg"]
         self.root.configure(bg=desktop_bg)
+        self.system_bar.configure(bg=chrome_bg)
+        self.system_user_label.configure(bg=chrome_bg, fg=chrome_fg)
+        for button in self.system_menu_buttons:
+            button.configure(
+                bg=chrome_bg, fg=chrome_fg,
+                activebackground=surface_bg, activeforeground=text_fg,
+            )
+            try:
+                button._system_menu.configure(
+                    bg=surface_bg, fg=text_fg,
+                    activebackground=chrome_bg, activeforeground=chrome_fg,
+                )
+            except tk.TclError:
+                pass
         self.desktop_canvas.configure(bg=desktop_bg)
         self.icon_container.configure(bg=desktop_bg)
         for launcher in self.icon_container.winfo_children():
@@ -1226,6 +1428,14 @@ class DesktopGUI:
             "messenger",
             self.open_messenger,
             230, 84
+        )
+
+        self.games_icon = DesktopIcon(
+            self.icon_container,
+            "Games Suite",
+            "games",
+            self.open_games_suite,
+            340, 84
         )
     
     def open_cli(self):
@@ -1634,6 +1844,369 @@ class DesktopGUI:
 
         file_list.bind("<Double-Button-1>", open_selected)
         populate()
+
+    def open_games_suite(self):
+        """Open the launcher for pyOS's small built-in games."""
+        window = self.create_window("Games Suite", width=560, height=390)
+        background = self.preferences.get("surface_bg", "#ffffff")
+        foreground = self.preferences.get("text_fg", "#000000")
+        tk.Label(
+            window.content, text="pyOS GAMES SUITE", bg=background, fg=foreground,
+            font=("Courier New", 18, "bold"),
+        ).pack(pady=(22, 8))
+        tk.Label(
+            window.content, text="Choose a game", bg=background, fg=foreground,
+            font=("Courier New", 11),
+        ).pack(pady=(0, 15))
+        games = (
+            ("SNAKE", "Eat food, grow, and avoid the walls.", self.open_snake),
+            ("SUDOKU", "Complete a generated 9 x 9 number puzzle.", self.open_sudoku),
+            ("AUTOMATED CHESS", "Play White against a computer opponent.", self.open_chess),
+        )
+        for title, description, command in games:
+            card = tk.Frame(window.content, bg=background, relief=tk.RAISED, bd=2)
+            card.pack(fill=tk.X, padx=35, pady=5)
+            tk.Button(
+                card, text=title, command=command, width=20, bg=background, fg=foreground,
+                font=("Courier New", 10, "bold"),
+            ).pack(side=tk.LEFT, padx=8, pady=8)
+            tk.Label(card, text=description, bg=background, fg=foreground, anchor=tk.W).pack(
+                side=tk.LEFT, fill=tk.X, expand=True, padx=5
+            )
+
+    def open_snake(self):
+        """Open a keyboard-controlled Snake game."""
+        window = self.create_window("Snake", width=570, height=540)
+        background = self.preferences.get("surface_bg", "#ffffff")
+        foreground = self.preferences.get("text_fg", "#000000")
+        status = tk.StringVar(value="Press Start, then use arrow keys or WASD.")
+        score = tk.StringVar(value="Score: 0")
+        header = tk.Frame(window.content, bg=background)
+        header.pack(fill=tk.X, padx=10, pady=7)
+        tk.Label(header, textvariable=score, bg=background, fg=foreground,
+                 font=("Courier New", 11, "bold")).pack(side=tk.LEFT)
+        tk.Label(header, textvariable=status, bg=background, fg=foreground).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=15
+        )
+        canvas = tk.Canvas(window.content, width=500, height=420, bg="#101010",
+                           highlightthickness=2, highlightbackground=foreground)
+        canvas.pack(padx=10, pady=(0, 6))
+        state = {"snake": [], "food": None, "direction": (1, 0), "next": (1, 0),
+                 "running": False, "after": None}
+        cell, columns, rows = 20, 25, 21
+
+        def place_food():
+            available = [(x, y) for x in range(columns) for y in range(rows)
+                         if (x, y) not in state["snake"]]
+            state["food"] = random.choice(available) if available else None
+
+        def draw():
+            canvas.delete("all")
+            if state["food"] is not None:
+                x, y = state["food"]
+                canvas.create_oval(x * cell + 3, y * cell + 3, (x + 1) * cell - 3,
+                                   (y + 1) * cell - 3, fill="#e53935", outline="")
+            for index, (x, y) in enumerate(state["snake"]):
+                color = "#9cff57" if index == 0 else "#43a047"
+                canvas.create_rectangle(x * cell + 1, y * cell + 1, (x + 1) * cell - 1,
+                                        (y + 1) * cell - 1, fill=color, outline="#101010")
+
+        def stop(message):
+            state["running"] = False
+            state["after"] = None
+            status.set(message)
+
+        def tick():
+            state["after"] = None
+            if not state["running"] or not window.frame.winfo_exists():
+                return
+            state["direction"] = state["next"]
+            dx, dy = state["direction"]
+            head = (state["snake"][0][0] + dx, state["snake"][0][1] + dy)
+            if (head[0] < 0 or head[0] >= columns or head[1] < 0 or head[1] >= rows
+                    or head in state["snake"][:-1]):
+                stop("Game over. Press New Game to try again.")
+                return
+            state["snake"].insert(0, head)
+            if head == state["food"]:
+                score.set(f"Score: {len(state['snake']) - 4}")
+                place_food()
+            else:
+                state["snake"].pop()
+            draw()
+            state["after"] = self.root.after(max(65, 150 - len(state["snake"]) * 2), tick)
+
+        def change_direction(direction):
+            current = state["direction"]
+            if direction != (-current[0], -current[1]):
+                state["next"] = direction
+
+        def key_pressed(event):
+            directions = {
+                "Left": (-1, 0), "a": (-1, 0), "A": (-1, 0),
+                "Right": (1, 0), "d": (1, 0), "D": (1, 0),
+                "Up": (0, -1), "w": (0, -1), "W": (0, -1),
+                "Down": (0, 1), "s": (0, 1), "S": (0, 1),
+            }
+            if event.keysym in directions:
+                change_direction(directions[event.keysym])
+                return "break"
+
+        def new_game():
+            if state["after"] is not None:
+                self.root.after_cancel(state["after"])
+            state.update(snake=[(8, 10), (7, 10), (6, 10), (5, 10)],
+                         direction=(1, 0), next=(1, 0), running=True, after=None)
+            score.set("Score: 0")
+            status.set("Running")
+            place_food()
+            draw()
+            canvas.focus_set()
+            state["after"] = self.root.after(150, tick)
+
+        tk.Button(window.content, text="New Game", command=new_game).pack(pady=(0, 7))
+        canvas.bind("<KeyPress>", key_pressed)
+        window.frame.bind("<Destroy>", lambda event: (
+            self.root.after_cancel(state["after"]) if event.widget is window.frame
+            and state["after"] is not None else None
+        ), add="+")
+        new_game()
+
+    def open_sudoku(self):
+        """Open a generated Sudoku puzzle."""
+        window = self.create_window("Sudoku", width=550, height=610)
+        background = self.preferences.get("surface_bg", "#ffffff")
+        foreground = self.preferences.get("text_fg", "#000000")
+        status = tk.StringVar(value="Fill every row, column, and 3 x 3 box with 1-9.")
+        tk.Label(window.content, textvariable=status, bg=background, fg=foreground).pack(pady=8)
+        board_frame = tk.Frame(window.content, bg=foreground, bd=3)
+        board_frame.pack(padx=15, pady=4)
+        entries = [[None for _ in range(9)] for _ in range(9)]
+        state = {"solution": None, "puzzle": None}
+        validation = (self.root.register(lambda value: value == "" or
+                                         (len(value) == 1 and value in "123456789")), "%P")
+        for row in range(9):
+            for column in range(9):
+                cell_frame = tk.Frame(
+                    board_frame, bg=foreground,
+                    padx=(2 if column % 3 == 0 else 0),
+                    pady=(2 if row % 3 == 0 else 0),
+                )
+                cell_frame.grid(row=row, column=column)
+                entry = tk.Entry(
+                    cell_frame, width=2, justify=tk.CENTER, font=("Courier New", 17, "bold"),
+                    validate="key", validatecommand=validation, relief=tk.FLAT,
+                )
+                entry.pack(ipadx=4, ipady=4, padx=1, pady=1)
+                entries[row][column] = entry
+
+        def generate_puzzle():
+            base = 3
+            pattern = lambda row, column: (base * (row % base) + row // base + column) % 9
+            groups = range(base)
+            rows = [group * base + row for group in random.sample(list(groups), base)
+                    for row in random.sample(list(groups), base)]
+            columns = [group * base + column for group in random.sample(list(groups), base)
+                       for column in random.sample(list(groups), base)]
+            numbers = random.sample(range(1, 10), 9)
+            solution = [[numbers[pattern(row, column)] for column in columns] for row in rows]
+            puzzle = [line[:] for line in solution]
+            for index in random.sample(range(81), 48):
+                puzzle[index // 9][index % 9] = 0
+            return puzzle, solution
+
+        def new_puzzle():
+            puzzle, solution = generate_puzzle()
+            state.update(puzzle=puzzle, solution=solution)
+            status.set("Fill every row, column, and 3 x 3 box with 1-9.")
+            for row in range(9):
+                for column in range(9):
+                    entry = entries[row][column]
+                    entry.configure(state=tk.NORMAL, bg="#ffffff", fg="#1565c0")
+                    entry.delete(0, tk.END)
+                    if puzzle[row][column]:
+                        entry.insert(0, str(puzzle[row][column]))
+                        entry.configure(state=tk.DISABLED, disabledbackground="#e0e0e0",
+                                        disabledforeground="#000000")
+
+        def check_puzzle():
+            incomplete = False
+            incorrect = 0
+            for row in range(9):
+                for column in range(9):
+                    entry = entries[row][column]
+                    if state["puzzle"][row][column]:
+                        continue
+                    value = entry.get()
+                    entry.configure(bg="#ffffff")
+                    if not value:
+                        incomplete = True
+                    elif int(value) != state["solution"][row][column]:
+                        entry.configure(bg="#ffcdd2")
+                        incorrect += 1
+            if incorrect:
+                status.set(f"{incorrect} incorrect cell(s) are highlighted.")
+            elif incomplete:
+                status.set("Correct so far, but the puzzle is incomplete.")
+            else:
+                status.set("Solved correctly!")
+                self.show_notification("Sudoku", "Puzzle solved correctly!", kind="system")
+
+        controls = tk.Frame(window.content, bg=background)
+        controls.pack(pady=8)
+        tk.Button(controls, text="New Puzzle", command=new_puzzle).pack(side=tk.LEFT, padx=5)
+        tk.Button(controls, text="Check", command=check_puzzle).pack(side=tk.LEFT, padx=5)
+        new_puzzle()
+
+    def open_chess(self):
+        """Open chess against a lightweight automated opponent."""
+        try:
+            import chess
+        except ImportError:
+            messagebox.showerror(
+                "Automated Chess",
+                "Chess requires the 'chess' package. Run setup again to install it.",
+                parent=self.root,
+            )
+            return
+        window = self.create_window("Automated Chess", width=670, height=700)
+        background = self.preferences.get("surface_bg", "#ffffff")
+        foreground = self.preferences.get("text_fg", "#000000")
+        status = tk.StringVar(value="You are White. Select a piece, then its destination.")
+        tk.Label(window.content, textvariable=status, bg=background, fg=foreground).pack(pady=6)
+        board_canvas = tk.Canvas(window.content, width=576, height=576, highlightthickness=2,
+                                 highlightbackground=foreground)
+        board_canvas.pack(padx=10, pady=4)
+        board = chess.Board()
+        state = {"selected": None, "thinking": False, "after": None}
+        size = 72
+        pieces = {
+            "K": "♔", "Q": "♕", "R": "♖", "B": "♗", "N": "♘", "P": "♙",
+            "k": "♚", "q": "♛", "r": "♜", "b": "♝", "n": "♞", "p": "♟",
+        }
+
+        def draw_board():
+            board_canvas.delete("all")
+            legal_targets = set()
+            if state["selected"] is not None:
+                legal_targets = {move.to_square for move in board.legal_moves
+                                 if move.from_square == state["selected"]}
+            for display_row in range(8):
+                for file_index in range(8):
+                    square = chess.square(file_index, 7 - display_row)
+                    x0, y0 = file_index * size, display_row * size
+                    color = "#f0d9b5" if (file_index + display_row) % 2 == 0 else "#8b5a2b"
+                    if square == state["selected"]:
+                        color = "#f6e05e"
+                    board_canvas.create_rectangle(x0, y0, x0 + size, y0 + size,
+                                                  fill=color, outline=color)
+                    if square in legal_targets:
+                        board_canvas.create_oval(x0 + 28, y0 + 28, x0 + 44, y0 + 44,
+                                                 fill="#43a047", outline="")
+                    piece = board.piece_at(square)
+                    if piece:
+                        board_canvas.create_text(x0 + size / 2, y0 + size / 2,
+                                                 text=pieces[piece.symbol()],
+                                                 font=("Segoe UI Symbol", 42))
+            for index, letter in enumerate("abcdefgh"):
+                board_canvas.create_text(index * size + 7, 568, text=letter,
+                                         anchor=tk.SW, font=("Courier New", 8, "bold"))
+
+        def material_score():
+            values = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3.2,
+                      chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 0}
+            return sum((1 if piece.color == chess.WHITE else -1) * values[piece.piece_type]
+                       for piece in board.piece_map().values())
+
+        def update_game_status():
+            if board.is_checkmate():
+                winner = "White" if board.turn == chess.BLACK else "Computer"
+                status.set(f"Checkmate. {winner} wins.")
+                self.show_notification("Automated Chess", f"Checkmate. {winner} wins.")
+                return True
+            if board.is_game_over():
+                status.set(f"Game over: {board.outcome().termination.name.replace('_', ' ').title()}.")
+                return True
+            return False
+
+        def choose_computer_move():
+            moves = list(board.legal_moves)
+            random.shuffle(moves)
+            best_move, best_score = moves[0], float("inf")
+            for move in moves:
+                board.push(move)
+                if board.is_checkmate():
+                    score = -10000
+                else:
+                    replies = list(board.legal_moves)
+                    if replies:
+                        reply_scores = []
+                        for reply in replies:
+                            board.push(reply)
+                            reply_scores.append(material_score())
+                            board.pop()
+                        score = max(reply_scores)
+                    else:
+                        score = material_score()
+                board.pop()
+                if score < best_score:
+                    best_move, best_score = move, score
+            return best_move
+
+        def computer_move():
+            state["after"] = None
+            if not window.frame.winfo_exists() or board.turn != chess.BLACK or board.is_game_over():
+                state["thinking"] = False
+                return
+            board.push(choose_computer_move())
+            state["thinking"] = False
+            draw_board()
+            if not update_game_status():
+                status.set("Your turn (White).")
+
+        def clicked(event):
+            if state["thinking"] or board.turn != chess.WHITE or board.is_game_over():
+                return
+            file_index, display_row = event.x // size, event.y // size
+            if not (0 <= file_index < 8 and 0 <= display_row < 8):
+                return
+            square = chess.square(file_index, 7 - display_row)
+            if state["selected"] is None:
+                piece = board.piece_at(square)
+                if piece and piece.color == chess.WHITE:
+                    state["selected"] = square
+                    draw_board()
+                return
+            candidates = [move for move in board.legal_moves
+                          if move.from_square == state["selected"] and move.to_square == square]
+            state["selected"] = None
+            if candidates:
+                move = next((candidate for candidate in candidates
+                             if candidate.promotion == chess.QUEEN), candidates[0])
+                board.push(move)
+                draw_board()
+                if not update_game_status():
+                    state["thinking"] = True
+                    status.set("Computer is thinking...")
+                    state["after"] = self.root.after(250, computer_move)
+            else:
+                draw_board()
+
+        def new_game():
+            if state["after"] is not None:
+                self.root.after_cancel(state["after"])
+            board.reset()
+            state.update(selected=None, thinking=False, after=None)
+            status.set("You are White. Select a piece, then its destination.")
+            draw_board()
+
+        board_canvas.bind("<Button-1>", clicked)
+        tk.Button(window.content, text="New Game", command=new_game).pack(pady=5)
+        window.frame.bind("<Destroy>", lambda event: (
+            self.root.after_cancel(state["after"]) if event.widget is window.frame
+            and state["after"] is not None else None
+        ), add="+")
+        draw_board()
 
     def open_messenger(self):
         """Open the LAN peer-to-peer text and image messenger."""
@@ -3049,12 +3622,15 @@ class DesktopGUI:
         toolbar = tk.Frame(window.content, bg="white", relief=tk.RAISED, bd=1)
         toolbar.pack(fill=tk.X)
 
-        tk.Label(toolbar, text="URL:", bg="white", fg="black").pack(side=tk.LEFT, padx=(6, 2), pady=5)
+        tk.Label(toolbar, text="Search or URL:", bg="white", fg="black").pack(
+            side=tk.LEFT, padx=(6, 2), pady=5
+        )
         url_var = tk.StringVar(value="https://example.com")
         url_entry = tk.Entry(toolbar, textvariable=url_var)
         url_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4, pady=5)
 
         status_var = tk.StringVar(value="Ready")
+        javascript_enabled = tk.BooleanVar(value=False)
         status_label = tk.Label(window.content, textvariable=status_var, bg="white", fg="black", anchor=tk.W)
         status_label.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=(0, 4))
 
@@ -3079,7 +3655,9 @@ class DesktopGUI:
                 status_var.set("Installing HTML/CSS renderer...")
                 self.root.update_idletasks()
                 try:
-                    subprocess.check_call([sys.executable, "-m", "pip", "install", "tkinterweb"])
+                    subprocess.check_call([
+                        sys.executable, "-m", "pip", "install", "tkinterweb[javascript]>=4.25,<5.0"
+                    ])
                     from tkinterweb import HtmlFrame
                     return HtmlFrame
                 except Exception as e:
@@ -3088,7 +3666,10 @@ class DesktopGUI:
 
         HtmlFrame = get_html_frame_class()
         if HtmlFrame:
-            html_frame = HtmlFrame(browser_area, messages_enabled=False)
+            html_frame = HtmlFrame(
+                browser_area, messages_enabled=False, javascript_enabled=False,
+                crash_prevention_enabled=True,
+            )
             html_frame.pack(fill=tk.BOTH, expand=True)
             renderer["html_frame"] = html_frame
         else:
@@ -3104,13 +3685,7 @@ class DesktopGUI:
             psutil_state["module"] = None
 
         def normalize_url(raw_url):
-            raw_url = raw_url.strip()
-            if not raw_url:
-                return ""
-            parsed = urllib.parse.urlparse(raw_url)
-            if not parsed.scheme:
-                raw_url = "https://" + raw_url
-            return raw_url
+            return browser_input_to_url(raw_url)
 
         def update_network_status(prefix="Ready"):
             psutil = psutil_state["module"]
@@ -3160,7 +3735,10 @@ class DesktopGUI:
                     url_var.set(final_url)
                     if html_frame:
                         html_frame.load_html(page_text, base_url=final_url)
-                        update_network_status(f"Rendered {final_url} | HTML/CSS active | JavaScript unavailable")
+                        javascript_state = "on" if javascript_enabled.get() else "off"
+                        update_network_status(
+                            f"Rendered {final_url} | HTML/CSS active | JavaScript {javascript_state}"
+                        )
                         return
                     set_source_content(page_text)
                     reason = renderer_error["message"] or "renderer unavailable"
@@ -3231,7 +3809,67 @@ class DesktopGUI:
             except OSError as error:
                 messagebox.showerror("Download Page", f"Could not save page: {error}")
 
+        def toggle_javascript():
+            html_frame = renderer["html_frame"]
+            if not html_frame:
+                javascript_enabled.set(False)
+                status_var.set("JavaScript requires the HTML renderer.")
+                return
+            if javascript_enabled.get():
+                try:
+                    import pythonmonkey  # noqa: F401
+                except ImportError:
+                    javascript_enabled.set(False)
+                    messagebox.showerror(
+                        "JavaScript",
+                        "PythonMonkey is not installed. Run setup again to install JavaScript support.",
+                        parent=self.root,
+                    )
+                    return
+                accepted = messagebox.askokcancel(
+                    "Enable Experimental JavaScript?",
+                    "JavaScript support is experimental and the available DOM is incomplete. "
+                    "Scripts from websites can be malicious and may expose data or affect pyOS.\n\n"
+                    "Only enable JavaScript for websites you trust. Continue?",
+                    parent=self.root,
+                )
+                if not accepted:
+                    javascript_enabled.set(False)
+                    return
+            try:
+                html_frame.configure(javascript_enabled=javascript_enabled.get())
+                if javascript_enabled.get():
+                    html_frame.javascript.eval("""
+                        for (const name of [
+                            "python", "require", "module", "exports", "__filename", "__dirname"
+                        ]) {
+                            try { globalThis[name] = undefined; } catch (error) {}
+                            try {
+                                Object.defineProperty(globalThis, name, {
+                                    value: undefined, writable: false, configurable: false
+                                });
+                            } catch (error) {}
+                        }
+                    """)
+                status_var.set(f"JavaScript {'enabled' if javascript_enabled.get() else 'disabled'}.")
+                if page_cache["url"]:
+                    load_url()
+            except Exception as error:
+                javascript_enabled.set(False)
+                try:
+                    html_frame.configure(javascript_enabled=False)
+                except Exception:
+                    pass
+                status_var.set(f"Could not change JavaScript mode: {error}")
+
         tk.Button(toolbar, text="Go", command=load_url).pack(side=tk.LEFT, padx=4, pady=4)
+        javascript_toggle = tk.Checkbutton(
+            toolbar, text="JavaScript", variable=javascript_enabled, command=toggle_javascript,
+            bg="white", fg="black",
+        )
+        javascript_toggle.pack(side=tk.LEFT, padx=4, pady=4)
+        if not renderer["html_frame"]:
+            javascript_toggle.configure(state=tk.DISABLED)
         tk.Button(toolbar, text="Inspect", command=inspect_page).pack(side=tk.LEFT, padx=4, pady=4)
         tk.Button(toolbar, text="Save Page", command=save_page).pack(side=tk.LEFT, padx=4, pady=4)
         tk.Button(toolbar, text="Network", command=lambda: update_network_status("Network status")).pack(
@@ -3241,7 +3879,7 @@ class DesktopGUI:
         )
         url_entry.bind("<Return>", load_url)
         if renderer["html_frame"]:
-            update_network_status("Ready | HTML/CSS renderer active | JavaScript unavailable")
+            update_network_status("Ready | HTML/CSS renderer active | JavaScript off")
         else:
             reason = renderer_error["message"] or "tkinterweb unavailable"
             update_network_status(f"Ready | HTML/CSS renderer missing: {reason}")
@@ -3590,6 +4228,7 @@ Created with Python & Tkinter
         context_menu.add_command(label="Open Media Player", command=self.open_media_player)
         context_menu.add_command(label="Open Calculator", command=self.open_calculator)
         context_menu.add_command(label="Open Messenger", command=self.open_messenger)
+        context_menu.add_command(label="Open Games Suite", command=self.open_games_suite)
         context_menu.add_separator()
         context_menu.add_command(label="Lock Desktop", command=self.lock_desktop)
         context_menu.add_command(label="Refresh", command=self.refresh_desktop)

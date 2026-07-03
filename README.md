@@ -12,6 +12,8 @@ Python 3.10 or newer is recommended. On Windows, launch the setup wizard from Po
 python setup.py
 ```
 
+On macOS you can double click "pyOS Desktop.command" for the GUI or "pyOS Command Center.command" for the CLI.
+
 The wizard lets you choose:
 
 - Application installation directory

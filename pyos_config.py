@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 from pathlib import Path
 
 
@@ -72,3 +73,23 @@ def get_cli_settings_path():
     if config.get("configured"):
         return get_data_dir() / "cli_settings.json"
     return Path.home() / ".pyOS_settings.json"
+
+
+def relaunch_in_configured_environment(script_path):
+    """Re-execute a directly launched script with setup's isolated Python."""
+    config = load_config()
+    if not config.get("configured"):
+        return False
+    install_dir = Path(config["install_dir"]).expanduser()
+    if os.name == "nt":
+        runtime = install_dir / ".venv" / "Scripts" / "python.exe"
+    else:
+        runtime = install_dir / ".venv" / "bin" / "python"
+    try:
+        if not runtime.is_file() or runtime.resolve() == Path(sys.executable).resolve():
+            return False
+        script = Path(script_path).resolve()
+        os.execv(str(runtime), [str(runtime), str(script), *sys.argv[1:]])
+    except OSError:
+        return False
+    return True

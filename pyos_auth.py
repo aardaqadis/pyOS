@@ -5,8 +5,10 @@ import hmac
 import json
 import os
 import secrets
+import base64
+import sys
 import tkinter as tk
-from tkinter import ttk
+from tkinter import simpledialog, ttk
 from pathlib import Path
 
 from pyos_config import get_data_dir, load_config
@@ -15,6 +17,8 @@ from pyos_config import get_data_dir, load_config
 PBKDF2_ITERATIONS = 600_000
 MIN_ITERATIONS = 100_000
 MAX_ITERATIONS = 2_000_000
+PASSKEY_RP_ID = "pyos.local"
+PASSKEY_ORIGIN = "https://pyos.local"
 
 
 def credentials_path():
@@ -69,7 +73,19 @@ def get_username():
     return credentials["username"] if credentials else None
 
 
-def _write_account(username, password):
+def _save_credentials(data):
+    path = credentials_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    try:
+        os.chmod(temporary, 0o600)
+    except OSError:
+        pass
+    temporary.replace(path)
+
+
+def _write_account(username, password, preserve_passkeys=False):
     salt = secrets.token_bytes(32)
     password_hash = hashlib.pbkdf2_hmac(
         "sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS
@@ -82,15 +98,11 @@ def _write_account(username, password):
         "salt": salt.hex(),
         "password_hash": password_hash.hex(),
     }
-    path = credentials_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    try:
-        os.chmod(temporary, 0o600)
-    except OSError:
-        pass
-    temporary.replace(path)
+    previous = load_credentials() if preserve_passkeys else None
+    if previous:
+        data["passkeys"] = previous.get("passkeys", [])
+        data["passkey_user_id"] = previous.get("passkey_user_id", secrets.token_hex(32))
+    _save_credentials(data)
     return data["username"]
 
 
@@ -128,7 +140,141 @@ def change_account(current_password, new_username, new_password):
     error = validate_account(new_username, new_password)
     if error:
         raise ValueError(error)
-    return _write_account(new_username, new_password)
+    return _write_account(new_username, new_password, preserve_passkeys=True)
+
+
+def has_passkey():
+    credentials = load_credentials()
+    return bool(credentials and credentials.get("passkeys"))
+
+
+def passkey_support_status():
+    """Return platform-passkey availability without prompting the user."""
+    if sys.platform != "win32":
+        return False, "Platform passkeys currently require Windows Hello."
+    try:
+        from fido2.client.windows import WindowsClient
+        if not WindowsClient.is_available():
+            return False, "The Windows WebAuthn API is unavailable on this device."
+        return True, "Windows Hello / WebAuthn is available."
+    except ImportError:
+        return False, "The fido2 package is not installed. Run setup again to install it."
+    except Exception as error:
+        return False, f"Could not access Windows WebAuthn: {error}"
+
+
+def _passkey_components(parent):
+    available, reason = passkey_support_status()
+    if not available:
+        raise RuntimeError(reason)
+    from fido2.client import DefaultClientDataCollector
+    from fido2.client.windows import WindowsClient
+    from fido2.server import Fido2Server
+
+    collector = DefaultClientDataCollector(PASSKEY_ORIGIN)
+    client = WindowsClient(collector, handle=parent.winfo_id())
+    server = Fido2Server({"id": PASSKEY_RP_ID, "name": "pyOS"})
+    return client, server
+
+
+def _stored_passkey_credentials(data):
+    from fido2.webauthn import AttestedCredentialData
+
+    credentials = []
+    for item in data.get("passkeys", []):
+        try:
+            credentials.append(AttestedCredentialData(base64.b64decode(item["credential_data"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return credentials
+
+
+def register_passkey(parent):
+    """Register a Windows Hello platform credential for the current account."""
+    data = load_credentials()
+    if not data:
+        raise RuntimeError("Create a pyOS account before adding a passkey.")
+    client, server = _passkey_components(parent)
+    existing = _stored_passkey_credentials(data)
+    user_id_hex = data.get("passkey_user_id") or secrets.token_hex(32)
+    options, state = server.register_begin(
+        {"id": bytes.fromhex(user_id_hex), "name": data["username"],
+         "displayName": data["username"]},
+        credentials=existing,
+        resident_key_requirement="required",
+        user_verification="required",
+        authenticator_attachment="platform",
+    )
+    response = client.make_credential(options["publicKey"])
+    auth_data = server.register_complete(state, response)
+    credential = auth_data.credential_data
+    if credential is None:
+        raise RuntimeError("Windows Hello did not return a usable credential.")
+    encoded = base64.b64encode(bytes(credential)).decode("ascii")
+    passkeys = list(data.get("passkeys", []))
+    passkeys.append({"credential_data": encoded, "provider": "Windows Hello"})
+    data["passkeys"] = passkeys
+    data["passkey_user_id"] = user_id_hex
+    _save_credentials(data)
+    return len(passkeys)
+
+
+def register_passkey_dialog(parent):
+    """Confirm the account password before invoking Windows Hello enrollment."""
+    data = load_credentials()
+    if not data:
+        raise RuntimeError("Create a pyOS account before adding a passkey.")
+    password = simpledialog.askstring(
+        "Register Passkey", "Enter the current password before registering Windows Hello:",
+        show="*", parent=parent,
+    )
+    if password is None:
+        return None
+    if not verify_credentials(data["username"], password):
+        raise ValueError("Current password is incorrect.")
+    return register_passkey(parent)
+
+
+def authenticate_passkey(parent):
+    """Verify a fresh Windows Hello assertion against the stored public key."""
+    data = load_credentials()
+    if not data or not data.get("passkeys"):
+        raise RuntimeError("No passkey is registered for this account.")
+    client, server = _passkey_components(parent)
+    credentials = _stored_passkey_credentials(data)
+    if not credentials:
+        raise RuntimeError("The stored passkey data is invalid.")
+    # Registration requires a discoverable credential, so let Windows Hello locate it
+    # by RP ID. Supplying an allow-list causes some Windows providers to report that a
+    # valid platform passkey does not exist before returning an assertion to verify.
+    options, state = server.authenticate_begin(None, user_verification="required")
+    public_key_options = options["publicKey"]
+    public_key_options["hints"] = ["client-device"]
+    selection = client.get_assertion(public_key_options)
+    response = selection.get_response(0)
+    server.authenticate_complete(state, credentials, response)
+    return data["username"]
+
+
+def remove_passkeys(password):
+    """Remove passkey public credentials from pyOS after password verification."""
+    data = load_credentials()
+    if not data or not verify_credentials(data["username"], password):
+        raise ValueError("Current password is incorrect.")
+    data.pop("passkeys", None)
+    data.pop("passkey_user_id", None)
+    _save_credentials(data)
+
+
+def remove_passkeys_dialog(parent):
+    password = simpledialog.askstring(
+        "Remove Passkeys", "Enter the current password to remove all pyOS passkeys:",
+        show="*", parent=parent,
+    )
+    if password is None:
+        return False
+    remove_passkeys(password)
+    return True
 
 
 class _AccountDialog:
@@ -204,6 +350,10 @@ class _AccountDialog:
             ttk.Button(buttons, text="Cancel", command=self.cancel).pack(side=tk.RIGHT, padx=(6, 0))
         action = {"create": "Create Account", "login": "Unlock", "change": "Save Account"}[mode]
         ttk.Button(buttons, text=action, command=self.submit).pack(side=tk.RIGHT)
+        if mode == "login" and has_passkey():
+            ttk.Button(buttons, text="Use Passkey", command=self.submit_passkey).pack(
+                side=tk.LEFT, padx=(0, 12)
+            )
 
         self.window.update_idletasks()
         x = parent.winfo_screenwidth() // 2 - self.window.winfo_reqwidth() // 2
@@ -239,6 +389,17 @@ class _AccountDialog:
             return "break"
         self.window.destroy()
         return "break"
+
+    def submit_passkey(self):
+        self.error.set("Waiting for Windows Hello...")
+        self.window.update_idletasks()
+        try:
+            self.result = authenticate_passkey(self.window)
+        except Exception as error:
+            self.result = None
+            self.error.set(f"Passkey failed: {error}")
+            return
+        self.window.destroy()
 
     def cancel(self, event=None):
         if not self.cancellable:

@@ -21,6 +21,7 @@ APPLICATION_FILES = (
     "pyOSgui.py", "pyOScli.py", "pyos_config.py", "pyos_auth.py", "setup.py", "README.md"
 )
 PYTHON_PACKAGES = (
+    "fido2>=2.2,<3.0",
     "Pillow>=12.0",
     "mido>=1.3",
     "pygame-ce>=2.5",

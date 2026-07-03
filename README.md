@@ -1,6 +1,6 @@
 # pyOS
 
-pyOS is a Python desktop environment containing a graphical desktop, command center, virtual drives, file tools, media applications, Sticky Notes and an image viewer.
+pyOS is a Python desktop environment containing a graphical desktop, authenticated command center, virtual drives, file tools, media applications, notifications, a graphing calculator, and peer-to-peer messaging.
 
 <img width="685" height="387" alt="pyOS" src="https://github.com/user-attachments/assets/16bfe9df-7f53-4034-93d6-840e2414adef" />
 
@@ -46,6 +46,8 @@ python setup.py --dry-run --no-vlc --no-shortcuts
 
 After setup, use the generated `pyOS GUI` or `pyOS CLI` shortcut.
 
+Directly launching `pyOSgui.py` or `pyOScli.py` after setup automatically switches to the configured isolated Python environment so installed dependencies such as `fido2` remain available.
+
 To run directly from this project:
 
 ```powershell
@@ -62,6 +64,8 @@ On first use, pyOS asks you to create a username and password. The account is st
 - The CLI requests credentials immediately before it sends the first command. Authentication remains valid for that CLI session.
 - Use **Settings > Lock CLI** to require the password before the next command.
 - Username and password changes are available from the desktop Security settings and the CLI Settings menu. The current password is required.
+- On supported Windows systems, **Settings > Security** can register a Windows Hello platform passkey. The lock screen then offers passwordless **Use Passkey** authentication while retaining the password as a fallback.
+- Passkey registration and removal require the current password. pyOS stores the public credential; Windows Hello retains the private key.
 
 ## Desktop Basics
 
@@ -69,6 +73,7 @@ On first use, pyOS asks you to create a username and password. The account is st
 - Drag launchers to move them; they snap to the desktop grid.
 - Drag an application title bar to move its window.
 - Drag the bottom-right handle to resize a window.
+- Select `_` to minimize an application into the taskbar.
 - Left-click empty desktop space to open the desktop menu.
 - Right-click the desktop for application shortcuts.
 
@@ -97,6 +102,7 @@ Taskbar shortcuts display a small icon with their name below it.
 - Images open in Image Viewer.
 - Audio and video open in Media Player.
 - Other files open in Text Editor.
+- Minimized applications appear as titled taskbar buttons. Click one to restore and raise its window.
 
 Click the taskbar clock to open a movable analogue clock and calendar. Use `<` and `>` to navigate between months.
 
@@ -178,8 +184,29 @@ Edit, run, stop, and debug Python scripts. Program output appears in the embedde
 <img width="1023" height="597" alt="image" src="https://github.com/user-attachments/assets/4f6d2f90-d459-4337-9328-9c29f3fd4054" />
 
 
-Run basic and graphic calculations.
-Supports functions such as sqrt, sin, cos, tan and logarithms, and holds constants pi, e and tau along with variables a-z.
+Run basic arithmetic and interactive graphical calculations.
+
+- Supports `sqrt`, trigonometric functions, logarithms, powers, modulo, and parentheses.
+- Provides constants `pi`, `e`, and `tau` through a restricted expression evaluator rather than Python `eval`.
+- Plot multiple enabled expressions as `y = expression` or plain expressions, each with an independent color.
+- Edit shared variables `a` through `z` directly or with sliders whose minimum and maximum thresholds are configurable.
+- Drag the graph and grid together to pan. Use the mouse wheel to zoom around the pointer.
+- Configure visible X and Y ranges manually.
+
+### Peer-to-Peer Messenger
+
+Messenger discovers other running pyOS Messenger instances by their shared pyOS username on the same local network.
+
+- Send text and images directly to an online username.
+- Preview received images and save them to disk.
+- Images are limited to 5 MB and incoming packets are validated before display.
+- Incoming messages generate desktop notifications, including while the Messenger window is closed.
+
+Messenger is LAN-only: discovery uses local broadcasts and messages use direct TCP connections. Messages are not end-to-end encrypted. Connecting exposes your username, IP address, and online status to peers, and hackers or malicious peers could obtain information or send harmful content. Only use Messenger on trusted networks and only open images from people you trust.
+
+### Notifications
+
+pyOS displays dismissible desktop toasts for system events, Messenger messages, and rotating usage tips. Toasts close automatically and stack above the taskbar.
 
 ## Settings
 
@@ -203,6 +230,18 @@ Settings are saved in the data directory selected by setup.
 
 - Show or hide dot-prefixed files
 - Select the default File Manager location: Home, Drive A, or Drive B
+
+### Security
+
+- Change the shared pyOS username and password
+- Register or remove a Windows Hello/WebAuthn platform passkey
+- Lock the desktop immediately
+
+### Notifications
+
+- Enable or disable all system notifications
+- Enable or disable rotating pyOS tips independently
+- Disabling system notifications also suppresses tips
 
 ## Virtual Drives
 
@@ -288,6 +327,16 @@ Install the renderer:
 ```
 
 The source inspector remains available when rendering is unavailable.
+
+### Passkey Is Unavailable
+
+Run setup again to install the supported `fido2` package into pyOS's isolated environment. Confirm that Windows Hello is configured and that **Settings > Security** reports WebAuthn support. Standalone script launches automatically reuse the configured environment after setup.
+
+If Windows no longer holds the registered credential, sign in with the password, remove the stale passkey from pyOS under **Settings > Security**, and register it again.
+
+### Messenger Does Not Find Another User
+
+Both users must open Messenger on devices connected to the same local network. Permit pyOS through the operating-system firewall when prompted. Guest Wi-Fi, client isolation, VPN policies, and routed networks may block peer discovery or direct connections.
 
 ### Reset Installation Locations
 

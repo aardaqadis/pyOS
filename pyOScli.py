@@ -24,6 +24,7 @@ from pyos_config import (
     get_downloads_dir,
     get_drive_b_dir,
     get_gui_settings_path,
+    relaunch_in_configured_environment,
 )
 from pyos_auth import authenticate, change_credentials_dialog, has_account
 
@@ -1928,6 +1929,7 @@ Built with Python & Tkinter
 
 
 if __name__ == "__main__":
+    relaunch_in_configured_environment(__file__)
     root = tk.Tk()
     app = PythonOS(root)
     root.mainloop()

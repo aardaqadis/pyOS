@@ -14,10 +14,30 @@ import calendar
 import math
 import ast
 import functools
+import base64
+import socket
+import struct
+import time
+import uuid
+import queue
+import io
 from pathlib import Path
 
-from pyos_config import get_downloads_dir, get_drive_b_dir, get_gui_settings_path
-from pyos_auth import authenticate, change_credentials_dialog, get_username
+from pyos_config import (
+    get_downloads_dir,
+    get_drive_b_dir,
+    get_gui_settings_path,
+    relaunch_in_configured_environment,
+)
+from pyos_auth import (
+    authenticate,
+    change_credentials_dialog,
+    get_username,
+    has_passkey,
+    passkey_support_status,
+    register_passkey_dialog,
+    remove_passkeys_dialog,
+)
 
 AUDIO_EXTENSIONS = {
     ".aac", ".aiff", ".flac", ".m4a", ".mid", ".midi", ".mp3", ".ogg", ".opus", ".wav", ".wma",
@@ -29,6 +49,202 @@ MEDIA_EXTENSIONS = AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
 IMAGE_EXTENSIONS = {
     ".apng", ".bmp", ".gif", ".ico", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp",
 }
+
+MESSENGER_DISCOVERY_PORT = 54545
+MESSENGER_MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MESSENGER_MAX_PACKET_BYTES = 8 * 1024 * 1024
+
+
+class PeerMessenger:
+    """LAN discovery and direct TCP transport for pyOS Messenger."""
+
+    def __init__(self, username, event_callback):
+        self.username = username
+        self.event_callback = event_callback
+        self.instance_id = uuid.uuid4().hex
+        self.peers = {}
+        self.history = []
+        self._lock = threading.Lock()
+        self._stopping = threading.Event()
+        self._udp = None
+        self._tcp = None
+        self.port = None
+
+    def start(self):
+        self._tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._tcp.bind(("0.0.0.0", 0))
+        self._tcp.listen(8)
+        self._tcp.settimeout(0.75)
+        self.port = self._tcp.getsockname()[1]
+
+        self._udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self._udp.bind(("", MESSENGER_DISCOVERY_PORT))
+        self._udp.settimeout(0.75)
+        for target in (self._listen_tcp, self._listen_discovery, self._announce_loop):
+            threading.Thread(target=target, daemon=True).start()
+
+    def stop(self):
+        self._stopping.set()
+        for connection in (self._udp, self._tcp):
+            if connection:
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+
+    def set_event_callback(self, callback):
+        self.event_callback = callback
+
+    def _emit(self, event, payload=None):
+        callback = self.event_callback
+        if callback:
+            callback(event, payload)
+
+    def _announcement(self):
+        return json.dumps({
+            "app": "pyos-messenger",
+            "version": 1,
+            "id": self.instance_id,
+            "username": self.username,
+            "port": self.port,
+        }).encode("utf-8")
+
+    def _announce_loop(self):
+        while not self._stopping.is_set():
+            packet = self._announcement()
+            for address in (("255.255.255.255", MESSENGER_DISCOVERY_PORT),
+                            ("127.0.0.1", MESSENGER_DISCOVERY_PORT)):
+                try:
+                    self._udp.sendto(packet, address)
+                except OSError:
+                    pass
+            self._expire_peers()
+            self._stopping.wait(3)
+
+    def _listen_discovery(self):
+        while not self._stopping.is_set():
+            try:
+                packet, address = self._udp.recvfrom(4096)
+                data = json.loads(packet.decode("utf-8"))
+                if data.get("app") != "pyos-messenger" or data.get("id") == self.instance_id:
+                    continue
+                username = str(data.get("username", "")).strip()
+                port = int(data.get("port", 0))
+                if not 3 <= len(username) <= 32 or not 1 <= port <= 65535:
+                    continue
+                with self._lock:
+                    self.peers[username.casefold()] = {
+                        "username": username, "host": address[0], "port": port,
+                        "seen": time.monotonic(), "id": data.get("id"),
+                    }
+                self._emit("peers", self.peer_names())
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+
+    def _expire_peers(self):
+        cutoff = time.monotonic() - 12
+        changed = False
+        with self._lock:
+            for key in [key for key, peer in self.peers.items() if peer["seen"] < cutoff]:
+                del self.peers[key]
+                changed = True
+        if changed:
+            self._emit("peers", self.peer_names())
+
+    def peer_names(self):
+        with self._lock:
+            return sorted((peer["username"] for peer in self.peers.values()), key=str.casefold)
+
+    def _listen_tcp(self):
+        while not self._stopping.is_set():
+            try:
+                connection, address = self._tcp.accept()
+                connection.settimeout(5)
+                threading.Thread(
+                    target=self._receive_connection, args=(connection, address), daemon=True
+                ).start()
+            except OSError:
+                continue
+
+    @staticmethod
+    def _receive_exact(connection, size):
+        chunks = bytearray()
+        while len(chunks) < size:
+            chunk = connection.recv(size - len(chunks))
+            if not chunk:
+                raise ConnectionError("Connection closed before the message was complete.")
+            chunks.extend(chunk)
+        return bytes(chunks)
+
+    def _receive_connection(self, connection, address):
+        try:
+            with connection:
+                size = struct.unpack("!I", self._receive_exact(connection, 4))[0]
+                if not 1 <= size <= MESSENGER_MAX_PACKET_BYTES:
+                    raise ValueError("Incoming message is too large.")
+                message = json.loads(self._receive_exact(connection, size).decode("utf-8"))
+            message = self._validate_message(message)
+            message.update(direction="incoming", host=address[0], timestamp=time.time())
+            with self._lock:
+                self.history.append(message)
+            self._emit("message", message)
+        except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError, ConnectionError) as error:
+            self._emit("error", f"Rejected incoming message: {error}")
+
+    @staticmethod
+    def _validate_message(message):
+        if not isinstance(message, dict) or message.get("protocol") != "pyos-message-1":
+            raise ValueError("Unsupported message format.")
+        sender = str(message.get("sender", "")).strip()
+        kind = message.get("kind")
+        if not 3 <= len(sender) <= 32 or kind not in {"text", "image"}:
+            raise ValueError("Invalid message metadata.")
+        validated = {"sender": sender, "kind": kind, "text": str(message.get("text", ""))[:10000]}
+        if kind == "image":
+            raw = base64.b64decode(message.get("data", ""), validate=True)
+            if len(raw) > MESSENGER_MAX_IMAGE_BYTES:
+                raise ValueError("Image exceeds the 5 MB limit.")
+            validated.update(
+                data=raw, filename=Path(str(message.get("filename", "image"))).name[:255]
+            )
+        return validated
+
+    def send_text(self, username, text):
+        text = text.strip()
+        if not text:
+            raise ValueError("Enter a message.")
+        return self._send(username, {"protocol": "pyos-message-1", "sender": self.username,
+                                     "kind": "text", "text": text[:10000]})
+
+    def send_image(self, username, path):
+        path = Path(path)
+        data = path.read_bytes()
+        if len(data) > MESSENGER_MAX_IMAGE_BYTES:
+            raise ValueError("Images must be 5 MB or smaller.")
+        return self._send(username, {
+            "protocol": "pyos-message-1", "sender": self.username, "kind": "image",
+            "text": "", "filename": path.name, "data": base64.b64encode(data).decode("ascii"),
+        })
+
+    def _send(self, username, message):
+        with self._lock:
+            peer = self.peers.get(username.casefold())
+        if not peer:
+            raise ValueError(f"{username} is no longer available.")
+        encoded = json.dumps(message, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > MESSENGER_MAX_PACKET_BYTES:
+            raise ValueError("Message is too large.")
+        with socket.create_connection((peer["host"], peer["port"]), timeout=5) as connection:
+            connection.sendall(struct.pack("!I", len(encoded)) + encoded)
+        local = self._validate_message(message)
+        local.update(direction="outgoing", recipient=peer["username"], timestamp=time.time())
+        with self._lock:
+            self.history.append(local)
+        self._emit("message", local)
+        return local
 
 CALCULATOR_FUNCTIONS = {
     "abs": abs,
@@ -271,6 +487,7 @@ class Taskbar:
         self.clock_24h = clock_24h
         self.show_seconds = show_seconds
         self.items = []
+        self.window_buttons = {}
         self.taskbar = tk.Frame(parent, bg="black", height=64, relief=tk.RAISED, bd=2)
         self.taskbar.pack(side=tk.BOTTOM, fill=tk.X)
         self.taskbar.pack_propagate(False)
@@ -279,6 +496,9 @@ class Taskbar:
         self.shortcuts_frame.pack(side=tk.LEFT, fill=tk.Y)
         for shortcut in desktop.preferences.get("taskbar_shortcuts", []):
             self.add_shortcut(shortcut)
+
+        self.windows_frame = tk.Frame(self.taskbar, bg="black")
+        self.windows_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(5, 0))
 
         # Time display on right
         self.time_label = tk.Label(self.taskbar, text="", font=("Courier New", 11, "bold"),
@@ -309,12 +529,37 @@ class Taskbar:
                 item.destroy()
                 self.items.remove((stored_path, item))
 
+    def add_minimized_window(self, window):
+        if window in self.window_buttons:
+            return
+        button = tk.Button(
+            self.windows_frame,
+            text=window.title[:18],
+            command=window.restore,
+            bg=self.desktop.preferences["chrome_bg"],
+            fg=self.desktop.preferences["chrome_fg"],
+            activebackground=self.desktop.preferences["surface_bg"],
+            activeforeground=self.desktop.preferences["text_fg"],
+            relief=tk.RAISED,
+            width=18,
+        )
+        button.pack(side=tk.LEFT, fill=tk.Y, padx=2, pady=5)
+        self.window_buttons[window] = button
+
+    def remove_minimized_window(self, window):
+        button = self.window_buttons.pop(window, None)
+        if button:
+            button.destroy()
+
     def apply_colors(self, background, foreground):
         self.taskbar.configure(bg=background)
         self.shortcuts_frame.configure(bg=background)
+        self.windows_frame.configure(bg=background)
         self.time_label.configure(bg=background, fg=foreground)
         for path, item in self.items:
             item.set_colors(background, foreground)
+        for button in self.window_buttons.values():
+            button.configure(bg=background, fg=foreground)
     
     def update_time(self):
         """Update time display"""
@@ -332,6 +577,8 @@ class DesktopWindow:
     def __init__(self, desktop, title, x=180, y=120, width=720, height=460):
         self.desktop = desktop
         self.canvas = desktop.desktop_canvas
+        self.title = title
+        self.minimized = False
         self.width = width
         self.height = height
         self.min_width = 320
@@ -373,6 +620,17 @@ class DesktopWindow:
             width=4,
         )
         self.close_button.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.minimize_button = tk.Button(
+            self.titlebar,
+            text="_",
+            command=self.minimize,
+            bg=chrome_bg,
+            fg=chrome_fg,
+            bd=0,
+            width=4,
+        )
+        self.minimize_button.pack(side=tk.RIGHT, fill=tk.Y)
 
         self.content = tk.Frame(self.frame, bg=surface_bg)
         self.content.pack(fill=tk.BOTH, expand=True)
@@ -424,10 +682,27 @@ class DesktopWindow:
         self.canvas.itemconfigure(self.window_id, width=new_width, height=new_height)
 
     def close(self):
+        self.desktop.taskbar.remove_minimized_window(self)
         self.canvas.delete(self.window_id)
         self.frame.destroy()
         if self in self.desktop.windows:
             self.desktop.windows.remove(self)
+
+    def minimize(self):
+        if self.minimized:
+            return
+        self.minimized = True
+        self.canvas.itemconfigure(self.window_id, state=tk.HIDDEN)
+        self.desktop.taskbar.add_minimized_window(self)
+
+    def restore(self):
+        if not self.minimized:
+            self.canvas.tag_raise(self.window_id)
+            return
+        self.minimized = False
+        self.canvas.itemconfigure(self.window_id, state=tk.NORMAL)
+        self.canvas.tag_raise(self.window_id)
+        self.desktop.taskbar.remove_minimized_window(self)
 
 
 class DesktopGUI:
@@ -435,6 +710,14 @@ class DesktopGUI:
     def __init__(self, root):
         self.root = root
         self.username = None
+        self.messenger_service = None
+        self.messenger_window = None
+        self.messenger_events = queue.Queue()
+        self.messenger_ui_handler = None
+        self.notification_toasts = []
+        self.tip_after = None
+        self.tip_index = 0
+        self._notifications_started = False
         self.settings_path = get_gui_settings_path()
         self.preferences = self.load_preferences()
         self.windows = []
@@ -507,11 +790,136 @@ class DesktopGUI:
         self.background_label.bind("<Button-1>", self.show_desktop_menu)
 
         self.apply_preferences()
+        self.root.bind("<Destroy>", self._shutdown_messenger, add="+")
+        self.root.after(200, self._poll_messenger_events)
 
     def lock_desktop(self):
         """Block all desktop interaction until valid credentials are supplied."""
         self.username = authenticate(self.root, cancellable=False)
         return self.username
+
+    def _shutdown_messenger(self, event):
+        if event.widget is self.root and self.messenger_service:
+            self.messenger_service.stop()
+
+    def _poll_messenger_events(self):
+        """Dispatch network events even while the Messenger window is closed."""
+        try:
+            while True:
+                event, payload = self.messenger_events.get_nowait()
+                handler = self.messenger_ui_handler
+                if handler:
+                    handler(event, payload)
+                elif event == "message" and payload.get("direction") == "incoming":
+                    summary = (payload.get("text") or f"Image: {payload.get('filename', 'image')}")[:90]
+                    self.show_notification(
+                        "Messenger", f"{payload.get('sender', 'Unknown')}: {summary}", kind="system"
+                    )
+                elif event == "error":
+                    self.show_notification("Messenger Error", str(payload), kind="system")
+        except queue.Empty:
+            pass
+        if self.root.winfo_exists():
+            self.root.after(200, self._poll_messenger_events)
+
+    def show_notification(self, title, message, kind="system", duration=6000):
+        """Display a non-blocking desktop toast when allowed by preferences."""
+        if not self.preferences.get("notifications_enabled", True):
+            return
+        if kind == "tip" and not self.preferences.get("tips_enabled", True):
+            return
+        chrome = self.preferences.get("chrome_bg", "#000000")
+        chrome_text = self.preferences.get("chrome_fg", "#ffffff")
+        surface = self.preferences.get("surface_bg", "#ffffff")
+        text = self.preferences.get("text_fg", "#000000")
+        frame = tk.Frame(self.root, bg=surface, relief=tk.RAISED, bd=3)
+        header = tk.Frame(frame, bg=chrome)
+        header.pack(fill=tk.X)
+        tk.Label(header, text=title, bg=chrome, fg=chrome_text,
+                 font=("Courier New", 9, "bold"), anchor=tk.W).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=7, pady=3
+        )
+        tk.Button(header, text="X", command=lambda: self.dismiss_notification(frame),
+                  bg=chrome, fg=chrome_text, bd=0, width=3).pack(side=tk.RIGHT, fill=tk.Y)
+        tk.Label(frame, text=message, bg=surface, fg=text, justify=tk.LEFT,
+                 anchor=tk.NW, wraplength=310).pack(fill=tk.BOTH, expand=True, padx=8, pady=7)
+        record = {"frame": frame, "kind": kind, "after": None}
+        self.notification_toasts.append(record)
+        record["after"] = self.root.after(duration, lambda: self.dismiss_notification(frame))
+        self._position_notifications()
+        frame.lift()
+
+    def dismiss_notification(self, frame):
+        for record in list(self.notification_toasts):
+            if record["frame"] is frame:
+                if record["after"] is not None:
+                    try:
+                        self.root.after_cancel(record["after"])
+                    except tk.TclError:
+                        pass
+                self.notification_toasts.remove(record)
+                if frame.winfo_exists():
+                    frame.destroy()
+                break
+        self._position_notifications()
+
+    def _position_notifications(self):
+        for index, record in enumerate(reversed(self.notification_toasts)):
+            record["frame"].place(
+                relx=1.0, rely=1.0, x=-12, y=-(76 + index * 98),
+                width=340, height=90, anchor=tk.SE,
+            )
+            record["frame"].lift()
+
+    def start_notifications(self):
+        if self._notifications_started:
+            return
+        self._notifications_started = True
+        if self.preferences.get("notifications_enabled", True):
+            self.root.after(
+                500,
+                lambda: self.show_notification(
+                    "pyOS System", f"Welcome, {self.username or 'user'}. pyOS is ready."
+                ),
+            )
+        self._schedule_next_tip(initial=True)
+
+    def _schedule_next_tip(self, initial=False):
+        if self.tip_after is not None:
+            try:
+                self.root.after_cancel(self.tip_after)
+            except tk.TclError:
+                pass
+            self.tip_after = None
+        if not (self.preferences.get("notifications_enabled", True)
+                and self.preferences.get("tips_enabled", True)):
+            return
+        delay = 7000 if initial else 90000
+        self.tip_after = self.root.after(delay, self._show_next_tip)
+
+    def _show_next_tip(self):
+        self.tip_after = None
+        tips = (
+            "Use the _ button to minimize an app. Restore it from the taskbar.",
+            "Drag an app's title bar to move it around the desktop.",
+            "The Calculator graph can be panned with the mouse and zoomed with the wheel.",
+            "Right-click the desktop for quick access to applications and Lock Desktop.",
+            "Settings controls appearance, notifications, security, files, and the clock.",
+        )
+        self.show_notification("pyOS Tip", tips[self.tip_index % len(tips)], kind="tip", duration=8000)
+        self.tip_index += 1
+        self._schedule_next_tip()
+
+    def apply_notification_preferences(self):
+        if not self.preferences.get("notifications_enabled", True):
+            for record in list(self.notification_toasts):
+                self.dismiss_notification(record["frame"])
+        elif not self.preferences.get("tips_enabled", True):
+            for record in list(self.notification_toasts):
+                if record["kind"] == "tip":
+                    self.dismiss_notification(record["frame"])
+        if self._notifications_started:
+            self._schedule_next_tip(initial=True)
 
     def resize_icon_layer(self, event):
         """Keep the draggable launcher area fitted to the desktop canvas."""
@@ -540,6 +948,8 @@ class DesktopGUI:
             "show_hidden_files": False,
             "file_manager_start": "Home",
             "taskbar_shortcuts": [],
+            "notifications_enabled": True,
+            "tips_enabled": True,
         }
         try:
             saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
@@ -578,6 +988,8 @@ class DesktopGUI:
             item for item in defaults["taskbar_shortcuts"]
             if isinstance(item, dict) and isinstance(item.get("path"), str)
         ][:12]
+        defaults["notifications_enabled"] = bool(defaults["notifications_enabled"])
+        defaults["tips_enabled"] = bool(defaults["tips_enabled"])
         return defaults
 
     def save_preferences(self):
@@ -610,6 +1022,7 @@ class DesktopGUI:
             window.titlebar.configure(bg=chrome_bg)
             window.title_label.configure(bg=chrome_bg, fg=chrome_fg)
             window.close_button.configure(bg=chrome_bg, fg=chrome_fg)
+            window.minimize_button.configure(bg=chrome_bg, fg=chrome_fg)
             window.resize_handle.configure(bg=surface_bg, fg=text_fg)
             if hasattr(window, "sticky_note"):
                 window.sticky_toolbar.configure(bg=surface_bg)
@@ -805,6 +1218,14 @@ class DesktopGUI:
             "calculator",
             self.open_calculator,
             120, 84
+        )
+
+        self.messenger_icon = DesktopIcon(
+            self.icon_container,
+            "Messenger",
+            "messenger",
+            self.open_messenger,
+            230, 84
         )
     
     def open_cli(self):
@@ -1213,6 +1634,237 @@ class DesktopGUI:
 
         file_list.bind("<Double-Button-1>", open_selected)
         populate()
+
+    def open_messenger(self):
+        """Open the LAN peer-to-peer text and image messenger."""
+        if self.messenger_window and self.messenger_window.frame.winfo_exists():
+            self.desktop_canvas.tag_raise(self.messenger_window.window_id)
+            return
+        if self.messenger_service is None:
+            accepted = messagebox.askokcancel(
+                "Peer-to-Peer Messenger Warning",
+                "SECURITY AND PRIVACY WARNING\n\n"
+                "Connecting exposes your pyOS username, IP address, and online status to other "
+                "pyOS users on the local network. Messages are sent directly and are not "
+                "end-to-end encrypted. Hackers or malicious peers could gain information about "
+                "you or send harmful content once connected.\n\n"
+                "Only connect on a trusted network and only open images from people you trust. "
+                "Continue?",
+                parent=self.root,
+            )
+            if not accepted:
+                return
+            username = get_username()
+            if not username:
+                messagebox.showerror("Messenger", "Create a pyOS account before using Messenger.")
+                return
+            try:
+                self.messenger_service = PeerMessenger(
+                    username, lambda event, payload: self.messenger_events.put((event, payload))
+                )
+                self.messenger_service.start()
+            except OSError as error:
+                if self.messenger_service:
+                    self.messenger_service.stop()
+                self.messenger_service = None
+                messagebox.showerror(
+                    "Messenger",
+                    f"Could not start peer discovery: {error}\nCheck firewall and port settings.",
+                )
+                return
+
+        while not self.messenger_events.empty():
+            try:
+                self.messenger_events.get_nowait()
+            except queue.Empty:
+                break
+        service = self.messenger_service
+        window = self.create_window("Peer-to-Peer Messenger", width=860, height=590)
+        self.messenger_window = window
+        background = self.preferences.get("surface_bg", "#ffffff")
+        foreground = self.preferences.get("text_fg", "#000000")
+        status = tk.StringVar(value=f"Online as {service.username}. Waiting for peers...")
+        selected_peer = tk.StringVar()
+        last_received_image = {"message": None}
+        image_references = []
+
+        warning = tk.Label(
+            window.content,
+            text="WARNING: P2P connections reveal network information. Hackers could gain information about you.",
+            bg="#fff2cc", fg="#8a1c1c", anchor=tk.W, justify=tk.LEFT, wraplength=800,
+        )
+        warning.pack(fill=tk.X, padx=7, pady=(7, 3))
+        body = tk.PanedWindow(window.content, orient=tk.HORIZONTAL, sashwidth=5, bg=foreground)
+        body.pack(fill=tk.BOTH, expand=True, padx=7, pady=4)
+        peer_frame = tk.Frame(body, bg=background, width=190)
+        chat_frame = tk.Frame(body, bg=background)
+        body.add(peer_frame, minsize=160)
+        body.add(chat_frame, minsize=400)
+
+        tk.Label(peer_frame, text="ONLINE USERS", bg=background, fg=foreground,
+                 font=("Courier New", 10, "bold")).pack(fill=tk.X, padx=5, pady=5)
+        peers = tk.Listbox(
+            peer_frame, bg=background, fg=foreground, selectbackground="#1976d2",
+            selectforeground="#ffffff", exportselection=False,
+        )
+        peers.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0, 5))
+
+        conversation = scrolledtext.ScrolledText(
+            chat_frame, state=tk.DISABLED, wrap=tk.WORD, bg=background, fg=foreground,
+            font=("Courier New", 10),
+        )
+        conversation.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        def choose_peer(event=None):
+            selection = peers.curselection()
+            selected_peer.set(peers.get(selection[0]) if selection else "")
+            status.set(f"Selected {selected_peer.get()}." if selection else "Select an online user.")
+
+        peers.bind("<<ListboxSelect>>", choose_peer)
+
+        def render_message(message):
+            direction = message.get("direction")
+            name = "You" if direction == "outgoing" else message.get("sender", "Unknown")
+            destination = f" to {message.get('recipient')}" if direction == "outgoing" else ""
+            stamp = datetime.fromtimestamp(message.get("timestamp", time.time())).strftime("%H:%M:%S")
+            conversation.configure(state=tk.NORMAL)
+            conversation.insert(tk.END, f"[{stamp}] {name}{destination}:\n")
+            if message.get("kind") == "text":
+                conversation.insert(tk.END, message.get("text", "") + "\n\n")
+            else:
+                conversation.insert(tk.END, f"[Image: {message.get('filename', 'image')}]\n")
+                try:
+                    from PIL import Image, ImageTk
+                    image = Image.open(io.BytesIO(message["data"]))
+                    if image.width * image.height > 25_000_000:
+                        raise ValueError("Image dimensions are too large to preview safely.")
+                    image.thumbnail((360, 240))
+                    photo = ImageTk.PhotoImage(image)
+                    image_references.append(photo)
+                    conversation.image_create(tk.END, image=photo)
+                    conversation.insert(tk.END, "\n\n")
+                except Exception:
+                    conversation.insert(tk.END, "Preview unavailable.\n\n")
+                if direction == "incoming":
+                    last_received_image["message"] = message
+            conversation.configure(state=tk.DISABLED)
+            conversation.see(tk.END)
+
+        for historic_message in service.history:
+            render_message(historic_message)
+
+        input_row = tk.Frame(chat_frame, bg=background)
+        input_row.pack(fill=tk.X, padx=5, pady=(0, 5))
+        message_text = tk.StringVar()
+        message_entry = tk.Entry(
+            input_row, textvariable=message_text, bg=background, fg=foreground,
+            insertbackground=foreground,
+        )
+        message_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        def run_send(action):
+            def worker():
+                try:
+                    action()
+                except (OSError, ValueError) as error:
+                    self.messenger_events.put(("error", f"Send failed: {error}"))
+            threading.Thread(target=worker, daemon=True).start()
+
+        def send_text(event=None):
+            recipient = selected_peer.get()
+            text = message_text.get()
+            if not recipient:
+                status.set("Select an online user first.")
+                return "break"
+            if not text.strip():
+                return "break"
+            message_text.set("")
+            run_send(lambda: service.send_text(recipient, text))
+            return "break"
+
+        def send_image():
+            recipient = selected_peer.get()
+            if not recipient:
+                status.set("Select an online user first.")
+                return
+
+            def selected(path):
+                path = Path(path)
+                if path.suffix.lower() not in IMAGE_EXTENSIONS:
+                    status.set("Choose a supported image file.")
+                    return
+                run_send(lambda: service.send_image(recipient, path))
+
+            self.open_file_picker(Path.home(), selected)
+
+        def save_received_image():
+            message = last_received_image["message"]
+            if not message:
+                status.set("No received image is available to save.")
+                return
+            destination = filedialog.asksaveasfilename(
+                parent=self.root,
+                title="Save Received Image",
+                initialdir=str(get_downloads_dir()),
+                initialfile=message.get("filename", "received-image"),
+            )
+            if destination:
+                try:
+                    Path(destination).write_bytes(message["data"])
+                    status.set(f"Saved {destination}")
+                except OSError as error:
+                    status.set(f"Could not save image: {error}")
+
+        tk.Button(input_row, text="Send", command=send_text).pack(side=tk.LEFT, padx=(4, 0))
+        tk.Button(input_row, text="Send Image", command=send_image).pack(side=tk.LEFT, padx=(4, 0))
+        tk.Button(input_row, text="Save Last Image", command=save_received_image).pack(
+            side=tk.LEFT, padx=(4, 0)
+        )
+        message_entry.bind("<Return>", send_text)
+        tk.Label(window.content, textvariable=status, bg=background, fg=foreground, anchor=tk.W).pack(
+            fill=tk.X, padx=9, pady=(0, 7)
+        )
+
+        def refresh_peers(names):
+            previous = selected_peer.get()
+            peers.delete(0, tk.END)
+            for name in names:
+                peers.insert(tk.END, name)
+            if previous in names:
+                index = names.index(previous)
+                peers.selection_set(index)
+                peers.activate(index)
+            elif previous:
+                selected_peer.set("")
+
+        refresh_peers(service.peer_names())
+
+        def handle_messenger_event(event, payload):
+            if not window.frame.winfo_exists():
+                return
+            if event == "peers":
+                refresh_peers(payload)
+            elif event == "message":
+                render_message(payload)
+                status.set("Message sent." if payload.get("direction") == "outgoing"
+                           else f"Message received from {payload.get('sender')}.")
+                if payload.get("direction") == "incoming":
+                    summary = (payload.get("text") or f"Image: {payload.get('filename', 'image')}")[:90]
+                    self.show_notification(
+                        "Messenger", f"{payload.get('sender', 'Unknown')}: {summary}", kind="system"
+                    )
+            elif event == "error":
+                status.set(payload)
+
+        def messenger_destroyed(event):
+            if event.widget is window.frame:
+                self.messenger_window = None
+                if self.messenger_ui_handler is handle_messenger_event:
+                    self.messenger_ui_handler = None
+
+        window.frame.bind("<Destroy>", messenger_destroyed, add="+")
+        self.messenger_ui_handler = handle_messenger_event
+        message_entry.focus_set()
 
     def open_calculator(self):
         """Open a basic and graphing calculator."""
@@ -2652,6 +3304,8 @@ Features:
         seconds = tk.BooleanVar(value=self.preferences["show_seconds"])
         hidden = tk.BooleanVar(value=self.preferences["show_hidden_files"])
         start_location = tk.StringVar(value=self.preferences["file_manager_start"])
+        notifications_enabled = tk.BooleanVar(value=self.preferences["notifications_enabled"])
+        tips_enabled = tk.BooleanVar(value=self.preferences["tips_enabled"])
         status = tk.StringVar()
 
         notebook = ttk.Notebook(window.content)
@@ -2660,10 +3314,12 @@ Features:
         clock = tk.Frame(notebook, bg="white")
         files = tk.Frame(notebook, bg="white")
         security = tk.Frame(notebook, bg="white")
+        notifications = tk.Frame(notebook, bg="white")
         notebook.add(appearance, text="Appearance")
         notebook.add(clock, text="Clock")
         notebook.add(files, text="Files")
         notebook.add(security, text="Security")
+        notebook.add(notifications, text="Notifications")
 
         tk.Label(appearance, text="BACKGROUND", font=("Courier New", 11, "bold"), anchor=tk.W).pack(
             fill=tk.X, padx=16, pady=(10, 3)
@@ -2755,6 +3411,22 @@ Features:
             anchor=tk.W,
         ).pack(fill=tk.X, padx=16, pady=8)
 
+        tk.Label(
+            notifications, text="DESKTOP NOTIFICATIONS", font=("Courier New", 11, "bold"), anchor=tk.W
+        ).pack(fill=tk.X, padx=16, pady=(18, 8))
+        tk.Checkbutton(
+            notifications, text="Enable system notifications", variable=notifications_enabled,
+            anchor=tk.W,
+        ).pack(fill=tk.X, padx=16, pady=5)
+        tk.Checkbutton(
+            notifications, text="Show pyOS tips", variable=tips_enabled, anchor=tk.W,
+        ).pack(fill=tk.X, padx=16, pady=5)
+        tk.Label(
+            notifications,
+            text="Turning off system notifications also suppresses tips.\nChanges apply after pressing Apply.",
+            justify=tk.LEFT, anchor=tk.W,
+        ).pack(fill=tk.X, padx=16, pady=10)
+
         account_name = tk.StringVar(value=get_username() or "Not configured")
         tk.Label(security, text="PYOS ACCOUNT", font=("Courier New", 11, "bold"), anchor=tk.W).pack(
             fill=tk.X, padx=16, pady=(18, 8)
@@ -2771,6 +3443,8 @@ Features:
             username = change_credentials_dialog(self.root)
             if username:
                 self.username = username
+                if self.messenger_service:
+                    self.messenger_service.username = username
                 account_name.set(username)
                 status.set("Account credentials changed.")
 
@@ -2780,6 +3454,48 @@ Features:
         tk.Button(security, text="Lock Desktop Now", command=self.lock_desktop).pack(
             anchor=tk.W, padx=16, pady=5
         )
+
+        passkey_state = tk.StringVar()
+        tk.Label(security, text="WINDOWS HELLO PASSKEY", font=("Courier New", 11, "bold"), anchor=tk.W).pack(
+            fill=tk.X, padx=16, pady=(18, 5)
+        )
+        tk.Label(security, textvariable=passkey_state, justify=tk.LEFT, anchor=tk.W, wraplength=540).pack(
+            fill=tk.X, padx=16, pady=4
+        )
+        passkey_buttons = tk.Frame(security, bg="white")
+        passkey_buttons.pack(fill=tk.X, padx=16, pady=5)
+
+        def refresh_passkey_state():
+            available, reason = passkey_support_status()
+            registered = has_passkey()
+            if registered:
+                passkey_state.set("Registered. Use 'Use Passkey' on the lock screen. Password fallback remains available.")
+            else:
+                passkey_state.set(reason if not available else "No passkey registered.")
+            add_passkey_button.configure(state=tk.NORMAL if available and not registered else tk.DISABLED)
+            remove_passkey_button.configure(state=tk.NORMAL if registered else tk.DISABLED)
+
+        def add_passkey():
+            try:
+                if register_passkey_dialog(self.root) is not None:
+                    status.set("Windows Hello passkey registered.")
+            except Exception as error:
+                messagebox.showerror("Passkey", f"Could not register passkey: {error}", parent=self.root)
+            refresh_passkey_state()
+
+        def remove_passkey():
+            try:
+                if remove_passkeys_dialog(self.root):
+                    status.set("Passkey removed from pyOS. Your password remains active.")
+            except ValueError as error:
+                messagebox.showerror("Passkey", str(error), parent=self.root)
+            refresh_passkey_state()
+
+        add_passkey_button = tk.Button(passkey_buttons, text="Register Windows Hello Passkey", command=add_passkey)
+        add_passkey_button.pack(side=tk.LEFT)
+        remove_passkey_button = tk.Button(passkey_buttons, text="Remove Passkey", command=remove_passkey)
+        remove_passkey_button.pack(side=tk.LEFT, padx=6)
+        refresh_passkey_state()
 
         def apply_settings():
             try:
@@ -2806,8 +3522,11 @@ Features:
                 "show_seconds": bool(seconds.get()),
                 "show_hidden_files": bool(hidden.get()),
                 "file_manager_start": start_location.get(),
+                "notifications_enabled": bool(notifications_enabled.get()),
+                "tips_enabled": bool(tips_enabled.get()),
             })
             self.apply_preferences()
+            self.apply_notification_preferences()
             self.save_preferences()
             status.set("Settings applied and saved.")
 
@@ -2826,6 +3545,8 @@ Features:
             seconds.set(True)
             hidden.set(False)
             start_location.set("Home")
+            notifications_enabled.set(True)
+            tips_enabled.set(True)
             apply_settings()
 
         footer = tk.Frame(window.content, bg="white", relief=tk.RAISED, bd=1)
@@ -2868,6 +3589,7 @@ Created with Python & Tkinter
         context_menu.add_command(label="Open Python IDE", command=self.open_python_ide)
         context_menu.add_command(label="Open Media Player", command=self.open_media_player)
         context_menu.add_command(label="Open Calculator", command=self.open_calculator)
+        context_menu.add_command(label="Open Messenger", command=self.open_messenger)
         context_menu.add_separator()
         context_menu.add_command(label="Lock Desktop", command=self.lock_desktop)
         context_menu.add_command(label="Refresh", command=self.refresh_desktop)
@@ -2882,10 +3604,12 @@ Created with Python & Tkinter
 
 def main():
     """Main entry point"""
+    relaunch_in_configured_environment(__file__)
     root = tk.Tk()
     app = DesktopGUI(root)
     root.update_idletasks()
     app.lock_desktop()
+    app.start_notifications()
     root.mainloop()
 
 

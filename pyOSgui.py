@@ -1,5 +1,6 @@
 
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import colorchooser, filedialog, messagebox, scrolledtext, ttk
 import subprocess
 import os
@@ -23,6 +24,11 @@ import queue
 import io
 import random
 import ipaddress
+import shutil
+import html
+import re
+import webbrowser
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from pyos_config import (
@@ -50,6 +56,17 @@ VIDEO_EXTENSIONS = {
 MEDIA_EXTENSIONS = AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
 IMAGE_EXTENSIONS = {
     ".apng", ".bmp", ".gif", ".ico", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp",
+}
+
+WEATHER_DESCRIPTIONS = {
+    0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+    45: "Fog", 48: "Freezing fog", 51: "Light drizzle", 53: "Drizzle",
+    55: "Heavy drizzle", 56: "Light freezing drizzle", 57: "Freezing drizzle",
+    61: "Light rain", 63: "Rain", 65: "Heavy rain", 66: "Light freezing rain",
+    67: "Freezing rain", 71: "Light snow", 73: "Snow", 75: "Heavy snow",
+    77: "Snow grains", 80: "Light showers", 81: "Showers", 82: "Heavy showers",
+    85: "Light snow showers", 86: "Heavy snow showers", 95: "Thunderstorm",
+    96: "Thunderstorm with hail", 99: "Severe thunderstorm with hail",
 }
 
 MESSENGER_DISCOVERY_PORT = 54545
@@ -750,13 +767,14 @@ class DesktopGUI:
         self.tip_index = 0
         self._notifications_started = False
         self.settings_path = get_gui_settings_path()
+        self.virtual_drives_path = self.settings_path.with_name("virtual_drives.json")
         self.preferences = self.load_preferences()
         self.windows = []
         self.root.title("Python OS Desktop")
         self.root.geometry("1280x720")
         self.root.configure(bg="white")
 
-        self.root.option_add("*Font", ("Courier New", self.preferences["font_size"]))
+        self.root.option_add("*Font", (self.preferences["font_family"], self.preferences["font_size"]))
         self.root.option_add("*Background", "white")
         self.root.option_add("*Foreground", "black")
         self.root.option_add("*Button.background", "white")
@@ -1131,6 +1149,7 @@ class DesktopGUI:
             "chrome_bg": "#000000",
             "chrome_fg": "#ffffff",
             "font_size": 9,
+            "font_family": "Courier New",
             "clock_24h": True,
             "show_seconds": True,
             "show_hidden_files": False,
@@ -1149,6 +1168,8 @@ class DesktopGUI:
             defaults["font_size"] = max(8, min(14, int(defaults["font_size"])))
         except (TypeError, ValueError):
             defaults["font_size"] = 9
+        if not isinstance(defaults.get("font_family"), str) or not defaults["font_family"].strip():
+            defaults["font_family"] = "Courier New"
         color_defaults = {
             "desktop_bg": "#ffffff",
             "surface_bg": "#ffffff",
@@ -1186,6 +1207,31 @@ class DesktopGUI:
             self.settings_path.write_text(json.dumps(self.preferences, indent=2), encoding="utf-8")
         except OSError as error:
             messagebox.showerror("Settings", f"Could not save settings: {error}")
+
+    def _apply_widget_fonts(self, widget):
+        """Apply the selected family while retaining intentional text styling."""
+        try:
+            existing = tkfont.Font(root=self.root, font=widget.cget("font"))
+            preserve_size = widget.winfo_class() in {"Text", "ScrolledText"} or getattr(widget, "_keep_font", False)
+            size = existing.cget("size") if preserve_size else self.preferences["font_size"]
+            font_spec = [self.preferences["font_family"], size]
+            if existing.cget("weight") == "bold":
+                font_spec.append("bold")
+            if existing.cget("slant") == "italic":
+                font_spec.append("italic")
+            if existing.cget("underline"):
+                font_spec.append("underline")
+            if existing.cget("overstrike"):
+                font_spec.append("overstrike")
+            widget.configure(font=tuple(font_spec))
+        except tk.TclError:
+            pass
+        try:
+            children = widget.winfo_children()
+        except tk.TclError:
+            return
+        for child in children:
+            self._apply_widget_fonts(child)
 
     def apply_preferences(self):
         """Apply preferences that can be updated while the desktop is running."""
@@ -1263,19 +1309,12 @@ class DesktopGUI:
         style.configure("TScale", background=surface_bg, troughcolor=surface_bg, bordercolor=chrome_bg)
         style.configure("TScrollbar", background=surface_bg, troughcolor=surface_bg, bordercolor=chrome_bg)
 
-        font = ("Courier New", self.preferences["font_size"])
+        family = self.preferences["font_family"]
+        font = (family, self.preferences["font_size"])
         self.root.option_add("*Font", font)
+        style.configure(".", font=font)
 
-        def update_fonts(widget):
-            try:
-                if widget.winfo_class() not in {"Text", "ScrolledText"} and not getattr(widget, "_keep_font", False):
-                    widget.configure(font=font)
-            except tk.TclError:
-                pass
-            for child in widget.winfo_children():
-                update_fonts(child)
-
-        update_fonts(self.root)
+        self._apply_widget_fonts(self.root)
 
     def apply_desktop_background(self):
         """Render the selected solid color or cover-scaled image background."""
@@ -1437,6 +1476,38 @@ class DesktopGUI:
             self.open_games_suite,
             340, 84
         )
+
+        self.modding_icon = DesktopIcon(
+            self.icon_container,
+            "Modding Environment",
+            "python_ide",
+            self.open_modding_environment,
+            450, 84
+        )
+
+        self.virtual_drives_icon = DesktopIcon(
+            self.icon_container,
+            "Virtual Drives",
+            "drive",
+            self.open_virtual_drive_manager,
+            560, 84
+        )
+
+        self.weather_icon = DesktopIcon(
+            self.icon_container,
+            "Weather",
+            "info",
+            self.open_weather,
+            670, 84
+        )
+
+        self.news_icon = DesktopIcon(
+            self.icon_container,
+            "News",
+            "browser",
+            self.open_news,
+            780, 84
+        )
     
     def open_cli(self):
         """Open CLI application in its own process."""
@@ -1454,6 +1525,7 @@ class DesktopGUI:
         self.window_offset = (self.window_offset + 24) % 144
         window = DesktopWindow(self, title, 160 + self.window_offset, 100 + self.window_offset, width, height)
         self.windows.append(window)
+        self.root.after_idle(lambda target=window.frame: self._apply_widget_fonts(target))
         return window
 
     def add_taskbar_shortcut(self, path):
@@ -1767,6 +1839,534 @@ class DesktopGUI:
     def get_drive_b_path(self):
         return get_drive_b_dir()
 
+    def _load_virtual_drives(self):
+        try:
+            drives = json.loads(self.virtual_drives_path.read_text(encoding="utf-8"))
+            if isinstance(drives, list):
+                return [drive for drive in drives if isinstance(drive, dict)]
+        except (OSError, ValueError, TypeError):
+            pass
+        return []
+
+    def _save_virtual_drives(self, drives):
+        self.virtual_drives_path.parent.mkdir(parents=True, exist_ok=True)
+        self.virtual_drives_path.write_text(json.dumps(drives, indent=2), encoding="utf-8")
+
+    def open_virtual_drive_manager(self):
+        """Create and manage additional directory-backed virtual drives."""
+        window = self.create_window("Virtual Drive Manager", width=720, height=500)
+        drives = self._load_virtual_drives()
+        surface = self.preferences["surface_bg"]
+        status = tk.StringVar(value="Select a drive or create a new one.")
+
+        list_frame = tk.Frame(window.content, bg=surface)
+        list_frame.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
+        drive_list = tk.Listbox(list_frame, width=25, height=20)
+        drive_list.pack(fill=tk.BOTH, expand=True)
+
+        form = tk.Frame(window.content, bg=surface)
+        form.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10), pady=10)
+        name = tk.StringVar()
+        location = tk.StringVar(value=str(Path.home() / "pyOS_Virtual_Drives"))
+        quota = tk.StringVar(value="1024")
+        storage = tk.StringVar(value="persistent")
+        read_only = tk.BooleanVar(value=False)
+
+        def row(label, variable, browse=False):
+            tk.Label(form, text=label, bg=surface, anchor=tk.W).pack(fill=tk.X, pady=(5, 1))
+            holder = tk.Frame(form, bg=surface)
+            holder.pack(fill=tk.X)
+            tk.Entry(holder, textvariable=variable).pack(side=tk.LEFT, fill=tk.X, expand=True)
+            if browse:
+                def choose():
+                    selected = filedialog.askdirectory(parent=self.root, initialdir=variable.get() or str(Path.home()))
+                    if selected:
+                        variable.set(selected)
+                tk.Button(holder, text="Browse", command=choose).pack(side=tk.LEFT, padx=(5, 0))
+
+        row("Drive name", name)
+        row("Parent location", location, True)
+        row("Quota (MB, configuration metadata)", quota)
+        tk.Label(form, text="Storage mode", bg=surface, anchor=tk.W).pack(fill=tk.X, pady=(8, 1))
+        ttk.Combobox(form, textvariable=storage, values=("persistent", "temporary"), state="readonly").pack(fill=tk.X)
+        tk.Checkbutton(form, text="Read-only", variable=read_only, bg=surface).pack(anchor=tk.W, pady=6)
+
+        def refresh():
+            drive_list.delete(0, tk.END)
+            for drive in drives:
+                drive_list.insert(tk.END, drive.get("name", "Unnamed"))
+
+        def selected_index():
+            selection = drive_list.curselection()
+            return selection[0] if selection else None
+
+        def create_drive():
+            drive_name = name.get().strip()
+            if not drive_name or any(character in drive_name for character in '<>:"/\\|?*'):
+                messagebox.showerror("Virtual Drives", "Enter a valid drive name.", parent=self.root)
+                return
+            if any(drive.get("name", "").casefold() == drive_name.casefold() for drive in drives):
+                messagebox.showerror("Virtual Drives", "A drive with that name already exists.", parent=self.root)
+                return
+            try:
+                quota_mb = max(1, int(quota.get()))
+                parent = Path(location.get()).expanduser().resolve()
+                path = parent / drive_name
+                path.mkdir(parents=True, exist_ok=False)
+                drive = {"name": drive_name, "path": str(path), "quota_mb": quota_mb,
+                         "storage": storage.get(), "read_only": bool(read_only.get()),
+                         "created": datetime.now().isoformat(timespec="seconds")}
+                drives.append(drive)
+                self._save_virtual_drives(drives)
+            except FileExistsError:
+                messagebox.showerror("Virtual Drives", "That directory already exists.", parent=self.root)
+                return
+            except (OSError, ValueError) as error:
+                messagebox.showerror("Virtual Drives", f"Could not create drive: {error}", parent=self.root)
+                return
+            refresh()
+            status.set(f"Created {drive_name} at {path}")
+
+        def open_drive():
+            index = selected_index()
+            if index is not None:
+                path = Path(drives[index].get("path", ""))
+                path.mkdir(parents=True, exist_ok=True)
+                self.open_file_manager(path)
+
+        def remove_drive():
+            index = selected_index()
+            if index is None:
+                return
+            removed = drives.pop(index)
+            self._save_virtual_drives(drives)
+            refresh()
+            status.set(f"Unregistered {removed.get('name')}; its files were not deleted.")
+
+        buttons = tk.Frame(form, bg=surface)
+        buttons.pack(fill=tk.X, pady=10)
+        tk.Button(buttons, text="Create", command=create_drive).pack(side=tk.LEFT)
+        tk.Button(buttons, text="Open", command=open_drive).pack(side=tk.LEFT, padx=5)
+        tk.Button(buttons, text="Unregister", command=remove_drive).pack(side=tk.LEFT)
+        tk.Label(form, textvariable=status, bg=surface, justify=tk.LEFT, wraplength=420).pack(fill=tk.X)
+        drive_list.bind("<Double-Button-1>", lambda event: open_drive())
+        refresh()
+
+    def open_modding_environment(self):
+        """Edit pyOS modules and settings with backups and syntax validation."""
+        window = self.create_window("Modding Environment", width=900, height=570)
+        project = Path(__file__).resolve().parent
+        excluded_parts = {
+            ".git", ".idea", ".pyos_mod_backups", ".backups", "__pycache__",
+            ".venv", "venv", "env", "site-packages",
+        }
+        project_modules = [
+            path for path in project.rglob("*.py")
+            if not any(part.casefold() in excluded_parts for part in path.relative_to(project).parts)
+        ]
+        apps_directory = self._custom_apps_directory()
+        custom_apps = list(apps_directory.glob("*.py"))
+        candidates = sorted(
+            dict.fromkeys(path.resolve() for path in project_modules + custom_apps),
+            key=lambda path: str(path).casefold(),
+        )
+        if self.settings_path.exists():
+            candidates.append(self.settings_path.resolve())
+        current = {"path": None}
+        status = tk.StringVar(value="Choose a pyOS module to begin.")
+        sidebar = tk.Frame(window.content, bg=self.preferences["surface_bg"], width=190)
+        sidebar.pack(side=tk.LEFT, fill=tk.Y, padx=6, pady=6)
+        files = tk.Listbox(sidebar, width=25)
+        files.pack(fill=tk.BOTH, expand=True)
+        def candidate_label(path):
+            try:
+                return str(path.relative_to(project))
+            except ValueError:
+                try:
+                    return "Apps / " + str(path.relative_to(apps_directory))
+                except ValueError:
+                    return path.name
+
+        for path in candidates:
+            files.insert(tk.END, candidate_label(path))
+        workspace = tk.Frame(window.content, bg=self.preferences["surface_bg"])
+        workspace.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6), pady=6)
+        toolbar = tk.Frame(workspace, bg=self.preferences["surface_bg"])
+        toolbar.pack(fill=tk.X, pady=(0, 5))
+        editor = scrolledtext.ScrolledText(workspace, wrap=tk.NONE, undo=True, font=("Courier New", 10))
+        editor.pack(fill=tk.BOTH, expand=True)
+        status_label = tk.Label(
+            workspace,
+            textvariable=status,
+            anchor=tk.W,
+            bg=self.preferences["surface_bg"],
+        )
+        status_label.pack(fill=tk.X, pady=(5, 0))
+
+        def load_selected(event=None):
+            selection = files.curselection()
+            if not selection:
+                return
+            path = candidates[selection[0]]
+            try:
+                content = path.read_text(encoding="utf-8")
+            except OSError as error:
+                messagebox.showerror("Modding Environment", str(error), parent=self.root)
+                return
+            current["path"] = path
+            editor.delete("1.0", tk.END)
+            editor.insert("1.0", content)
+            editor.edit_modified(False)
+            status.set(str(path))
+
+        def save_mod():
+            path = current["path"]
+            if path is None:
+                return
+            content = editor.get("1.0", "end-1c")
+            try:
+                if path.suffix.lower() == ".py":
+                    compile(content, str(path), "exec")
+                elif path.suffix.lower() == ".json":
+                    json.loads(content)
+                backup_dir = project / ".pyos_mod_backups"
+                backup_dir.mkdir(exist_ok=True)
+                stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                shutil.copy2(path, backup_dir / f"{path.name}.{stamp}.bak")
+                path.write_text(content, encoding="utf-8")
+                editor.edit_modified(False)
+                status.set(f"Saved {path.name}; backup created in {backup_dir.name}.")
+            except (OSError, SyntaxError, ValueError, json.JSONDecodeError) as error:
+                messagebox.showerror("Modding Environment", f"Not saved: {error}", parent=self.root)
+
+        tk.Button(toolbar, text="Save + Validate", command=save_mod).pack(side=tk.LEFT)
+        tk.Button(toolbar, text="Reload", command=load_selected).pack(side=tk.LEFT, padx=5)
+        tk.Button(toolbar, text="App Maker", command=self.open_app_maker).pack(side=tk.LEFT, padx=(8, 0))
+        files.bind("<<ListboxSelect>>", load_selected)
+        editor.bind("<Control-s>", lambda event: (save_mod(), "break")[1])
+
+    def _custom_apps_directory(self):
+        path = self.settings_path.parent / "apps"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def run_custom_app(self, path):
+        """Validate and run a user-created app inside a pyOS window."""
+        path = Path(path).resolve()
+        apps_directory = self._custom_apps_directory().resolve()
+        if path.parent != apps_directory or path.suffix.lower() != ".py":
+            raise ValueError("The app must be a Python file in the pyOS apps directory.")
+        source = path.read_text(encoding="utf-8")
+        code = compile(source, str(path), "exec")
+        namespace = {
+            "__name__": f"pyos_app_{path.stem}",
+            "__file__": str(path),
+            "tk": tk,
+            "ttk": ttk,
+            "messagebox": messagebox,
+        }
+        exec(code, namespace)
+        builder = namespace.get("build")
+        if not callable(builder):
+            raise ValueError("App must define build(app, window).")
+        title = str(namespace.get("APP_NAME", path.stem.replace("_", " ").title()))[:80]
+        app_window = self.create_window(title, width=640, height=440)
+        try:
+            builder(self, app_window)
+        except Exception:
+            app_window.close()
+            raise
+        return app_window
+
+    def open_app_maker(self):
+        """Create, edit, and launch Python apps hosted inside pyOS."""
+        window = self.create_window("App Maker", width=920, height=590)
+        surface = self.preferences["surface_bg"]
+        foreground = self.preferences["text_fg"]
+        apps_directory = self._custom_apps_directory()
+        current = {"path": None}
+        status = tk.StringVar(value="Create an app or select an existing one.")
+        app_name = tk.StringVar(value="My App")
+
+        sidebar = tk.Frame(window.content, bg=surface, width=190)
+        sidebar.pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=8)
+        tk.Label(sidebar, text="YOUR APPS", font=("Courier New", 11, "bold"),
+                 bg=surface, fg=foreground).pack(fill=tk.X, pady=(0, 5))
+        app_list = tk.Listbox(sidebar, width=24)
+        app_list.pack(fill=tk.BOTH, expand=True)
+
+        workspace = tk.Frame(window.content, bg=surface)
+        workspace.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8), pady=8)
+        toolbar = tk.Frame(workspace, bg=surface)
+        toolbar.pack(fill=tk.X, pady=(0, 5))
+        tk.Label(toolbar, text="Name:", bg=surface, fg=foreground).pack(side=tk.LEFT)
+        tk.Entry(toolbar, textvariable=app_name, width=22).pack(side=tk.LEFT, padx=5)
+        editor = scrolledtext.ScrolledText(
+            workspace, wrap=tk.NONE, undo=True, font=("Courier New", 10),
+        )
+        editor.pack(fill=tk.BOTH, expand=True)
+        tk.Label(workspace, textvariable=status, anchor=tk.W, bg=surface, fg=foreground,
+                 wraplength=650).pack(fill=tk.X, pady=(5, 0))
+
+        template = '''APP_NAME = "My App"
+
+
+def build(app, window):
+    """Build this app inside the supplied pyOS window."""
+    content = window.content
+    content.configure(bg="white")
+
+    title = tk.Label(
+        content,
+        text="Hello from my pyOS app!",
+        font=("Courier New", 16, "bold"),
+        bg="white",
+    )
+    title.pack(pady=30)
+
+    message = tk.StringVar(value="Press the button to begin.")
+    tk.Label(content, textvariable=message, bg="white").pack(pady=10)
+    tk.Button(
+        content,
+        text="Run Action",
+        command=lambda: message.set("Your app is running inside pyOS."),
+    ).pack(pady=10)
+'''
+
+        def app_paths():
+            return sorted(apps_directory.glob("*.py"), key=lambda item: item.name.casefold())
+
+        def refresh(select_path=None):
+            paths = app_paths()
+            app_list.delete(0, tk.END)
+            for item in paths:
+                app_list.insert(tk.END, item.stem.replace("_", " ").title())
+            if select_path in paths:
+                index = paths.index(select_path)
+                app_list.selection_set(index)
+                app_list.see(index)
+
+        def new_app():
+            current["path"] = None
+            app_name.set("My App")
+            editor.delete("1.0", tk.END)
+            editor.insert("1.0", template)
+            editor.edit_modified(False)
+            status.set("New app template. Choose a name, then Save App.")
+
+        def load_app(event=None):
+            selection = app_list.curselection()
+            paths = app_paths()
+            if not selection or selection[0] >= len(paths):
+                return
+            path = paths[selection[0]]
+            try:
+                source = path.read_text(encoding="utf-8")
+            except OSError as error:
+                messagebox.showerror("App Maker", str(error), parent=self.root)
+                return
+            current["path"] = path
+            app_name.set(path.stem.replace("_", " ").title())
+            editor.delete("1.0", tk.END)
+            editor.insert("1.0", source)
+            editor.edit_modified(False)
+            status.set(str(path))
+
+        def target_path():
+            display_name = app_name.get().strip()
+            slug = "_".join(display_name.lower().split())
+            slug = "".join(character for character in slug if character.isalnum() or character == "_")
+            slug = slug.strip("_")
+            if not slug or not display_name:
+                raise ValueError("Enter an app name containing letters or numbers.")
+            return apps_directory / f"{slug}.py"
+
+        def save_app():
+            source = editor.get("1.0", "end-1c")
+            try:
+                syntax_tree = ast.parse(source, filename=str(target_path()), mode="exec")
+                compile(syntax_tree, str(target_path()), "exec")
+                if not any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "build"
+                           for node in syntax_tree.body):
+                    raise ValueError("App must define build(app, window).")
+                destination = target_path()
+                old_path = current["path"]
+                if destination.exists():
+                    backup_dir = apps_directory / ".backups"
+                    backup_dir.mkdir(exist_ok=True)
+                    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                    shutil.copy2(destination, backup_dir / f"{destination.name}.{stamp}.bak")
+                destination.write_text(source, encoding="utf-8")
+                if old_path and old_path != destination and old_path.exists():
+                    old_path.unlink()
+                current["path"] = destination
+                editor.edit_modified(False)
+                refresh(destination)
+                status.set(f"Saved and validated {destination.name}.")
+                return destination
+            except (OSError, SyntaxError, ValueError) as error:
+                messagebox.showerror("App Maker", f"App was not saved: {error}", parent=self.root)
+                return None
+
+        def run_app():
+            path = save_app()
+            if path is None:
+                return
+            try:
+                self.run_custom_app(path)
+                status.set(f"Running {path.stem.replace('_', ' ').title()} inside pyOS.")
+            except Exception as error:
+                messagebox.showerror("App Maker", f"App could not run: {error}", parent=self.root)
+
+        def delete_app():
+            path = current["path"]
+            if path is None or not path.exists():
+                return
+            if not messagebox.askyesno("App Maker", f"Delete {path.name}?", parent=self.root):
+                return
+            try:
+                path.unlink()
+            except OSError as error:
+                messagebox.showerror("App Maker", str(error), parent=self.root)
+                return
+            new_app()
+            refresh()
+            status.set("App deleted.")
+
+        tk.Button(toolbar, text="New", command=new_app).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Button(toolbar, text="Save App", command=save_app).pack(side=tk.LEFT, padx=4)
+        tk.Button(toolbar, text="Run Inside pyOS", command=run_app).pack(side=tk.LEFT)
+        tk.Button(toolbar, text="Delete", command=delete_app).pack(side=tk.RIGHT)
+        app_list.bind("<<ListboxSelect>>", load_app)
+        editor.bind("<Control-s>", lambda event: (save_app(), "break")[1])
+        refresh()
+        new_app()
+
+    def open_weather(self):
+        """Show current conditions and a seven-day forecast for a selected location."""
+        window = self.create_window("Weather", width=760, height=560)
+        surface = self.preferences["surface_bg"]
+        foreground = self.preferences["text_fg"]
+        location_query = tk.StringVar()
+        status = tk.StringVar(value="Detecting your approximate location...")
+
+        toolbar = tk.Frame(window.content, bg=surface)
+        toolbar.pack(fill=tk.X, padx=10, pady=10)
+        tk.Label(toolbar, text="City or postcode:", bg=surface, fg=foreground).pack(side=tk.LEFT)
+        location_entry = tk.Entry(toolbar, textvariable=location_query)
+        location_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+
+        heading = tk.Label(
+            window.content, text="WEATHER", font=("Courier New", 17, "bold"),
+            bg=surface, fg=foreground, anchor=tk.W,
+        )
+        heading.pack(fill=tk.X, padx=14)
+        current_label = tk.Label(
+            window.content, text="", font=("Courier New", 11), justify=tk.LEFT,
+            anchor=tk.NW, bg=surface, fg=foreground,
+        )
+        current_label.pack(fill=tk.X, padx=14, pady=(6, 12))
+        tk.Label(
+            window.content, text="7-DAY FORECAST", font=("Courier New", 11, "bold"),
+            bg=surface, fg=foreground, anchor=tk.W,
+        ).pack(fill=tk.X, padx=14)
+        forecast = scrolledtext.ScrolledText(
+            window.content, height=13, wrap=tk.NONE, font=("Courier New", 10),
+            bg=surface, fg=foreground,
+        )
+        forecast.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        forecast.configure(state=tk.DISABLED)
+        tk.Label(
+            window.content, textvariable=status, anchor=tk.W, bg=surface, fg=foreground,
+        ).pack(fill=tk.X, padx=12, pady=(0, 8))
+
+        def request_json(url):
+            request = urllib.request.Request(url, headers={"User-Agent": "pyOS-Weather/1.0"})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return json.loads(response.read().decode("utf-8"))
+
+        def fetch_forecast(latitude, longitude):
+            params = urllib.parse.urlencode({
+                "latitude": latitude,
+                "longitude": longitude,
+                "current": "temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,cloud_cover,pressure_msl,wind_speed_10m,wind_direction_10m,wind_gusts_10m",
+                "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,sunrise,sunset,wind_speed_10m_max",
+                "timezone": "auto",
+                "forecast_days": 7,
+            })
+            return request_json("https://api.open-meteo.com/v1/forecast?" + params)
+
+        def search_location(query):
+            params = urllib.parse.urlencode({"name": query, "count": 1, "language": "en", "format": "json"})
+            data = request_json("https://geocoding-api.open-meteo.com/v1/search?" + params)
+            results = data.get("results") or []
+            if not results:
+                raise ValueError(f"No location found for '{query}'.")
+            result = results[0]
+            label = ", ".join(filter(None, (result.get("name"), result.get("admin1"), result.get("country"))))
+            return result["latitude"], result["longitude"], label
+
+        def auto_location():
+            data = request_json("https://ipapi.co/json/")
+            latitude, longitude = data.get("latitude"), data.get("longitude")
+            if latitude is None or longitude is None:
+                raise ValueError("Automatic location detection was unavailable. Enter a city instead.")
+            label = ", ".join(filter(None, (data.get("city"), data.get("region"), data.get("country_name"))))
+            return latitude, longitude, label or "Current location"
+
+        def render(data, label):
+            current = data.get("current", {})
+            units = data.get("current_units", {})
+            description = WEATHER_DESCRIPTIONS.get(current.get("weather_code"), "Unknown conditions")
+            heading.configure(text=label.upper())
+            current_label.configure(text=(
+                f"{description} | {current.get('temperature_2m', '?')}{units.get('temperature_2m', '°C')}"
+                f" (feels like {current.get('apparent_temperature', '?')}{units.get('apparent_temperature', '°C')})\n"
+                f"Humidity: {current.get('relative_humidity_2m', '?')}%    Cloud: {current.get('cloud_cover', '?')}%    "
+                f"Rain: {current.get('precipitation', '?')} mm\n"
+                f"Wind: {current.get('wind_speed_10m', '?')} km/h, gusting {current.get('wind_gusts_10m', '?')} km/h    "
+                f"Pressure: {current.get('pressure_msl', '?')} hPa"
+            ))
+            daily = data.get("daily", {})
+            rows = ["DATE         CONDITIONS                 LOW / HIGH   RAIN   WIND"]
+            count = len(daily.get("time", []))
+            for index in range(count):
+                code = daily.get("weather_code", [None] * count)[index]
+                condition = WEATHER_DESCRIPTIONS.get(code, "Unknown")[:26]
+                rows.append(
+                    f"{daily['time'][index]:<12} {condition:<26} "
+                    f"{daily['temperature_2m_min'][index]:>4.0f}° / {daily['temperature_2m_max'][index]:>4.0f}°   "
+                    f"{daily['precipitation_probability_max'][index]:>3}%   "
+                    f"{daily['wind_speed_10m_max'][index]:>3.0f} km/h"
+                )
+            forecast.configure(state=tk.NORMAL)
+            forecast.delete("1.0", tk.END)
+            forecast.insert("1.0", "\n".join(rows))
+            forecast.configure(state=tk.DISABLED)
+            status.set(f"Updated {datetime.now().strftime('%H:%M')} • Forecast data: Open-Meteo")
+
+        def load_weather(use_auto=False):
+            query = location_query.get().strip()
+            if not use_auto and len(query) < 2:
+                status.set("Enter at least two characters for a location.")
+                return
+            status.set("Loading weather data...")
+
+            def worker():
+                try:
+                    latitude, longitude, label = auto_location() if use_auto else search_location(query)
+                    data = fetch_forecast(latitude, longitude)
+                    self.root.after(0, lambda: render(data, label))
+                except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+                    self.root.after(0, lambda message=str(error): status.set(f"Weather unavailable: {message}"))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        tk.Button(toolbar, text="Search", command=load_weather).pack(side=tk.LEFT)
+        tk.Button(toolbar, text="My Location", command=lambda: load_weather(True)).pack(side=tk.LEFT, padx=(5, 0))
+        location_entry.bind("<Return>", lambda event: load_weather())
+        load_weather(True)
+
     def open_default_file_manager(self):
         locations = {
             "Home": Path.home(),
@@ -1844,6 +2444,122 @@ class DesktopGUI:
 
         file_list.bind("<Double-Button-1>", open_selected)
         populate()
+
+    def open_news(self):
+        """Browse current headlines and search Google News RSS feeds."""
+        window = self.create_window("News", width=880, height=570)
+        surface = self.preferences["surface_bg"]
+        foreground = self.preferences["text_fg"]
+        category = tk.StringVar(value="Top Stories")
+        search_text = tk.StringVar()
+        status = tk.StringVar(value="Loading current headlines...")
+        articles = []
+
+        toolbar = tk.Frame(window.content, bg=surface)
+        toolbar.pack(fill=tk.X, padx=8, pady=8)
+        tk.Label(toolbar, text="Section:", bg=surface, fg=foreground).pack(side=tk.LEFT)
+        section_box = ttk.Combobox(
+            toolbar, textvariable=category,
+            values=("Top Stories", "World", "UK", "Business", "Technology", "Science", "Health", "Sports", "Entertainment"),
+            state="readonly", width=15,
+        )
+        section_box.pack(side=tk.LEFT, padx=5)
+        tk.Label(toolbar, text="Search:", bg=surface, fg=foreground).pack(side=tk.LEFT, padx=(10, 0))
+        search_entry = tk.Entry(toolbar, textvariable=search_text)
+        search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        pane = tk.PanedWindow(window.content, orient=tk.HORIZONTAL, bg=surface, sashwidth=5)
+        pane.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
+        headline_list = tk.Listbox(pane, width=48)
+        detail = scrolledtext.ScrolledText(pane, wrap=tk.WORD, state=tk.DISABLED)
+        pane.add(headline_list, minsize=300)
+        pane.add(detail, minsize=300)
+
+        footer = tk.Frame(window.content, bg=surface)
+        footer.pack(fill=tk.X, padx=8, pady=(0, 8))
+        tk.Label(footer, textvariable=status, bg=surface, fg=foreground, anchor=tk.W).pack(
+            side=tk.LEFT, fill=tk.X, expand=True
+        )
+
+        topics = {
+            "World": "WORLD", "UK": "NATION", "Business": "BUSINESS",
+            "Technology": "TECHNOLOGY", "Science": "SCIENCE", "Health": "HEALTH",
+            "Sports": "SPORTS", "Entertainment": "ENTERTAINMENT",
+        }
+
+        def feed_url():
+            query = search_text.get().strip()
+            locale = "hl=en-GB&gl=GB&ceid=GB%3Aen"
+            if query:
+                return "https://news.google.com/rss/search?" + urllib.parse.urlencode({"q": query}) + "&" + locale
+            topic = topics.get(category.get())
+            if topic:
+                return f"https://news.google.com/rss/headlines/section/topic/{topic}?{locale}"
+            return "https://news.google.com/rss?" + locale
+
+        def clean_summary(raw):
+            text = re.sub(r"<[^>]+>", " ", raw or "")
+            return re.sub(r"\s+", " ", html.unescape(text)).strip()
+
+        def show_article(event=None):
+            selection = headline_list.curselection()
+            if not selection or selection[0] >= len(articles):
+                return
+            article = articles[selection[0]]
+            text = (f"{article['title']}\n\nSource: {article['source']}\n"
+                    f"Published: {article['published']}\n\n{article['summary']}")
+            detail.configure(state=tk.NORMAL)
+            detail.delete("1.0", tk.END)
+            detail.insert("1.0", text)
+            detail.configure(state=tk.DISABLED)
+
+        def open_article():
+            selection = headline_list.curselection()
+            if selection and selection[0] < len(articles):
+                webbrowser.open(articles[selection[0]]["link"])
+
+        def refresh_news(event=None):
+            url = feed_url()
+            status.set("Updating headlines...")
+
+            def worker():
+                try:
+                    request = urllib.request.Request(url, headers={"User-Agent": "pyOS-News/1.0"})
+                    with urllib.request.urlopen(request, timeout=12) as response:
+                        root = ET.fromstring(response.read())
+                    fetched = []
+                    for item in root.findall("./channel/item")[:50]:
+                        source = item.find("source")
+                        fetched.append({
+                            "title": item.findtext("title", "Untitled"),
+                            "link": item.findtext("link", ""),
+                            "published": item.findtext("pubDate", "Unknown"),
+                            "source": source.text if source is not None and source.text else "Unknown",
+                            "summary": clean_summary(item.findtext("description", "")),
+                        })
+
+                    def display():
+                        articles[:] = fetched
+                        headline_list.delete(0, tk.END)
+                        for article in articles:
+                            headline_list.insert(tk.END, article["title"])
+                        status.set(f"{len(articles)} stories • Updated {datetime.now().strftime('%H:%M')}")
+                        if articles:
+                            headline_list.selection_set(0)
+                            show_article()
+                    self.root.after(0, display)
+                except (OSError, ET.ParseError, ValueError) as error:
+                    self.root.after(0, lambda message=str(error): status.set(f"News unavailable: {message}"))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        tk.Button(toolbar, text="Search / Refresh", command=refresh_news).pack(side=tk.LEFT)
+        tk.Button(footer, text="Open Full Story", command=open_article).pack(side=tk.RIGHT, padx=(6, 0))
+        headline_list.bind("<<ListboxSelect>>", show_article)
+        headline_list.bind("<Double-Button-1>", lambda event: open_article())
+        search_entry.bind("<Return>", refresh_news)
+        section_box.bind("<<ComboboxSelected>>", refresh_news)
+        refresh_news()
 
     def open_games_suite(self):
         """Open the launcher for pyOS's small built-in games."""
@@ -3938,6 +4654,7 @@ Features:
         chrome_color = tk.StringVar(value=self.preferences["chrome_bg"])
         chrome_text_color = tk.StringVar(value=self.preferences["chrome_fg"])
         font_size = tk.IntVar(value=self.preferences["font_size"])
+        font_family = tk.StringVar(value=self.preferences["font_family"])
         clock_24h = tk.BooleanVar(value=self.preferences["clock_24h"])
         seconds = tk.BooleanVar(value=self.preferences["show_seconds"])
         hidden = tk.BooleanVar(value=self.preferences["show_hidden_files"])
@@ -4016,6 +4733,14 @@ Features:
         font_row.pack(fill=tk.X, padx=16, pady=(8, 4))
         tk.Label(font_row, text="Interface font size:").pack(side=tk.LEFT)
         tk.Spinbox(font_row, from_=8, to=14, textvariable=font_size, width=5).pack(side=tk.LEFT, padx=10)
+        family_row = tk.Frame(appearance, bg="white")
+        family_row.pack(fill=tk.X, padx=16, pady=(2, 6))
+        tk.Label(family_row, text="Text font:").pack(side=tk.LEFT)
+        available_fonts = sorted(set(tkfont.families(self.root)), key=str.casefold)
+        ttk.Combobox(
+            family_row, textvariable=font_family, values=available_fonts,
+            state="readonly", width=28,
+        ).pack(side=tk.LEFT, padx=10)
 
         tk.Label(clock, text="TASKBAR CLOCK", font=("Courier New", 11, "bold"), anchor=tk.W).pack(
             fill=tk.X, padx=16, pady=(18, 8)
@@ -4156,6 +4881,7 @@ Features:
                 "chrome_bg": chrome_color.get(),
                 "chrome_fg": chrome_text_color.get(),
                 "font_size": selected_size,
+                "font_family": font_family.get() or "Courier New",
                 "clock_24h": bool(clock_24h.get()),
                 "show_seconds": bool(seconds.get()),
                 "show_hidden_files": bool(hidden.get()),
@@ -4179,6 +4905,7 @@ Features:
             for variable, swatch in color_swatches:
                 swatch.configure(bg=variable.get(), activebackground=variable.get())
             font_size.set(9)
+            font_family.set("Courier New")
             clock_24h.set(True)
             seconds.set(True)
             hidden.set(False)
@@ -4229,6 +4956,10 @@ Created with Python & Tkinter
         context_menu.add_command(label="Open Calculator", command=self.open_calculator)
         context_menu.add_command(label="Open Messenger", command=self.open_messenger)
         context_menu.add_command(label="Open Games Suite", command=self.open_games_suite)
+        context_menu.add_command(label="Open Modding Environment", command=self.open_modding_environment)
+        context_menu.add_command(label="Manage Virtual Drives", command=self.open_virtual_drive_manager)
+        context_menu.add_command(label="Open Weather", command=self.open_weather)
+        context_menu.add_command(label="Open News", command=self.open_news)
         context_menu.add_separator()
         context_menu.add_command(label="Lock Desktop", command=self.lock_desktop)
         context_menu.add_command(label="Refresh", command=self.refresh_desktop)
@@ -4258,6 +4989,10 @@ DESKTOP_APP_LAUNCHERS = {
     "drive-a": "open_drive_a",
     "drive-b": "open_drive_b",
     "settings": "open_settings",
+    "modding": "open_modding_environment",
+    "virtual-drives": "open_virtual_drive_manager",
+    "weather": "open_weather",
+    "news": "open_news",
     "about": "show_about",
 }
 

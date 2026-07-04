@@ -84,6 +84,7 @@ On first use, pyOS asks you to create a username and password. The account is st
 - Drag launchers to move them; they snap to the desktop grid.
 - Drag an application title bar to move its window.
 - Drag the bottom-right handle to resize a window.
+- Application windows are constrained to the usable pyOS desktop and automatically fitted when the host window shrinks, keeping title bars and close controls reachable.
 - Select `_` to minimize an application into the taskbar.
 - Left-click empty desktop space to open the desktop menu.
 - Right-click the desktop for application shortcuts.
@@ -100,6 +101,26 @@ The persistent top bar provides pyOS-wide controls:
 - **Help**: display a usage tip or open About
 
 Restart and shutdown actions require confirmation. **Shut Down pyOS** closes the pyOS environment and its internal applications; it does not shut down the host operating system. **Restart and Run Setup** closes pyOS, runs the setup wizard, and relaunches pyOS after setup exits.
+
+### Uninstall pyOS Data
+
+Select **Settings > Security > Uninstall pyOS** to reset and remove pyOS data without removing the program or its Python dependencies. The operation requires the current account password followed by typing `UNINSTALL` exactly.
+
+It permanently removes:
+
+- The pyOS account, password hash, registered passkey metadata, GUI and CLI settings
+- App Maker applications and modding backups
+- Drive A, Drive B, and the directories of all custom drives registered by Virtual Drive Manager
+- Other contents of a dedicated pyOS data directory
+- The shared pyOS installation-location configuration
+
+It preserves:
+
+- pyOS source files, modules, the isolated virtual environment, and installed packages
+- The configured Downloads directory and its files
+- Unrelated files when pyOS data was configured directly in a shared location such as the home directory
+
+For safety, pyOS refuses to recursively delete filesystem roots, the user home directory, the installation directory, the configured Downloads directory, or a directory containing one of those locations. After uninstalling data, pyOS closes. Running it again starts first-use account and setup behavior.
 
 ## Desktop Menu
 
@@ -221,6 +242,7 @@ Select **App Maker** from the Modding Environment to create applications that ru
 
 - Start from a working Python template.
 - Create, edit, rename, validate, run, and delete apps.
+- Show every saved app as an individual desktop launcher; launchers update immediately after saving, renaming, or deleting an app.
 - Run an app immediately with **Run Inside pyOS**.
 - Store custom apps in the shared pyOS data directory under `apps`.
 - Back up overwritten custom apps automatically.
@@ -333,6 +355,7 @@ Settings are saved in the data directory selected by setup.
 - Change the shared pyOS username and password
 - Register or remove a Windows Hello/WebAuthn platform passkey
 - Lock the desktop immediately
+- Uninstall all pyOS user data and registered virtual drives without removing modules or packages
 
 ### Notifications
 

@@ -1,7 +1,7 @@
 
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import colorchooser, filedialog, messagebox, scrolledtext, ttk
+from tkinter import colorchooser, filedialog, messagebox, scrolledtext, simpledialog, ttk
 import subprocess
 import os
 import json
@@ -29,22 +29,29 @@ import html
 import re
 import webbrowser
 import xml.etree.ElementTree as ET
+import platform
 from pathlib import Path
 
 from pyos_config import (
+    CONFIG_FILE,
+    get_cli_settings_path,
+    get_data_dir,
     get_downloads_dir,
     get_drive_b_dir,
     get_gui_settings_path,
+    load_config,
     relaunch_in_configured_environment,
 )
 from pyos_auth import (
     authenticate,
     change_credentials_dialog,
+    credentials_path,
     get_username,
     has_passkey,
     passkey_support_status,
     register_passkey_dialog,
     remove_passkeys_dialog,
+    verify_credentials,
 )
 
 AUDIO_EXTENSIONS = {
@@ -398,12 +405,19 @@ class DesktopIcon:
         self._drag_origin = None
         self._dragged = False
         self.frame = tk.Frame(parent, bg="white", relief=tk.RAISED, bd=2)
+        self.frame._desktop_icon = self
         self.frame.place(x=x, y=y, width=width, height=height)
+
+        self.icon = tk.Canvas(
+            self.frame, width=34, height=28, bg="white", highlightthickness=0,
+            cursor="hand2",
+        )
+        self.icon.pack(pady=(2, 0))
 
         self.name_label = tk.Label(
             self.frame,
             text=name.upper(),
-            font=("Courier New", 9, "bold"),
+            font=("Courier New", 7, "bold"),
             bg="white",
             fg="black",
             wraplength=88,
@@ -411,12 +425,101 @@ class DesktopIcon:
             relief=tk.FLAT,
             cursor="hand2",
         )
-        self.name_label.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self.name_label.pack(fill=tk.BOTH, expand=True, padx=3, pady=(0, 2))
 
-        for widget in (self.name_label, self.frame):
+        self.set_colors("white", "black")
+
+        for widget in (self.icon, self.name_label, self.frame):
             widget.bind("<ButtonPress-1>", self.start_drag)
             widget.bind("<B1-Motion>", self.drag)
             widget.bind("<ButtonRelease-1>", self.finish_drag)
+
+    def set_colors(self, background, foreground):
+        self.frame.configure(bg=background)
+        self.icon.configure(bg=background)
+        self.name_label.configure(bg=background, fg=foreground)
+        self._draw_pixel_icon(background, foreground)
+
+    def _draw_pixel_icon(self, background, foreground):
+        """Draw a compact monochrome pixel-art glyph for the launcher type."""
+        canvas = self.icon
+        canvas.delete("all")
+        pixel = 3
+
+        def block(x, y, width=1, height=1, fill=foreground, outline=""):
+            canvas.create_rectangle(
+                x * pixel + 2, y * pixel + 1,
+                (x + width) * pixel + 1, (y + height) * pixel,
+                fill=fill, outline=outline,
+            )
+
+        def outline_box(x, y, width, height):
+            block(x, y, width, 1)
+            block(x, y + height - 1, width, 1)
+            block(x, y, 1, height)
+            block(x + width - 1, y, 1, height)
+
+        kind = self.icon_type
+        if kind in {"file_explorer", "folder"}:
+            block(1, 3, 3, 1)
+            block(3, 2, 3, 1)
+            outline_box(1, 3, 9, 5)
+        elif kind == "terminal":
+            outline_box(1, 1, 10, 8)
+            block(3, 3); block(4, 4); block(3, 5)
+            block(6, 6, 3, 1)
+        elif kind == "trash":
+            block(3, 1, 5, 1); block(4, 0, 3, 1)
+            outline_box(3, 2, 5, 7)
+            block(5, 3, 1, 4)
+        elif kind == "drive":
+            outline_box(1, 2, 10, 6)
+            block(2, 5, 8, 1)
+            block(8, 3); block(9, 3)
+        elif kind == "settings":
+            block(5, 0, 2, 2); block(5, 7, 2, 2)
+            block(1, 3, 2, 3); block(9, 3, 2, 3)
+            outline_box(4, 2, 4, 5)
+            block(5, 3, 2, 3, fill=background)
+        elif kind == "info":
+            outline_box(2, 0, 8, 9)
+            block(5, 2, 2, 1); block(5, 4, 2, 4)
+        elif kind in {"text_editor", "notepad"}:
+            outline_box(2, 0, 8, 9)
+            block(4, 2, 4, 1); block(4, 4, 4, 1); block(4, 6, 3, 1)
+        elif kind == "browser":
+            outline_box(1, 1, 10, 8)
+            block(1, 3, 10, 1)
+            block(3, 5, 6, 1); block(4, 7, 4, 1)
+        elif kind == "python_ide":
+            outline_box(1, 1, 10, 8)
+            block(3, 3); block(4, 4); block(3, 5)
+            block(8, 3); block(7, 4); block(8, 5)
+        elif kind == "media_player":
+            outline_box(1, 1, 10, 8)
+            block(4, 3, 1, 4); block(5, 4, 1, 3); block(6, 5, 1, 1)
+        elif kind == "image_viewer":
+            outline_box(1, 1, 10, 8)
+            block(8, 2, 1, 1)
+            block(2, 7, 2, 1); block(3, 6, 2, 1); block(5, 5, 2, 1); block(7, 6, 3, 2)
+        elif kind == "calculator":
+            outline_box(2, 0, 8, 9)
+            block(3, 1, 6, 2, fill=background)
+            for x in (3, 5, 7):
+                for y in (4, 6):
+                    block(x, y)
+        elif kind == "messenger":
+            outline_box(1, 1, 10, 6)
+            block(3, 7, 2, 1); block(2, 8, 2, 1)
+            block(3, 3); block(5, 3); block(7, 3)
+        elif kind == "games":
+            block(2, 3, 8, 4)
+            block(1, 5, 2, 3); block(9, 5, 2, 3)
+            block(4, 4, 1, 3); block(3, 5, 3, 1)
+            block(8, 4); block(9, 5)
+        else:
+            outline_box(2, 0, 8, 9)
+            block(7, 0, 1, 3); block(8, 2, 2, 1)
 
     def start_drag(self, event):
         """Record pointer and launcher positions before a possible drag."""
@@ -627,10 +730,13 @@ class DesktopWindow:
         self.canvas = desktop.desktop_canvas
         self.title = title
         self.minimized = False
-        self.width = width
-        self.height = height
         self.min_width = 320
         self.min_height = 220
+        canvas_width, canvas_height = self._canvas_size()
+        self.width = min(max(self.min_width, width), canvas_width)
+        self.height = min(max(self.min_height, height), canvas_height)
+        x = max(0, min(x, canvas_width - self.width))
+        y = max(0, min(y, canvas_height - self.height))
         surface_bg = desktop.preferences.get("surface_bg", "#ffffff")
         text_fg = desktop.preferences.get("text_fg", "#000000")
         chrome_bg = desktop.preferences.get("chrome_bg", "#000000")
@@ -641,8 +747,8 @@ class DesktopWindow:
             y,
             window=self.frame,
             anchor=tk.NW,
-            width=width,
-            height=height,
+            width=self.width,
+            height=self.height,
         )
 
         self.titlebar = tk.Frame(self.frame, bg=chrome_bg, height=30)
@@ -701,6 +807,32 @@ class DesktopWindow:
         self.resize_handle.bind("<ButtonPress-1>", self.start_resize)
         self.resize_handle.bind("<B1-Motion>", self.resize)
 
+    def _canvas_size(self):
+        """Return the usable internal desktop dimensions."""
+        self.canvas.update_idletasks()
+        width = self.canvas.winfo_width()
+        height = self.canvas.winfo_height()
+        if width <= 1:
+            width = max(1, self.desktop.root.winfo_width())
+        if height <= 1:
+            height = max(1, self.desktop.root.winfo_height() - 90)
+        return width, height
+
+    def constrain_to_desktop(self):
+        """Resize and reposition the window so all controls remain reachable."""
+        if not self.canvas.type(self.window_id):
+            return
+        canvas_width, canvas_height = self._canvas_size()
+        self.width = min(self.width, canvas_width)
+        self.height = min(self.height, canvas_height)
+        coordinates = self.canvas.coords(self.window_id)
+        if len(coordinates) < 2:
+            return
+        x = max(0, min(coordinates[0], canvas_width - self.width))
+        y = max(0, min(coordinates[1], canvas_height - self.height))
+        self.canvas.coords(self.window_id, x, y)
+        self.canvas.itemconfigure(self.window_id, width=self.width, height=self.height)
+
     def start_drag(self, event):
         self._drag_start = (event.x_root, event.y_root, *self.canvas.coords(self.window_id))
         self.canvas.tag_raise(self.window_id)
@@ -709,10 +841,13 @@ class DesktopWindow:
         if not self._drag_start:
             return
         start_x, start_y, window_x, window_y = self._drag_start
+        canvas_width, canvas_height = self._canvas_size()
+        new_x = max(0, min(window_x + event.x_root - start_x, canvas_width - self.width))
+        new_y = max(0, min(window_y + event.y_root - start_y, canvas_height - self.height))
         self.canvas.coords(
             self.window_id,
-            window_x + event.x_root - start_x,
-            window_y + event.y_root - start_y,
+            new_x,
+            new_y,
         )
 
     def start_resize(self, event):
@@ -723,8 +858,15 @@ class DesktopWindow:
         if not self._resize_start:
             return
         start_x, start_y, start_width, start_height = self._resize_start
-        new_width = max(self.min_width, start_width + event.x_root - start_x)
-        new_height = max(self.min_height, start_height + event.y_root - start_y)
+        canvas_width, canvas_height = self._canvas_size()
+        coordinates = self.canvas.coords(self.window_id)
+        window_x, window_y = coordinates[:2]
+        maximum_width = max(1, canvas_width - window_x)
+        maximum_height = max(1, canvas_height - window_y)
+        minimum_width = min(self.min_width, maximum_width)
+        minimum_height = min(self.min_height, maximum_height)
+        new_width = min(max(minimum_width, start_width + event.x_root - start_x), maximum_width)
+        new_height = min(max(minimum_height, start_height + event.y_root - start_y), maximum_height)
         self.width = new_width
         self.height = new_height
         self.canvas.itemconfigure(self.window_id, width=new_width, height=new_height)
@@ -744,6 +886,7 @@ class DesktopWindow:
         self.desktop.taskbar.add_minimized_window(self)
 
     def restore(self):
+        self.constrain_to_desktop()
         if not self.minimized:
             self.canvas.tag_raise(self.window_id)
             return
@@ -770,6 +913,7 @@ class DesktopGUI:
         self.virtual_drives_path = self.settings_path.with_name("virtual_drives.json")
         self.preferences = self.load_preferences()
         self.windows = []
+        self.custom_app_icons = []
         self.root.title("Python OS Desktop")
         self.root.geometry("1280x720")
         self.root.configure(bg="white")
@@ -949,6 +1093,125 @@ class DesktopGUI:
         ):
             return
         self._stop_services()
+        self.root.destroy()
+
+    def uninstall_pyos(self):
+        """Remove pyOS user data and virtual drives while retaining the installation."""
+        warning = (
+            "This permanently removes:\n\n"
+            "• Your pyOS account, passkeys, settings, and custom apps\n"
+            "• Drive A, Drive B, and every registered custom virtual drive\n"
+            "• Other files in the dedicated pyOS data directory\n"
+            "• The pyOS installation configuration\n\n"
+            "The pyOS program, virtual environment, modules, and installed packages remain. "
+            "Files in your normal Downloads directory are not removed. This cannot be undone."
+        )
+        if not messagebox.askyesno("Uninstall pyOS", warning, icon=messagebox.WARNING, parent=self.root):
+            return
+        entered_password = simpledialog.askstring(
+            "Uninstall pyOS", "Enter your current pyOS password:", show="*", parent=self.root,
+        )
+        if entered_password is None:
+            return
+        username = get_username()
+        if username is None or not verify_credentials(username, entered_password):
+            messagebox.showerror("Uninstall pyOS", "The password is incorrect.", parent=self.root)
+            return
+        confirmation = simpledialog.askstring(
+            "Confirm Uninstall",
+            'Type UNINSTALL to permanently remove all pyOS data:',
+            parent=self.root,
+        )
+        if confirmation != "UNINSTALL":
+            messagebox.showinfo("Uninstall pyOS", "Uninstall cancelled.", parent=self.root)
+            return
+
+        config = load_config()
+        install_dir = Path(config["install_dir"]).expanduser().resolve()
+        data_dir = Path(config["data_dir"]).expanduser().resolve()
+        downloads_dir = Path(config["downloads_dir"]).expanduser().resolve()
+        home = Path.home().resolve()
+        failures = []
+
+        def is_dangerous_directory(path):
+            path = path.resolve()
+            if path == Path(path.anchor) or path in {home, install_dir, downloads_dir}:
+                return True
+            return any(protected.is_relative_to(path) for protected in (home, install_dir, downloads_dir))
+
+        def remove_path(path, allow_directory=True):
+            path = Path(path).expanduser()
+            try:
+                if path.is_symlink() or path.is_file():
+                    path.unlink(missing_ok=True)
+                elif path.is_dir() and allow_directory:
+                    if is_dangerous_directory(path):
+                        raise OSError(f"refused unsafe directory target: {path}")
+                    shutil.rmtree(path)
+            except OSError as error:
+                failures.append(f"{path}: {error}")
+
+        registered_drives = self._load_virtual_drives()
+        drive_paths = []
+        for drive in registered_drives:
+            raw_path = drive.get("path")
+            if isinstance(raw_path, str) and raw_path.strip():
+                try:
+                    drive_paths.append(Path(raw_path).expanduser().resolve())
+                except OSError as error:
+                    failures.append(f"{raw_path}: {error}")
+        for path in sorted(set(drive_paths), key=lambda item: len(item.parts), reverse=True):
+            remove_path(path)
+
+        remove_path(self.get_drive_a_path())
+        remove_path(get_drive_b_dir(create=False))
+
+        data_is_dedicated = (
+            data_dir not in {home, install_dir, downloads_dir, Path(data_dir.anchor)}
+            and not any(protected.is_relative_to(data_dir) for protected in (home, install_dir, downloads_dir))
+        )
+        if config.get("configured") and data_is_dedicated:
+            remove_path(data_dir)
+        else:
+            known_data = {
+                self.settings_path,
+                self.virtual_drives_path,
+                get_cli_settings_path(),
+                credentials_path(),
+                self.settings_path.with_name("email_settings.json"),
+                self.settings_path.parent / "apps",
+                data_dir / "Drive_B",
+            }
+            for path in known_data:
+                remove_path(path)
+
+        # Standalone-mode files and mod backups can exist outside the configured data directory.
+        for path in (
+            home / ".pyos_gui_settings.json",
+            home / ".pyOS_settings.json",
+            home / ".pyos_credentials.json",
+            Path(__file__).resolve().parent / ".pyos_mod_backups",
+            CONFIG_FILE,
+        ):
+            remove_path(path)
+
+        self._stop_services()
+        if failures:
+            preview = "\n".join(failures[:8])
+            if len(failures) > 8:
+                preview += f"\n...and {len(failures) - 8} more"
+            messagebox.showwarning(
+                "Uninstall pyOS",
+                "pyOS removed all accessible data, but some items could not be deleted:\n\n" + preview,
+                parent=self.root,
+            )
+        else:
+            messagebox.showinfo(
+                "Uninstall pyOS",
+                "All pyOS data and registered virtual drives were removed. "
+                "The program, modules, and packages remain installed.",
+                parent=self.root,
+            )
         self.root.destroy()
 
     def restart_pyos(self):
@@ -1132,6 +1395,8 @@ class DesktopGUI:
         width = max(1, event.width - 10)
         height = max(1, event.height - 10)
         self.desktop_canvas.itemconfigure(self.icon_layer_id, width=width, height=height)
+        for window in list(self.windows):
+            window.constrain_to_desktop()
         if self.preferences.get("background_mode") == "image":
             if self._background_after is not None:
                 self.root.after_cancel(self._background_after)
@@ -1260,9 +1525,11 @@ class DesktopGUI:
         for launcher in self.icon_container.winfo_children():
             if launcher is self.background_label:
                 continue
+            desktop_icon = getattr(launcher, "_desktop_icon", None)
+            if desktop_icon is not None:
+                desktop_icon.set_colors(surface_bg, text_fg)
+                continue
             launcher.configure(bg=surface_bg)
-            for child in launcher.winfo_children():
-                child.configure(bg=surface_bg, fg=text_fg)
         self.taskbar.apply_colors(chrome_bg, chrome_fg)
         for window in self.windows:
             window.frame.configure(bg=surface_bg)
@@ -1508,6 +1775,60 @@ class DesktopGUI:
             self.open_news,
             780, 84
         )
+        self.refresh_custom_app_icons()
+
+    def _custom_app_name(self, path):
+        """Read a custom app's declared name without executing its code."""
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in tree.body:
+                if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    continue
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if any(isinstance(target, ast.Name) and target.id == "APP_NAME" for target in targets):
+                    value = ast.literal_eval(node.value)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()[:80]
+        except (OSError, SyntaxError, ValueError, TypeError):
+            pass
+        return path.stem.replace("_", " ").title()
+
+    def _launch_custom_app(self, path):
+        try:
+            self.run_custom_app(path)
+        except Exception as error:
+            messagebox.showerror(
+                "Custom App", f"{Path(path).name} could not run:\n\n{error}", parent=self.root,
+            )
+
+    def refresh_custom_app_icons(self):
+        """Synchronize App Maker files with launchers on the desktop."""
+        for icon in self.custom_app_icons:
+            try:
+                icon.frame.destroy()
+            except tk.TclError:
+                pass
+        self.custom_app_icons.clear()
+        apps = sorted(self._custom_apps_directory().glob("*.py"), key=lambda item: item.name.casefold())
+        available_width = max(
+            120, self.icon_container.winfo_width(), self.icon_container.winfo_reqwidth()
+        )
+        columns = max(1, min(11, (available_width - 10) // 110))
+        first_slot = 19
+        for offset, path in enumerate(apps):
+            slot = first_slot + offset
+            x = 10 + (slot % columns) * 110
+            y = 10 + (slot // columns) * 74
+            icon = DesktopIcon(
+                self.icon_container,
+                self._custom_app_name(path),
+                "python_ide",
+                lambda target=path: self._launch_custom_app(target),
+                x,
+                y,
+            )
+            icon.set_colors(self.preferences["surface_bg"], self.preferences["text_fg"])
+            self.custom_app_icons.append(icon)
     
     def open_cli(self):
         """Open CLI application in its own process."""
@@ -2036,6 +2357,8 @@ class DesktopGUI:
                 path.write_text(content, encoding="utf-8")
                 editor.edit_modified(False)
                 status.set(f"Saved {path.name}; backup created in {backup_dir.name}.")
+                if path.parent.resolve() == apps_directory.resolve():
+                    self.refresh_custom_app_icons()
             except (OSError, SyntaxError, ValueError, json.JSONDecodeError) as error:
                 messagebox.showerror("Modding Environment", f"Not saved: {error}", parent=self.root)
 
@@ -2202,6 +2525,7 @@ def build(app, window):
                 current["path"] = destination
                 editor.edit_modified(False)
                 refresh(destination)
+                self.refresh_custom_app_icons()
                 status.set(f"Saved and validated {destination.name}.")
                 return destination
             except (OSError, SyntaxError, ValueError) as error:
@@ -2231,6 +2555,7 @@ def build(app, window):
                 return
             new_app()
             refresh()
+            self.refresh_custom_app_icons()
             status.set("App deleted.")
 
         tk.Button(toolbar, text="New", command=new_app).pack(side=tk.LEFT, padx=(8, 0))
@@ -4860,6 +5185,20 @@ Features:
         remove_passkey_button.pack(side=tk.LEFT, padx=6)
         refresh_passkey_state()
 
+        tk.Label(
+            security, text="DANGER ZONE", font=("Courier New", 11, "bold"),
+            anchor=tk.W, fg="#990000",
+        ).pack(fill=tk.X, padx=16, pady=(18, 5))
+        tk.Label(
+            security,
+            text="Permanently remove all pyOS user data and virtual drives while keeping the program and packages.",
+            justify=tk.LEFT, anchor=tk.W, wraplength=540,
+        ).pack(fill=tk.X, padx=16, pady=4)
+        tk.Button(
+            security, text="Uninstall pyOS...", command=self.uninstall_pyos,
+            fg="#990000",
+        ).pack(anchor=tk.W, padx=16, pady=5)
+
         def apply_settings():
             try:
                 selected_size = max(8, min(14, int(font_size.get())))
@@ -4922,25 +5261,99 @@ Features:
         tk.Button(footer, text="Apply", command=apply_settings).pack(side=tk.RIGHT, padx=4, pady=5)
 
     def show_about(self):
-        """Show about dialog"""
-        about_text = """Python OS v4.0 - Desktop Edition
+        """Show current pyOS information in an embedded desktop window."""
+        window = self.create_window("About pyOS", width=720, height=520)
+        surface = self.preferences["surface_bg"]
+        foreground = self.preferences["text_fg"]
 
-A comprehensive Python-based operating system emulator
-with GUI interface, virtual drives, and advanced features.
+        header = tk.Frame(window.content, bg=self.preferences["chrome_bg"], height=88)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+        about_title = tk.Label(
+            header, text="pyOS", font=("Courier New", 24, "bold"),
+            bg=self.preferences["chrome_bg"], fg=self.preferences["chrome_fg"],
+        )
+        about_title._keep_font = True
+        about_title.pack(anchor=tk.W, padx=18, pady=(12, 0))
+        tk.Label(
+            header, text="Python Desktop Environment",
+            bg=self.preferences["chrome_bg"], fg=self.preferences["chrome_fg"],
+        ).pack(anchor=tk.W, padx=20)
 
-Features:
-• Desktop GUI with Windows-like interface
-• Terminal/CLI mode with command execution
-• Virtual drives (A: temp, B: permanent, C: home)
-• File manager and navigation
-• Theme customization
-• Network diagnostics
-• System information
-• 25+ file operations commands
+        notebook = ttk.Notebook(window.content)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        overview = tk.Frame(notebook, bg=surface)
+        applications = tk.Frame(notebook, bg=surface)
+        privacy = tk.Frame(notebook, bg=surface)
+        system = tk.Frame(notebook, bg=surface)
+        notebook.add(overview, text="Overview")
+        notebook.add(applications, text="Applications")
+        notebook.add(privacy, text="Security & Privacy")
+        notebook.add(system, text="System")
 
-Created with Python & Tkinter
-"""
-        messagebox.showinfo("About Python OS", about_text)
+        overview_text = (
+            "pyOS is a Python and Tkinter desktop environment with movable, resizable, "
+            "minimizable applications and pixel-art desktop launchers.\n\n"
+            "The desktop includes persistent appearance settings, installed-font selection, "
+            "notifications, authentication, Windows Hello passkeys where supported, an "
+            "Command Center, and directory-backed virtual drives.\n\n"
+            "App windows are constrained to the usable desktop so their title bars and "
+            "controls remain reachable."
+        )
+        tk.Label(
+            overview, text=overview_text, justify=tk.LEFT, anchor=tk.NW,
+            wraplength=640, bg=surface, fg=foreground,
+        ).pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+
+        apps_text = (
+            "CORE\nFile Manager • Text Editor • Sticky Notes • Internet Browser\n"
+            "Image Viewer • Media Player • Python IDE • Calculator\n\n"
+            "CONNECTED\nWeather • News • LAN Peer-to-Peer Messenger\n\n"
+            "CREATE AND CUSTOMIZE\nModding Environment • App Maker • Virtual Drive Manager\n\n"
+            "ENTERTAINMENT\nSnake • Sudoku • Automated Chess\n\n"
+            "Apps made with App Maker run in pyOS windows and automatically receive "
+            "their own desktop launchers."
+        )
+        tk.Label(
+            applications, text=apps_text, justify=tk.LEFT, anchor=tk.NW,
+            wraplength=640, bg=surface, fg=foreground,
+        ).pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+
+        privacy_text = (
+            "• Account passwords use salted PBKDF2-SHA256 hashes.\n"
+            "• Passkey private keys remain with Windows Hello.\n"
+            "• Messenger is LAN-only and is not end-to-end encrypted.\n"
+            "• Weather's My Location feature uses IP-based approximate geolocation.\n"
+            "• Weather and News contact external data providers.\n"
+            "• App Maker apps are unrestricted Python and should only be run when trusted.\n"
+            "• Settings > Security can remove pyOS data and virtual drives while preserving modules and packages."
+        )
+        tk.Label(
+            privacy, text=privacy_text, justify=tk.LEFT, anchor=tk.NW,
+            wraplength=640, bg=surface, fg=foreground,
+        ).pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+
+        config = load_config()
+        system_text = (
+            f"User: {self.username or get_username() or 'Not signed in'}\n"
+            f"Python: {platform.python_version()}\n"
+            f"Platform: {platform.platform()}\n"
+            f"Tk: {tk.TkVersion}\n\n"
+            f"Installation: {Path(config['install_dir']).expanduser()}\n"
+            f"Data: {Path(config['data_dir']).expanduser()}\n"
+            f"Drive B: {get_drive_b_dir(create=False)}\n"
+            f"Custom apps: {self._custom_apps_directory()}\n\n"
+            "Built with Python and Tkinter."
+        )
+        tk.Label(
+            system, text=system_text, justify=tk.LEFT, anchor=tk.NW,
+            wraplength=640, bg=surface, fg=foreground,
+        ).pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+
+        footer = tk.Frame(window.content, bg=surface)
+        footer.pack(fill=tk.X, padx=10, pady=(0, 10))
+        tk.Button(footer, text="Settings", command=self.open_settings).pack(side=tk.LEFT)
+        tk.Button(footer, text="Close", command=window.close).pack(side=tk.RIGHT)
     
     def show_context_menu(self, event):
         """Show right-click context menu"""

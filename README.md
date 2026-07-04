@@ -1,6 +1,6 @@
 # pyOS
 
-pyOS is a Python desktop environment containing a graphical desktop, authenticated command center, virtual drives, file tools, media applications, notifications, a games suite, a graphing calculator, and peer-to-peer messaging.
+pyOS is a Python desktop environment containing a graphical desktop, authenticated command center, configurable virtual drives, development and app-making tools, live weather and news, file and media applications, notifications, games, a graphing calculator, and peer-to-peer messaging.
 
 <img width="685" height="387" alt="pyOS" src="https://github.com/user-attachments/assets/16bfe9df-7f53-4034-93d6-840e2414adef" />
 
@@ -55,6 +55,17 @@ To run directly from this project:
 .venv\Scripts\python.exe pyOScli.py
 ```
 
+The GUI can open a specific application after startup with `--app`:
+
+```powershell
+.venv\Scripts\python.exe pyOSgui.py --app weather
+.venv\Scripts\python.exe pyOSgui.py --app news
+.venv\Scripts\python.exe pyOSgui.py --app modding
+.venv\Scripts\python.exe pyOSgui.py --app virtual-drives
+```
+
+Authentication still occurs before the requested application opens.
+
 ## Authentication
 
 On first use, pyOS asks you to create a username and password. The account is stored permanently in the configured shared data directory (or in your home directory when running without setup). Passwords are stored as salted PBKDF2-SHA256 hashes, not as plain text.
@@ -77,7 +88,7 @@ On first use, pyOS asks you to create a username and password. The account is st
 - Left-click empty desktop space to open the desktop menu.
 - Right-click the desktop for application shortcuts.
 
-The default appearance is monochrome. Open **Settings > Appearance** to change system colors or use a solid/image desktop background. Animated GIF backgrounds are supported.
+The default appearance is monochrome. Open **Settings > Appearance** to change system colors, select an installed text font and size, or use a solid/image desktop background. Animated GIF backgrounds are supported.
 
 ## System Bar
 
@@ -192,6 +203,62 @@ Plays common audio and video formats with VLC.
 
 Edit, run, stop, and debug Python scripts. Program output appears in the embedded output console.
 
+### Modding Environment
+
+The Modding Environment provides direct access to pyOS source and configuration files from inside the desktop.
+
+- Edit every Python module in the project and all applications created with App Maker.
+- Validate Python syntax or JSON before saving.
+- Save with `Ctrl+S` or **Save + Validate**.
+- Create timestamped backups in `.pyos_mod_backups` before files are changed.
+- Exclude virtual environments, caches, Git metadata, and backup directories from the source list.
+
+Changes to pyOS source generally require restarting the desktop. Source mods execute with the same permissions as pyOS, so only use code you understand and trust.
+
+#### App Maker
+
+Select **App Maker** from the Modding Environment to create applications that run in embedded pyOS windows.
+
+- Start from a working Python template.
+- Create, edit, rename, validate, run, and delete apps.
+- Run an app immediately with **Run Inside pyOS**.
+- Store custom apps in the shared pyOS data directory under `apps`.
+- Back up overwritten custom apps automatically.
+
+Each custom app defines an optional `APP_NAME` and a required entry point:
+
+```python
+APP_NAME = "Example"
+
+def build(app, window):
+    tk.Label(window.content, text="Hello from pyOS").pack(pady=20)
+```
+
+The runtime supplies `tk`, `ttk`, and `messagebox`. The `app` argument is the active `DesktopGUI`, and `window.content` is the app's parent frame. App Maker code is unrestricted Python and runs inside the desktop process; a faulty or malicious app can access files, network resources, credentials available to the process, or destabilize pyOS.
+
+### Weather
+
+Weather displays current conditions and a seven-day forecast.
+
+- Select **My Location** to use an approximate IP-based location.
+- Search manually by city or postcode.
+- View temperature, apparent temperature, humidity, cloud cover, precipitation, pressure, wind, and gusts.
+- View daily conditions, temperature ranges, rain probability, and maximum wind speed.
+
+Forecast data comes from Open-Meteo. **My Location** sends the public IP address to `ipapi.co` for approximate geolocation; use manual search if you do not want that lookup. Weather requests run in the background and require an internet connection.
+
+### News
+
+News displays current stories from Google News RSS.
+
+- Browse top stories, World, UK, Business, Technology, Science, Health, Sports, and Entertainment.
+- Search by keyword.
+- Read the source, publication date, and feed summary.
+- Double-click a headline or select **Open Full Story** to open the article in the system browser.
+- Refresh feeds without blocking the desktop.
+
+News requires an internet connection. Headlines and summaries are supplied by third parties and may link to external sites with their own privacy policies or subscriptions.
+
 ### Calculator
 
 <img width="1023" height="597" alt="image" src="https://github.com/user-attachments/assets/4f6d2f90-d459-4337-9328-9c29f3fd4054" />
@@ -246,7 +313,7 @@ Settings are saved in the data directory selected by setup.
 
 - Solid-color or image desktop background
 - Editable desktop, window, text, title-bar, and title-text colors
-- Interface font size
+- Installed text-font family and interface font size
 - **Defaults** restores the monochrome color scheme
 
 ### Clock
@@ -278,6 +345,17 @@ Settings are saved in the data directory selected by setup.
 - **A:** temporary storage under the operating system's temporary directory
 - **B:** persistent storage in the data location selected during setup
 - **C:** user home directory in the CLI
+
+Open **Virtual Drives** to create additional directory-backed drives. Each drive has:
+
+- A unique name and parent location
+- A configured quota value in MB
+- Persistent or temporary storage metadata
+- A read-only configuration flag
+
+Double-click a registered drive or select **Open** to browse it in File Manager. **Unregister** removes its pyOS registration without deleting its directory or files. Quotas, storage mode, and read-only status are currently descriptive configuration metadata; pyOS does not enforce them at filesystem level.
+
+Custom drive definitions are stored as `virtual_drives.json` beside the GUI settings file.
 
 The shared setup configuration is stored in:
 
@@ -325,7 +403,8 @@ play <file>               Play audio or video
 The Command Center's **Apps** menu and CLI commands can launch every pyOS desktop
 application directly. Run `apps` to list them, or use commands such as
 `calculator`, `messenger`, `games`, `ide`, `notepad`, `images`,
-`desktop_browser`, and `desktop_media`.
+`desktop_browser`, and `desktop_media`. The GUI also accepts `--app weather`,
+`--app news`, `--app modding`, and `--app virtual-drives`.
 
 ### System and Console
 

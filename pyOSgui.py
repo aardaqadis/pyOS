@@ -386,6 +386,64 @@ def evaluate_calculator_expression(expression, x=None, variables=None):
         raise ValueError("Result is not a finite real number.")
     return result
 
+class FlatButton(tk.Label):
+    """Label-based button that honors bg/fg colors on every platform.
+
+    macOS Aqua ignores a tk.Button's background color, which left
+    chrome-colored buttons (white text on a black bar) rendering as white
+    text on the native pale-grey button face. A Label paints its colors
+    faithfully; Enter/Leave swap to the active colors for hover feedback.
+    """
+
+    def __init__(self, master=None, **kwargs):
+        self._command = kwargs.pop("command", None)
+        self._active_bg = kwargs.pop("activebackground", None)
+        self._active_fg = kwargs.pop("activeforeground", None)
+        kwargs.setdefault("cursor", "hand2")
+        super().__init__(master, **kwargs)
+        self._hovered = False
+        self._normal_bg = self.cget("bg")
+        self._normal_fg = self.cget("fg")
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", lambda event: self.invoke())
+
+    def _on_enter(self, _event):
+        self._hovered = True
+        self._normal_bg = self.cget("bg")
+        self._normal_fg = self.cget("fg")
+        super().configure(
+            bg=self._active_bg or self._normal_fg,
+            fg=self._active_fg or self._normal_bg,
+        )
+
+    def _on_leave(self, _event):
+        if self._hovered:
+            self._hovered = False
+            super().configure(bg=self._normal_bg, fg=self._normal_fg)
+
+    def invoke(self):
+        if self._command is not None:
+            self._command()
+
+    def configure(self, cnf=None, **kwargs):
+        options = dict(cnf or {})
+        options.update(kwargs)
+        if "command" in options:
+            self._command = options.pop("command")
+        if "activebackground" in options:
+            self._active_bg = options.pop("activebackground")
+        if "activeforeground" in options:
+            self._active_fg = options.pop("activeforeground")
+        if self._hovered and options.keys() & {"bg", "background", "fg", "foreground"}:
+            self._hovered = False
+        if not options and (cnf is not None or kwargs):
+            return None
+        return super().configure(**options)
+
+    config = configure
+
+
 class DesktopIcon:
     """A text-only desktop launcher styled like an early desktop OS."""
     GRID_MARGIN = 10
@@ -694,7 +752,7 @@ class Taskbar:
     def add_minimized_window(self, window):
         if window in self.window_buttons:
             return
-        button = tk.Button(
+        button = FlatButton(
             self.windows_frame,
             text=window.title[:18],
             command=window.restore,
@@ -775,7 +833,7 @@ class DesktopWindow:
         )
         self.title_label.pack(side=tk.LEFT, padx=8)
 
-        self.close_button = tk.Button(
+        self.close_button = FlatButton(
             self.titlebar,
             text="X",
             command=self.close,
@@ -786,7 +844,7 @@ class DesktopWindow:
         )
         self.close_button.pack(side=tk.RIGHT, fill=tk.Y)
 
-        self.minimize_button = tk.Button(
+        self.minimize_button = FlatButton(
             self.titlebar,
             text="_",
             command=self.minimize,
@@ -1104,7 +1162,7 @@ class DesktopGUI:
         self.system_menu_buttons = []
 
         def add_menu(label, postcommand=None):
-            button = tk.Button(
+            button = FlatButton(
                 self.system_bar, text=label, bg=chrome, fg=chrome_text,
                 activebackground=self.preferences.get("surface_bg", "#ffffff"),
                 activeforeground=self.preferences.get("text_fg", "#000000"),

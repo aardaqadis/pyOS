@@ -46,11 +46,12 @@ class InstallerCore:
     """Performs installation independently from the wizard UI."""
 
     def __init__(self, install_dir, data_dir, downloads_dir, install_vlc=True,
-                 create_shortcuts=True, dry_run=False, logger=print):
+                 install_ollama=True, create_shortcuts=True, dry_run=False, logger=print):
         self.install_dir = Path(install_dir).expanduser().resolve()
         self.data_dir = Path(data_dir).expanduser().resolve()
         self.downloads_dir = Path(downloads_dir).expanduser().resolve()
         self.install_vlc = install_vlc
+        self.install_ollama = install_ollama
         self.create_shortcuts = create_shortcuts
         self.dry_run = dry_run
         self.log = logger
@@ -173,6 +174,61 @@ class InstallerCore:
             "Downloading and installing VLC media runtime",
         )
 
+    @staticmethod
+    def ollama_installed():
+        # winget/brew installs may not be on PATH in the current session,
+        # so also probe the known install locations.
+        if shutil.which("ollama"):
+            return True
+        candidates = [
+            Path("/Applications/Ollama.app"),
+            Path.home() / "Applications" / "Ollama.app",
+            Path("/usr/local/bin/ollama"),
+            Path("/usr/bin/ollama"),
+        ]
+        local_appdata = os.environ.get("LOCALAPPDATA", "")
+        if local_appdata:
+            candidates.append(Path(local_appdata) / "Programs" / "Ollama" / "ollama.exe")
+        return any(path.exists() for path in candidates)
+
+    def install_ai_runtime(self):
+        if not self.install_ollama or self.ollama_installed():
+            self.log("Ollama AI runtime is already available" if self.ollama_installed()
+                     else "Ollama installation skipped")
+            return
+        if sys.platform == "darwin":
+            brew = shutil.which("brew")
+            if not brew:
+                warning = ("Ollama was not installed because Homebrew is unavailable; install it from "
+                           "https://ollama.com/download for the pyAI app.")
+                self.warnings.append(warning)
+                self.log("WARNING: " + warning)
+                return
+            self.run_command(
+                [brew, "install", "ollama"],
+                "Downloading and installing Ollama AI runtime",
+            )
+            self.log("Start the AI server with 'ollama serve' (or 'brew services start ollama').")
+            return
+        if os.name == "nt":
+            winget = shutil.which("winget")
+            if not winget:
+                warning = ("Ollama was not installed because winget is unavailable; "
+                           "the pyAI app will require Ollama from https://ollama.com/download.")
+                self.warnings.append(warning)
+                self.log("WARNING: " + warning)
+                return
+            self.run_command(
+                [winget, "install", "--id", "Ollama.Ollama", "--exact", "--silent",
+                 "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"],
+                "Downloading and installing Ollama AI runtime",
+            )
+            return
+        warning = ("Ollama was not installed automatically on this platform; install it with "
+                   "'curl -fsSL https://ollama.com/install.sh | sh' for the pyAI app.")
+        self.warnings.append(warning)
+        self.log("NOTE: " + warning)
+
     def write_launchers(self):
         self.log("Creating pyOS launchers")
         gui_launcher = self.install_dir / "pyOS GUI.cmd"
@@ -223,6 +279,7 @@ class InstallerCore:
         self.copy_application()
         self.create_environment()
         self.install_media_runtime()
+        self.install_ai_runtime()
         self.write_launchers()
         self.write_configuration()
         self.log("pyOS installation completed")
@@ -251,6 +308,7 @@ class SetupWizard:
         self.data_var = tk.StringVar(value=str(defaults["data_dir"]))
         self.downloads_var = tk.StringVar(value=str(defaults["downloads_dir"]))
         self.vlc_var = tk.BooleanVar(value=True)
+        self.ollama_var = tk.BooleanVar(value=True)
         self.shortcuts_var = tk.BooleanVar(value=True)
         self.launch_var = tk.BooleanVar(value=True)
 
@@ -338,6 +396,9 @@ class SetupWizard:
                        bg="white", fg="black", anchor=tk.W).pack(fill=tk.X, pady=5)
         tk.Checkbutton(self.content, text="Install VLC media runtime when missing", variable=self.vlc_var,
                        bg="white", fg="black", anchor=tk.W).pack(fill=tk.X, pady=5)
+        tk.Checkbutton(self.content, text="Install Ollama local AI runtime when missing (pyAI)",
+                       variable=self.ollama_var,
+                       bg="white", fg="black", anchor=tk.W).pack(fill=tk.X, pady=5)
         tk.Checkbutton(self.content, text="Create desktop shortcuts", variable=self.shortcuts_var,
                        bg="white", fg="black", anchor=tk.W).pack(fill=tk.X, pady=5)
 
@@ -372,7 +433,8 @@ class SetupWizard:
         try:
             installer = InstallerCore(
                 self.install_var.get(), self.data_var.get(), self.downloads_var.get(),
-                install_vlc=self.vlc_var.get(), create_shortcuts=self.shortcuts_var.get(),
+                install_vlc=self.vlc_var.get(), install_ollama=self.ollama_var.get(),
+                create_shortcuts=self.shortcuts_var.get(),
                 logger=self.append_log,
             )
             self.install_result = installer.install()
@@ -448,6 +510,7 @@ def parse_arguments():
     parser.add_argument("--data-dir", default=str(defaults["data_dir"]))
     parser.add_argument("--downloads-dir", default=str(defaults["downloads_dir"]))
     parser.add_argument("--no-vlc", action="store_true")
+    parser.add_argument("--no-ollama", action="store_true")
     parser.add_argument("--no-shortcuts", action="store_true")
     return parser.parse_args()
 
@@ -457,7 +520,8 @@ def main():
     if args.quiet or args.dry_run:
         installer = InstallerCore(
             args.install_dir, args.data_dir, args.downloads_dir,
-            install_vlc=not args.no_vlc, create_shortcuts=not args.no_shortcuts,
+            install_vlc=not args.no_vlc, install_ollama=not args.no_ollama,
+            create_shortcuts=not args.no_shortcuts,
             dry_run=args.dry_run,
         )
         installer.install()

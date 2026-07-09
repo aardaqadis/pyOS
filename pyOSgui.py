@@ -512,6 +512,11 @@ class DesktopIcon:
             outline_box(1, 1, 10, 6)
             block(3, 7, 2, 1); block(2, 8, 2, 1)
             block(3, 3); block(5, 3); block(7, 3)
+        elif kind == "ai_chat":
+            block(5, 0, 2, 1)
+            outline_box(2, 1, 8, 7)
+            block(4, 3); block(7, 3)
+            block(4, 5, 4, 1)
         elif kind == "games":
             block(2, 3, 8, 4)
             block(1, 5, 2, 3); block(9, 5, 2, 3)
@@ -900,6 +905,94 @@ class DesktopWindow:
         self.canvas.itemconfigure(self.window_id, state=tk.NORMAL)
         self.canvas.tag_raise(self.window_id)
         self.desktop.taskbar.remove_minimized_window(self)
+
+
+class OllamaClient:
+    """Minimal stdlib client for a local Ollama server (pyAI backend)."""
+
+    def __init__(self, base_url="http://localhost:11434"):
+        self.base_url = base_url.rstrip("/")
+
+    def _request(self, path, payload=None, timeout=10):
+        url = f"{self.base_url}{path}"
+        data = None
+        headers = {}
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        return urllib.request.urlopen(
+            urllib.request.Request(url, data=data, headers=headers), timeout=timeout
+        )
+
+    def list_models(self):
+        """Return installed model names; doubles as the server liveness probe."""
+        with self._request("/api/tags", timeout=3) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return [model.get("name", "") for model in payload.get("models", [])]
+
+    def has_model(self, name):
+        wanted = name if ":" in name else f"{name}:"
+        for installed in self.list_models():
+            if installed == name or installed.startswith(wanted):
+                return True
+        return False
+
+    def pull(self, name, on_progress, cancel_event):
+        """Download a model, reporting NDJSON progress lines via on_progress."""
+        # Current Ollama expects "model"; very old servers used "name".
+        with self._request("/api/pull", {"model": name, "stream": True}, timeout=60) as response:
+            for line in response:
+                if cancel_event.is_set():
+                    return False
+                try:
+                    chunk = json.loads(line.decode("utf-8"))
+                except ValueError:
+                    continue
+                if chunk.get("error"):
+                    raise OSError(chunk["error"])
+                on_progress(chunk.get("status", ""), chunk.get("completed"), chunk.get("total"))
+                if chunk.get("status") == "success":
+                    return True
+        return True
+
+    def chat(self, name, messages, on_token, cancel_event):
+        """Stream a chat completion; on_token(text, done) per NDJSON line.
+
+        The 300s timeout is per socket read: a cold model load on CPU can take
+        more than a minute before the first token arrives.
+        """
+        payload = {"model": name, "messages": messages, "stream": True}
+        with self._request("/api/chat", payload, timeout=300) as response:
+            for line in response:
+                if cancel_event.is_set():
+                    return
+                try:
+                    chunk = json.loads(line.decode("utf-8"))
+                except ValueError:
+                    continue
+                if chunk.get("error"):
+                    raise OSError(chunk["error"])
+                on_token(chunk.get("message", {}).get("content", ""), bool(chunk.get("done")))
+                if chunk.get("done"):
+                    return
+
+    @staticmethod
+    def binary_installed():
+        """Detect an Ollama install even before PATH picks it up (fresh winget/brew)."""
+        if shutil.which("ollama"):
+            return True
+        candidates = []
+        if sys.platform == "darwin":
+            candidates.append(Path("/Applications/Ollama.app"))
+            candidates.append(Path.home() / "Applications" / "Ollama.app")
+        elif os.name == "nt":
+            local_appdata = os.environ.get("LOCALAPPDATA", "")
+            if local_appdata:
+                candidates.append(Path(local_appdata) / "Programs" / "Ollama" / "ollama.exe")
+        else:
+            candidates.append(Path("/usr/local/bin/ollama"))
+            candidates.append(Path("/usr/bin/ollama"))
+        return any(candidate.exists() for candidate in candidates)
 
 
 class DesktopGUI:
@@ -1428,6 +1521,8 @@ class DesktopGUI:
             "taskbar_shortcuts": [],
             "notifications_enabled": True,
             "tips_enabled": True,
+            "ai_chat_model": "llama3.2",
+            "ai_chat_url": "http://localhost:11434",
         }
         try:
             saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
@@ -1470,6 +1565,10 @@ class DesktopGUI:
         ][:12]
         defaults["notifications_enabled"] = bool(defaults["notifications_enabled"])
         defaults["tips_enabled"] = bool(defaults["tips_enabled"])
+        if not isinstance(defaults.get("ai_chat_model"), str) or not defaults["ai_chat_model"].strip():
+            defaults["ai_chat_model"] = "llama3.2"
+        if not isinstance(defaults.get("ai_chat_url"), str) or not defaults["ai_chat_url"].startswith("http"):
+            defaults["ai_chat_url"] = "http://localhost:11434"
         return defaults
 
     def save_preferences(self):
@@ -1788,6 +1887,14 @@ class DesktopGUI:
             "dispenser",
             self.open_dispenser,
             890, 84
+        )
+
+        self.ai_chat_icon = DesktopIcon(
+            self.icon_container,
+            "pyAI",
+            "ai_chat",
+            self.open_ai_chat,
+            1000, 84
         )
         self.refresh_custom_app_icons()
 
@@ -4141,6 +4248,318 @@ def build(app, window):
         note.focus_set()
         return window
 
+    def open_ai_chat(self):
+        """Open pyAI, the chat assistant backed by a local Ollama server."""
+        surface_bg = self.preferences["surface_bg"]
+        text_fg = self.preferences["text_fg"]
+        font_size = self.preferences["font_size"]
+        window = self.create_window("pyAI", width=640, height=520)
+        window.min_width = 420
+        window.min_height = 360
+
+        state = {
+            "phase": "checking",
+            "closed": False,
+            "cancel": threading.Event(),
+            "history": [],
+        }
+
+        def client():
+            return OllamaClient(self.preferences["ai_chat_url"])
+
+        toolbar = tk.Frame(window.content, bg=surface_bg, relief=tk.RAISED, bd=1)
+        toolbar.pack(fill=tk.X)
+        tk.Label(toolbar, text="Model:", bg=surface_bg, fg=text_fg).pack(side=tk.LEFT, padx=(6, 2), pady=3)
+        model_var = tk.StringVar(value=self.preferences["ai_chat_model"])
+        model_entry = tk.Entry(
+            toolbar, textvariable=model_var, width=16,
+            bg=surface_bg, fg=text_fg, insertbackground=text_fg,
+        )
+        model_entry.pack(side=tk.LEFT, pady=3)
+
+        transcript = scrolledtext.ScrolledText(
+            window.content,
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+            bg=surface_bg,
+            fg=text_fg,
+            font=("Courier New", font_size),
+            relief=tk.FLAT,
+            padx=10,
+            pady=8,
+        )
+        transcript.tag_configure("you", font=("Courier New", font_size, "bold"))
+        transcript.tag_configure("system", font=("Courier New", font_size, "italic"))
+
+        action_frame = tk.Frame(window.content, bg=surface_bg)
+        action_label = tk.Label(
+            action_frame, bg=surface_bg, fg=text_fg,
+            wraplength=560, justify=tk.LEFT, anchor=tk.W,
+        )
+        action_button = tk.Button(action_frame, text="")
+        retry_button = tk.Button(action_frame, text="Retry")
+
+        input_frame = tk.Frame(window.content, bg=surface_bg)
+        input_box = tk.Text(
+            input_frame, height=3, wrap=tk.WORD,
+            bg=surface_bg, fg=text_fg, insertbackground=text_fg,
+            font=("Courier New", font_size), relief=tk.SOLID, bd=1,
+        )
+        input_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 3), pady=4)
+        send_button = tk.Button(input_frame, text="Send", width=6, state=tk.DISABLED)
+        send_button.pack(side=tk.RIGHT, padx=(3, 6), pady=4)
+
+        status_var = tk.StringVar(value="Checking Ollama...")
+        status = tk.Label(window.content, textvariable=status_var, bg=surface_bg, fg=text_fg, anchor=tk.W)
+
+        # Top-to-bottom pack order; action_frame collapses when its children hide.
+        transcript.pack(fill=tk.BOTH, expand=True)
+        action_frame.pack(fill=tk.X)
+        input_frame.pack(fill=tk.X)
+        status.pack(fill=tk.X, padx=6, pady=(0, 3))
+
+        def alive():
+            return not state["closed"] and transcript.winfo_exists()
+
+        def append_transcript(text, tag=None):
+            transcript.config(state=tk.NORMAL)
+            if tag:
+                transcript.insert(tk.END, text, tag)
+            else:
+                transcript.insert(tk.END, text)
+            transcript.see(tk.END)
+            transcript.config(state=tk.DISABLED)
+
+        def hide_action():
+            action_label.pack_forget()
+            action_button.pack_forget()
+            retry_button.pack_forget()
+
+        def show_action(message, button_text=None, command=None, show_retry=True):
+            hide_action()
+            action_label.config(text=message)
+            action_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6, pady=4)
+            if show_retry:
+                retry_button.config(command=run_check)
+                retry_button.pack(side=tk.RIGHT, padx=(3, 6), pady=4)
+            if button_text:
+                action_button.config(text=button_text, command=command)
+                action_button.pack(side=tk.RIGHT, padx=3, pady=4)
+
+        def current_model():
+            return model_var.get().strip() or "llama3.2"
+
+        def set_ready():
+            state["phase"] = "ready"
+            hide_action()
+            send_button.config(state=tk.NORMAL, command=send_message)
+            status_var.set(f"{current_model()} — ready")
+            input_box.focus_set()
+
+        def handle_offline():
+            if OllamaClient.binary_installed():
+                state["phase"] = "not_running"
+                status_var.set("Ollama is not running")
+                show_action(
+                    "Ollama is installed but not running. Start it, or run 'ollama serve' in a terminal.",
+                    "Start Ollama", start_server,
+                )
+            else:
+                state["phase"] = "not_installed"
+                status_var.set("Ollama is not installed")
+                show_action(
+                    "pyAI needs Ollama, a free local AI runtime. Install it from ollama.com/download "
+                    "(or re-run pyOS Setup, which can install it), then press Retry.",
+                    "Get Ollama", lambda: webbrowser.open("https://ollama.com/download"),
+                )
+
+        def handle_models(names, model):
+            wanted = model if ":" in model else f"{model}:"
+            if any(installed == model or installed.startswith(wanted) for installed in names):
+                set_ready()
+            else:
+                state["phase"] = "model_missing"
+                status_var.set(f"Model {model} not downloaded")
+                show_action(
+                    f"The model '{model}' is not downloaded yet (about 2 GB for llama3.2). "
+                    "Download it now? This is a one-time step.",
+                    "Download model", start_pull,
+                )
+
+        def run_check():
+            state["phase"] = "checking"
+            hide_action()
+            send_button.config(state=tk.DISABLED)
+            status_var.set("Checking Ollama...")
+            model = current_model()
+
+            def worker():
+                try:
+                    names = client().list_models()
+                except (urllib.error.URLError, OSError, ValueError):
+                    self.root.after(0, lambda: alive() and handle_offline())
+                    return
+                self.root.after(0, lambda found=names: alive() and handle_models(found, model))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def poll_server(attempts):
+            def worker():
+                try:
+                    client().list_models()
+                except (urllib.error.URLError, OSError, ValueError):
+                    if attempts > 1:
+                        self.root.after(1000, lambda: alive() and poll_server(attempts - 1))
+                    else:
+                        self.root.after(0, lambda: alive() and handle_offline())
+                    return
+                self.root.after(0, lambda: alive() and run_check())
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def start_server():
+            try:
+                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+                subprocess.Popen(
+                    ["ollama", "serve"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=flags,
+                )
+            except OSError as error:
+                status_var.set(f"Could not start Ollama: {error}")
+                return
+            hide_action()
+            status_var.set("Starting Ollama...")
+            poll_server(10)
+
+        def start_pull():
+            model = current_model()
+            hide_action()
+            state["phase"] = "pulling"
+            state["cancel"] = threading.Event()
+            cancel_event = state["cancel"]
+            status_var.set(f"Pulling {model}...")
+            show_action(f"Downloading '{model}'. You can keep using the desktop meanwhile.",
+                        "Cancel", cancel_event.set, show_retry=False)
+
+            def on_progress(status_text, completed, total):
+                if completed and total:
+                    message = f"Pulling {model}: {int(completed * 100 / total)}%"
+                else:
+                    message = f"Pulling {model}: {status_text or '...'}"
+                self.root.after(0, lambda text=message: alive() and status_var.set(text))
+
+            def worker():
+                try:
+                    client().pull(model, on_progress, cancel_event)
+                    error = None
+                except (urllib.error.URLError, OSError, ValueError) as exc:
+                    error = str(exc)
+
+                def done():
+                    if not alive():
+                        return
+                    if cancel_event.is_set():
+                        status_var.set("Download cancelled")
+                        handle_models([], model)
+                    elif error:
+                        status_var.set(f"Download failed: {error}")
+                        handle_models([], model)
+                    else:
+                        run_check()
+
+                self.root.after(0, done)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def finish_generation(tokens, error, cancel_event):
+            if not alive():
+                return
+            reply = "".join(tokens)
+            if reply:
+                # A stopped partial reply is still valid conversation context.
+                state["history"].append({"role": "assistant", "content": reply})
+            if cancel_event.is_set():
+                append_transcript(" [stopped]\n\n", "system")
+            elif error:
+                append_transcript(f"\n[error: {error}]\n\n", "system")
+            else:
+                append_transcript("\n\n")
+            set_ready()
+
+        def send_message(event=None):
+            if state["phase"] != "ready":
+                return "break"
+            prompt = input_box.get("1.0", "end-1c").strip()
+            if not prompt:
+                return "break"
+            input_box.delete("1.0", tk.END)
+            model = current_model()
+            state["history"].append({"role": "user", "content": prompt})
+            append_transcript(f"YOU> {prompt}\n", "you")
+            append_transcript(f"{model.upper()}> ")
+            state["phase"] = "generating"
+            state["cancel"] = threading.Event()
+            cancel_event = state["cancel"]
+            send_button.config(state=tk.DISABLED)
+            status_var.set("Generating... (Stop below)")
+            show_action("", "Stop", cancel_event.set, show_retry=False)
+            tokens = []
+
+            def on_token(text, done):
+                if text:
+                    tokens.append(text)
+                    self.root.after(0, lambda chunk=text: alive() and append_transcript(chunk))
+
+            def worker():
+                try:
+                    client().chat(model, list(state["history"]), on_token, cancel_event)
+                    error = None
+                except (urllib.error.URLError, OSError, ValueError) as exc:
+                    error = str(exc)
+                self.root.after(0, lambda: finish_generation(tokens, error, cancel_event))
+
+            threading.Thread(target=worker, daemon=True).start()
+            return "break"
+
+        def new_chat():
+            if state["phase"] in {"generating", "pulling"}:
+                state["cancel"].set()
+            state["history"] = []
+            transcript.config(state=tk.NORMAL)
+            transcript.delete("1.0", tk.END)
+            transcript.config(state=tk.DISABLED)
+
+        def apply_model(event=None):
+            name = model_var.get().strip()
+            if not name:
+                model_var.set(self.preferences["ai_chat_model"])
+                return
+            if name != self.preferences["ai_chat_model"]:
+                self.preferences["ai_chat_model"] = name
+                self.save_preferences()
+                if state["phase"] not in {"generating", "pulling"}:
+                    run_check()
+
+        def close_chat():
+            state["closed"] = True
+            state["cancel"].set()
+            window.close()
+
+        tk.Button(toolbar, text="New Chat", command=new_chat).pack(side=tk.LEFT, padx=6, pady=3)
+        model_entry.bind("<Return>", apply_model)
+        model_entry.bind("<FocusOut>", apply_model)
+        input_box.bind("<Return>", send_message)
+        input_box.bind("<Shift-Return>", lambda event: None)
+        window.close_button.configure(command=close_chat)
+
+        append_transcript(
+            "pyAI runs a language model locally through Ollama.\n"
+            "Nothing you type leaves this computer.\n\n", "system",
+        )
+        run_check()
+        return window
+
     def open_dispenser(self):
         """Open the Dispenser, a dot matrix printer that prints sausage pixel art."""
         surface_bg = self.preferences["surface_bg"]
@@ -6072,6 +6491,7 @@ DESKTOP_APP_LAUNCHERS = {
     "virtual-drives": "open_virtual_drive_manager",
     "weather": "open_weather",
     "news": "open_news",
+    "pyai": "open_ai_chat",
     "about": "show_about",
 }
 

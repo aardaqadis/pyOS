@@ -129,15 +129,24 @@ class InstallerCore:
 
     @staticmethod
     def vlc_installed():
-        candidates = (
-            Path(os.environ.get("ProgramFiles", "")) / "VideoLAN" / "VLC" / "libvlc.dll",
-            Path(os.environ.get("ProgramFiles(x86)", "")) / "VideoLAN" / "VLC" / "libvlc.dll",
-        )
+        if sys.platform == "darwin":
+            candidates = (
+                Path("/Applications/VLC.app/Contents/MacOS/lib/libvlccore.dylib"),
+                Path.home() / "Applications/VLC.app/Contents/MacOS/lib/libvlccore.dylib",
+            )
+        else:
+            candidates = (
+                Path(os.environ.get("ProgramFiles", "")) / "VideoLAN" / "VLC" / "libvlc.dll",
+                Path(os.environ.get("ProgramFiles(x86)", "")) / "VideoLAN" / "VLC" / "libvlc.dll",
+            )
         return any(path.is_file() for path in candidates)
 
     def install_media_runtime(self):
         if not self.install_vlc or self.vlc_installed():
             self.log("VLC media runtime is already available" if self.vlc_installed() else "VLC installation skipped")
+            return
+        if sys.platform == "darwin":
+            self.install_media_runtime_macos()
             return
         winget = shutil.which("winget")
         if not winget:
@@ -148,6 +157,19 @@ class InstallerCore:
         self.run_command(
             [winget, "install", "--id", "VideoLAN.VLC", "--exact", "--silent",
              "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"],
+            "Downloading and installing VLC media runtime",
+        )
+
+    def install_media_runtime_macos(self):
+        brew = shutil.which("brew")
+        if not brew:
+            warning = ("VLC was not installed because Homebrew is unavailable; install VLC from "
+                       "https://www.videolan.org/vlc/ for media playback.")
+            self.warnings.append(warning)
+            self.log("WARNING: " + warning)
+            return
+        self.run_command(
+            [brew, "install", "--cask", "vlc"],
             "Downloading and installing VLC media runtime",
         )
 

@@ -216,7 +216,7 @@ Plays common audio and video formats with VLC.
 
 - Open, play/pause, stop, seek, mute, and adjust volume.
 - VLC Media Player and the `python-vlc` package must both be installed.
-- Setup can install VLC automatically on Windows through `winget`.
+- Setup can install VLC automatically on Windows through `winget` and on macOS through Homebrew (`brew install --cask vlc`).
 
 ### Python IDE
 
@@ -448,12 +448,23 @@ exit                       Close pyOS CLI
 
 ### Media Player Reports Missing VLC
 
-Install both components:
+Install both components. The `python-vlc` package is installed by setup; if VLC
+itself is missing, install it for your platform.
+
+On Windows:
 
 ```powershell
 .venv\Scripts\python.exe -m pip install python-vlc
 winget install --id VideoLAN.VLC --exact
 ```
+
+On macOS:
+
+```bash
+brew install --cask vlc
+```
+
+(or download VLC from https://www.videolan.org/vlc/ and move it to `/Applications`).
 
 Restart pyOS after installation.
 

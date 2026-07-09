@@ -517,6 +517,12 @@ class DesktopIcon:
             block(1, 5, 2, 3); block(9, 5, 2, 3)
             block(4, 4, 1, 3); block(3, 5, 3, 1)
             block(8, 4); block(9, 5)
+        elif kind == "dispenser":
+            block(3, 0, 6, 2)
+            outline_box(1, 2, 10, 4)
+            block(8, 3); block(3, 4, 4, 1)
+            block(3, 6, 6, 3)
+            block(4, 7, 4, 1, fill=background)
         else:
             outline_box(2, 0, 8, 9)
             block(7, 0, 1, 3); block(8, 2, 2, 1)
@@ -1775,6 +1781,14 @@ class DesktopGUI:
             self.open_news,
             780, 84
         )
+
+        self.dispenser_icon = DesktopIcon(
+            self.icon_container,
+            "Dispenser",
+            "dispenser",
+            self.open_dispenser,
+            890, 84
+        )
         self.refresh_custom_app_icons()
 
     def _custom_app_name(self, path):
@@ -1814,7 +1828,7 @@ class DesktopGUI:
             120, self.icon_container.winfo_width(), self.icon_container.winfo_reqwidth()
         )
         columns = max(1, min(11, (available_width - 10) // 110))
-        first_slot = 19
+        first_slot = 20
         for offset, path in enumerate(apps):
             slot = first_slot + offset
             x = 10 + (slot % columns) * 110
@@ -4127,6 +4141,119 @@ def build(app, window):
         note.focus_set()
         return window
 
+    def open_dispenser(self):
+        """Open the Dispenser, a dot matrix printer that prints sausage pixel art."""
+        surface_bg = self.preferences["surface_bg"]
+        text_fg = self.preferences["text_fg"]
+        window = self.create_window("Dispenser", width=700, height=520)
+
+        scale = 10
+        art_width = len(DISPENSER_ARTWORK[0][0]) * scale
+        line_height = 20
+
+        scrollbar = tk.Scrollbar(window.content, orient=tk.VERTICAL)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 4), pady=8)
+        paper = tk.Canvas(
+            window.content,
+            bg=surface_bg,
+            highlightthickness=0,
+            yscrollcommand=scrollbar.set,
+        )
+        paper.pack(fill=tk.BOTH, expand=True, padx=(8, 0), pady=8)
+        scrollbar.configure(command=paper.yview)
+
+        prompt = tk.Frame(window.content, bg=surface_bg, relief=tk.RAISED, bd=1)
+        tk.Label(
+            prompt,
+            text="Sausage complete. Would you like another sausage?",
+            bg=surface_bg,
+            fg=text_fg,
+        ).pack(side=tk.LEFT, padx=10, pady=8)
+
+        state = {"cursor": 12, "photos": [], "last_rows": None}
+
+        def show_bottom(extent):
+            paper.configure(scrollregion=(0, 0, art_width, extent))
+            paper.yview_moveto(1.0)
+
+        def pick_rows():
+            """Serve a random artwork, never the same sausage twice in a row."""
+            choices = [rows for rows in DISPENSER_ARTWORK if rows is not state["last_rows"]]
+            state["last_rows"] = random.choice(choices)
+            return state["last_rows"]
+
+        def print_art(on_done):
+            rows = pick_rows()
+            photo = tk.PhotoImage(width=art_width, height=len(rows) * scale)
+            state["photos"].append(photo)
+            width = paper.winfo_width()
+            x = max(12, ((width if width > 1 else art_width + 24) - art_width) // 2)
+            top = state["cursor"]
+            paper.create_image(x, top, image=photo, anchor=tk.NW)
+            job = {"row": 0}
+
+            def tick():
+                if not window.frame.winfo_exists():
+                    return
+                if job["row"] >= len(rows):
+                    state["cursor"] = top + len(rows) * scale + line_height
+                    show_bottom(state["cursor"])
+                    on_done()
+                    return
+                colors = (DISPENSER_PALETTE[c] for c in rows[job["row"]])
+                data = "{" + " ".join(" ".join([color] * scale) for color in colors) + "}"
+                photo.put(data, to=(0, job["row"] * scale, art_width, (job["row"] + 1) * scale))
+                job["row"] += 1
+                show_bottom(top + job["row"] * scale + line_height)
+                self.root.after(45, tick)
+
+            tick()
+
+        def print_text(message, on_done):
+            item = paper.create_text(
+                12, state["cursor"], anchor=tk.NW, fill=text_fg,
+                font=("Courier New", 10), text="",
+            )
+            job = {"shown": 0}
+
+            def tick():
+                if not window.frame.winfo_exists():
+                    return
+                job["shown"] += 2
+                paper.itemconfigure(item, text=message[:job["shown"]])
+                show_bottom(state["cursor"] + line_height)
+                if job["shown"] >= len(message):
+                    state["cursor"] += line_height
+                    on_done()
+                else:
+                    self.root.after(25, tick)
+
+            tick()
+
+        def show_prompt():
+            prompt.pack(side=tk.BOTTOM, fill=tk.X, before=scrollbar)
+
+        def another_sausage():
+            prompt.pack_forget()
+            paper.delete("all")
+            state["photos"].clear()
+            state["cursor"] = 12
+            show_bottom(1)
+            print_art(show_prompt)
+
+        def refuse_sausage():
+            prompt.pack_forget()
+            print_text(
+                "You selected No, but everyone loves sausages, so here's another one.",
+                lambda: print_art(show_prompt),
+            )
+
+        tk.Button(prompt, text="No", width=6, command=refuse_sausage).pack(side=tk.RIGHT, padx=(4, 10), pady=6)
+        tk.Button(prompt, text="Yes", width=6, command=another_sausage).pack(side=tk.RIGHT, padx=4, pady=6)
+
+        print_art(show_prompt)
+        return window
+
     def open_text_editor(self, path=None):
         """Open an embedded text editor window."""
         file_path = Path(path) if path else Path.home() / "untitled.txt"
@@ -5385,6 +5512,544 @@ Features:
         messagebox.showinfo("Refresh", "Desktop refreshed!")
 
 
+# Dispenser artwork: 48x32 pixel-art sausage scenes, one char per pixel,
+# rendered through DISPENSER_PALETTE by open_dispenser.
+DISPENSER_PALETTE = {
+    ".": "#f2ecdc",
+    "w": "#ffffff",
+    "0": "#141317",
+    "K": "#33180d",
+    "B": "#5f2a12",
+    "b": "#7d3c18",
+    "r": "#9c4f1e",
+    "o": "#b96530",
+    "h": "#d98a4e",
+    "H": "#f0b476",
+    "R": "#c22321",
+    "Y": "#e0a512",
+    "y": "#f4cf47",
+    "n": "#c98f4b",
+    "N": "#e8bd7d",
+    "e": "#f7f1df",
+    "E": "#f2b21b",
+    "v": "#6f9c2c",
+    "G": "#26251f",
+    "g": "#4a4a48",
+    "m": "#8b8b8b",
+    "M": "#c9c9c4",
+    "S": "#dedbcd",
+    "F": "#e6541c",
+    "f": "#f7952b",
+    "W": "#ffe8a3",
+    "c": "#8fd3f0",
+    "C": "#4ba3d8",
+    "u": "#2a6fb0",
+    "p": "#f4a25b",
+    "P": "#e2643c",
+    "q": "#a03a56",
+    "Q": "#5c2a5e",
+    "D": "#221a3e",
+    "d": "#37306b",
+    "*": "#f7f3d0",
+    "s": "#ffd94a",
+    "t": "#3f7d3a",
+    "T": "#295c2d",
+    "a": "#2e6e8e",
+    "A": "#7fc4d8",
+    "k": "#6b4a2f",
+    "l": "#8a6a43",
+    "x": "#5a5566",
+    "X": "#38344a",
+    "z": "#c7b9a5",
+    "1": "#f0c29a",
+    "2": "#d99b6b",
+    "3": "#b06f44",
+    "4": "#8a5a33",
+    "5": "#5e3a20",
+    "L": "#d95f5f",
+    "i": "#f6ead2",
+}
+
+DISPENSER_ARTWORK = (
+    (
+        "................................................",
+        "................................................",
+        "................................................",
+        "................................................",
+        "................................................",
+        "................................................",
+        "................................................",
+        "........................S.......................",
+        ".......................S........................",
+        "................S......S........S...............",
+        "...............S........S......S................",
+        "...............S.........S.....S................",
+        "................S........S......S...............",
+        ".................S......S........S..............",
+        ".................S...............S..............",
+        "................S...............S...............",
+        "................................................",
+        "...........KKKKK................................",
+        ".........KKKKKKKKKKKKKKKKKKKKKKK................",
+        ".........KHhhrhhhhhrrhhhhhhKKKKKKKKKKK..........",
+        "kkkkkkkkkKHHHooHHHHHooHHHHorhhhhhrrhhKKkkkkkkkkk",
+        "llllllBKKKhhhhrrhhhhhooHHHHooHHHHHoHHHKwwlllllll",
+        "lllllllwwKooooobboooohrrhhhhrrhhhhhhhHKwKBllllll",
+        "llllllwwwKrrrrrobbooooobooooobboooooohKKwwwlllll",
+        "lllllMMwwKKbrrrrrBBrrrrrBrrrrrBBooooooKwwwMMllll",
+        "kkkkkkMMwwKKKvKKKKKKKbbbBBbbbrrBBrrrrrKwwMMkkkkk",
+        "lllllllMMMwwvvwwKKKKKKKKKKKKKKKKKKKvvKKMMMllllll",
+        "llllllllMMMMMMwwwwwwwwwwwwwwwwwwKKKKKMMMMlllllll",
+        "llllllllllMMMMMMMMMMMMMMwMMMMMMMMMMMMMMlllllllll",
+        "llllllllllllllMMMMMMMMMMMMMMMMMMMMMlllllllllllll",
+        "kkkkkkkkkkkkkkkkkkkkkkkkMkkkkkkkkkkkkkkkkkkkkkkk",
+        "llllllllllllllllllllllllllllllllllllllllllllllll",
+    ),
+    (
+        "................................................",
+        "...............S...............S................",
+        "..............S...............S.................",
+        "..............S...............S.................",
+        "...............S...............S................",
+        "................S...............S...............",
+        "................S...............S...............",
+        "...............S...............S................",
+        "................................................",
+        "................................................",
+        "................................................",
+        "................................................",
+        "........KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK........",
+        "......KKyhhhhhhhyhhhhhhhyhhhhhhhyhhhhhhhKK......",
+        "......KHYyHHHHHyYyHHHHHyYyHHHHHyYyHHHHHyHK......",
+        "......KHHYyHHHyYHYyHHHyYHYyHHHyYHYyHHHyYHK......",
+        "...BKKKhhhYyhyYhhhYyhyYhhhYyhyYhhhYyhyYhhKKKB...",
+        "......KooooYyYoooooYyYoooooYyYoooooYyYoooK......",
+        "......KrrrrrYrrrrrrrYrrrrrrrYrrrrrrrYrrrrK......",
+        "......KKbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbKK......",
+        "........KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKn.......",
+        "........nnNnnNnnNnnNnnNnnNnnNnnNnnNnnNnnn.......",
+        ".......nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn......",
+        ".......knnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnk......",
+        "........nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn.......",
+        ".........nknnnnnnnnnnnnnnnnnnnnnnnnnnnkn........",
+        "LLLLwwwwLLLkkknnnnnnnnnnnnnnnnnnnnnkkkwwLLLLwwww",
+        "LLLLwwwwLLLLwwkkkkkkkkkknkkkkkkkkkkLwwwwLLLLwwww",
+        "wwwwLLLLwwwwLLLLwwwwLLLLkwwwLLLLwwwwLLLLwwwwLLLL",
+        "wwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLL",
+        "wwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLL",
+        "wwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLL",
+    ),
+    (
+        "000000000000000000000000000000000000000000000000",
+        "000000000000000000000000000000000000000000000000",
+        "000000000000000000000000000000M00000000000000000",
+        "00000000000000M00000000000000M000000000000000000",
+        "0000000000000M000000000000000M000000000000000000",
+        "0000000000000M0000000000000000M00000000000000000",
+        "00000000000000M0000000000000000M0000000000000000",
+        "G0G0G0G0G0G0G0GMG0G0G0G0G0G0G0GMG0G0G0G0G0G0G0G0",
+        "GGGGGGGGGGGGGGGMGGGGGGGGGGGGGGMGGGGGGGGGGGGGGGGG",
+        "GGGGGGGGGGGGGGMGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG",
+        "GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG",
+        "0000000000000000000000000000000000KKKK0000000000",
+        "000g0000000g00KKKKKKKKKKKKKKKKKKKKKKKKK0000g0000",
+        "000g00000KKKKKKKKKKKhhhhhhhhhhhhhrrhhhhK000g0000",
+        "mmmgmmmmKKhhrrhhhhhroHHHHHHooHHHHHooHHHKmmmgmmmm",
+        "ggggggggKHHHHooHHHHHooHHHHHHrrhhhhhrhhhKKKBggggg",
+        "000g0BK0KhhhhhrrhhhhhrrhhhhhobbooooooooK000g0000",
+        "000g000KKoooooobbooooobbbooooobboorrrrrK000g0000",
+        "000g0000KooooorrBBrrrrrBBBrrrrrBBrrrrrKK000g0000",
+        "000g0000KrrrrrrrrBBbbbbbbBBbKKKKKKKKKKK0000g0000",
+        "mmmgmmmmmKKKKKKKKKKKKKKKKKKKKKKKKKmgmmmmmmmgmmmm",
+        "ggggggggggKKKKgggggggggggggggggggggggggggggggggg",
+        "00Wg0000WW0g000WW00g000W000g00W0000gW000000gW000",
+        "0WWW0000Wf00000WW00000Wf00000WfW0000fW00000fWW00",
+        "0fff0000ff00000ff00000ff0000Wfff0000ffW0000fff00",
+        "Wfff0000ffWW000ffW000WffW000ffff0000fff0000fff00",
+        "ffff000Wffff00Wfff000ffff00Wffff000Wfff00WWfffW0",
+        "fFFFW0WfFFff00fFFfW0WfFFfWWffFFFW00fFFfW0ffFFFf0",
+        "FFFFf0ffFFFF00fFFFf0fFFFFfffFFFFf0ffFFFf0ffFFFf0",
+        "FFFFFfFFFFFFffFFFFFfFFFFFFFFFFFFFffFFFFFfFFFFFFf",
+        "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+        "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    ),
+    (
+        "QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ",
+        "QQQQQQQQQQQQQQQQQQQQQQQQyQQQQQQQQQQQQQQQQQQQQQQQ",
+        "QQQQQQQQQQQQQQQQQQQQQQQQyQQQQQQQQQQQQQQQQQQQQQQQ",
+        "QQQQQQQQQQQQQQQQQQyQQQQQQQQQQQyQQQQQQQQQQQQQQQQQ",
+        "QQQQQQQQQQQQQQQQQQQyQQQQsQQQQyQQQQQQQQQQQQQQQQQQ",
+        "qQqQqQqQqQqQqQqQqQqsssssssssssqQqQqQqQqQqQqQqQqQ",
+        "qqqqqqqqqqqqqqqqqqsssssssssssssqqqqqqqqqqqqqqqqq",
+        "qqqqqqqqqqqqqyqqssssssssWssssssssqqyqqqqqqqqqqqq",
+        "qqqqqqqqqqqqqqysssssWWWWWWWWWsssssyqqqqqqqqqqqqq",
+        "qqqqqqqqqqqqqqqssssWWWWWWWWWWWssssqqqqqqqqqqqqqq",
+        "qPqPqPqPqPqPqPssKKKKKKKKKKKKKKKKsssPqPqPqPqPqPqP",
+        "PPPPPPPPPPPPPPsKhhhrrhhhhhrrhhhhKssPPPPPPPPPPPPP",
+        "PPPPPPPPPPPPPPsKHHHHooHHHHHooHHHKssPPPPPPPPPPPPP",
+        "PPPPPPPPPPyyBKKKhhhhhrrhhhhhrrhhKKKBPyyPPPMPPPPP",
+        "PPPPPPPPPPPPPPsKoooooobbooooobooKssPPPPPPMMMPPPP",
+        "pPpPpPpMpPpPpPsKrrrrrrrBBrrrrrrrKssPpPpPMMMMMPpP",
+        "ppppppMMMpppppssKKKKKKKKKKKKKKKKsssppppXXXXXXXpp",
+        "pppppMMMMMpppppssssWWWWWWWWWWWsssspppXXXXXXXXXXX",
+        "pppXXXXXXXXXpppsssssWWWWWWWWWsssssppXXXXXXXXXXXX",
+        "ppXXXXXXXXXXXpppssssssssWssssssssppXXXXXXXXXXXXX",
+        "XXXXXXXXXXXXXXXspssssssssssssssspsXXXXXXXXXXXXXX",
+        "XXXXXXXXXXXXXXXXssssssssssssssssXXXXXXXXXXXXXXXX",
+        "XXXXXXXXXXXXXXXXXXsssssssssssssXXXXXXXXXXXXXXXXX",
+        "XXXXXXXXXXXXXXXXXXXsssssssssssXXXXXXXXXXXXXXXXXX",
+        "ttttttTttttttTttttttTttttttTttttttTttttttTtttttt",
+        "tTttttttTttttttTttttttTttttttTttttttTttttttTtttt",
+        "tttTttttttTttttttTttttttTttttttTttttttTttttttTtt",
+        "tttttTttttttTttttttTttttttTttttttTttttttTttttttT",
+        "TttttttTttttttTttttttTttttttTttttttTttttttTttttt",
+        "ttTttttttTttttttTttttttTttttttTttttttTttttttTttt",
+        "ttttTttttttTttttttTttttttTttttttTttttttTttttttTt",
+        "ttttttTttttttTttttttTttttttTttttttTttttttTtttttt",
+    ),
+    (
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD*DDDDDDDD*",
+        "DDDDDDDDDDDDDDDDDDD*DDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+        "DDDDDD*DDD*DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+        "DDDDDDDDMMDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+        "DDDDDDMMDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD*D*D*DDD",
+        "DDDDwMDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDD*DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDKKKKKKKDDDD*DDDDDDDDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDKhhhhhKKKKKKKDDDDDDDDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDBKDKHHHHHrrhhhhKKKKKKDDDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDKKhhhHHHooHHHhrrhhKKKDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDKooohhhhroHHHHooHhhhKDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDKrooboooorhhhhhoHHHHKD*DDDDDDDDDDDD",
+        "DDDDDDDDDDDDDKrrrBrrrooboooohrhhhKDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDD*KKKbBbrrrBBroooboooKKKBDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDKKKKKKbbBBrrrrrroKDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDKKKKKKKbbbrrKDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDKKKKKKKDDDDDDd*DDDDDDD",
+        "DD*DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDdddudddDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDddCuuuuuuddDDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDMDDDDdCCCCCuuuuuddDD",
+        "DDDDDDDD*DDDDDDDDDDDDDDDDDDDDMMMMCCCCCCCuuuuudDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDD*DDDDDDdCCCCCuuuuuudDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDduuuCuuuuuuuuudD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDduuuuuuuuuuudMM",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDduuuuuuuCuuudDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDD*DDDDDDDdduuuuuuuuuddDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDdduuuuuuuddDDD",
+        "DDDDDDDDDDDD*DDDD*DDDDD*DDDDDDDDDD*DdddudddDDDDD",
+        "DDDDDDDD*DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDdDDDDDDDD",
+    ),
+    (
+        "DDD*DDDDD*D*DDDDDDDDXDDDDDDDDDDDD*DyWy***DDDXDDD",
+        "DDDDDDDDDDDD*DDXXXXXXXXXXXDDDDDDDDyWyDDXXXXXXXXX",
+        "DDDDDDXDDDDDDDXXXXXXXXXXXXXD**DDDyWyDDXXXXXXXXXX",
+        "DXXXXXXXXXXXDDDXXXXXXXXXXXDDDXXXXXXyWyXXXXXXXXXX",
+        "XXXXXXXXXXXXXDDDDDDDXDDDDDDDXXXXXXyWyXXXXDDDXDD*",
+        "*XXXXXXXXXXXDX*DDDDDDDDDDDDDXXXXyWyXXXXXDDDDDDDD",
+        "DQDQDQXQXXXXXXXXXXXQDQDXXXXXXXXyWyXQDQDQDQDQDQDQ",
+        "QQQQQQQXXXXXXXXXXXXXQQXX*XXXXXXXXyWyQQQQQQQQQQQQ",
+        "QQQQQQQQXXXXXXXXXXXQQQQXXXXXXXyWyXQQQQQQQQQQQQQQ",
+        "QQQQQQQQQQQQQXQQQQQ*QQQQQQQQyWyQQQQQQQQQQQQQQQQQ",
+        "QQQQQQQQQQQQQQQQQQQQQQQQKQQyW*QQQQQQQQQQQQQQQQQQ",
+        "QQQQQQQQQQQQQQQQQQQQQKKKKKKKQQQQQQQQQQQQQQQQQQQQ",
+        "QqQqQqQqQqQqQqQqQqQqQKHHhorKQqQqQqQqQqQqQqQqQqQq",
+        "qqqqqqqqqqqqqqqqqqqqKhHHhorbKqqqqqqqqqqqqqqqqqqq",
+        "qqqqqqqqqqqqqqqqqqqqKhHHhorbKqqqqqqqqqqqqqqqqqqq",
+        "qqqqqqqqqqqqqqqqqqqqKhHHhorbKqqqqqqqqqqqqqqqqqqq",
+        "xxxxxxxxxxxxxxxxxxxxKhHHhorbKxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxKhHHhorbKxxxxxxxxxxxxxxxxxxx",
+        "XxxXxxXxxXxxXxxXxxXxKhHHhorbKxXxxXxxXxxXxxXxxXxx",
+        "xxxxxxxxxxxxxxxxxxxxKhHHhorbKxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxKhHHhorbKxxxxxxxxxxxxxxxxxxx",
+        "xXxxXxxXxxXxxXxxXxxXKhHHhorbKxxXxxXxxXxxXxxXxxXx",
+        "xxxxxxxxxxxxxxxxxxxxKhHHhorbKxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxXXXXKhHHhorbKXXXXxxxxxxxxxxxxxxx",
+        "xxXxxXxxXxxXxXXXzzzzzKHHhorKzzzzzXXXxxXxxXxxXxxX",
+        "xxxxxxxxxxxxXzzzzzzzzKKKKKKKzzzzzzzzXxxxxxxxxxxx",
+        "xxxxxxxxxxxXzzzzzzzzzXzzzzzXzzzzzzzzzXxxxxxxxxxx",
+        "XxxXxxXxxXXzzzzzzzzzzzzzXzzzzzxzzzzzzzXXxxXxxXxx",
+        "xxxxxxxxxxxXzzzzzzxzzzzzzzzzzzzzzzzzzXxxxxxxxxxx",
+        "xxxxxxxxxxxxXzzzzzzzzzzzzxzzzzzzzzzzXxxxxxxxxxxx",
+        "xXxxXxxXxxXxxXXXzzzzzzzzzzzzzzzzzXXXxXxxXxxXxxXx",
+        "xxxxxxxxxxxxxxxxXXXXXXXXzXXXXXXXXxxxxxxxxxxxxxxx",
+    ),
+    (
+        "LLLLLwwwwwLLLLLwMwwwLLLLLwwwwwMLLLLwwwwwLLLLLwww",
+        "LLLLLwwwwwLLLLLwwMwwLLLLLwwwwwLMLLLwwwwwLLLLLwww",
+        "LLLLLwwwwwLLLLLwwMwwLLLLLwwwwwLMLLLwwwwwLLLLLwww",
+        "LLLLLwwwwwLLLLLwMwwwLLLLLwwwwwMLLLLwwwwwLLLLLwww",
+        "LLLLLwwwwwLLLLLwwwwwLLLLLwwwwwLLLLLwwwwwLLLLLwww",
+        "wwwwwLLLLLwwwKwLLLLLwwwwwLLLLLwwwwwLLLLLwwwwwLLL",
+        "wwwwwLLLLLwKKKKKKKKKKKKKKKKKKKKKKKwLLLLLwwwwwLLL",
+        "wwwwwLLLLLKhhhhhhhhrhhhhhhhhKKKKKKKKKLLLwwwwwLLL",
+        "wwwwwLLLLLKHHHoHHHHHooHHHHoohhhhhrhhhKLLwwwwwLLL",
+        "wwwwwLLBKKKhhhrrhhhhHooHHHHooHHHHHHHHKLLwwwwwLLL",
+        "LLLLLwwwwwKoooobbooohhrrhhhhrrhhhhhhhKwKBLLLLwww",
+        "LLLLLwwwwwKrrroobbooooobooooobbooooooKKwLLLLLwww",
+        "LLLLLwwwwwKrrrrrrBBrrrrrBrrrrrBBrroooKwwLLLLLwww",
+        "LLLLLwwwwwLKKKKKKKKKbbbbBBbbbbrBBrrrrKwwLLLLLwww",
+        "LLLLLwwwwwLLLLKKKKKKKKKKKKKKKKKKKKKKKwwwLLLLLwww",
+        "wwwwwLLLLLwwwwwLLLLLwmwwmLLmLLwwwwKLLLLLwwwwwLLL",
+        "wwwwwLLLLLwwwwwLLLLLwmwwmLLmLLwwwwwLLLLLwwwwwLLL",
+        "wwwwwLLLLLwwwwwLLLLLwmwwmLLmLLwwwwwLLLLLwwwwwLLL",
+        "wwwwwLLLLLwwwwwLLLLLwmmmmmmmLLwwwwwLLLLLwwwwwLLL",
+        "wwwwwLLLLLwwwwwLLLLLwmmmmmmmLLwwwwwLLLLLwwwwwLLL",
+        "LLLLLwwwwwLLLLLwwwwwLLLmmmwwwwLLLLLwwwwwLLLLLwww",
+        "LLLLLwwwwwLLLLLwwwwwLLLmmmwwwwLLLLLwwwwwLLLLLwww",
+        "LLLLLwwwwwLLLLLwwwwwLLLMmwwwwwLLLLLwwwwwLLLLLwww",
+        "LLLLLwwwwwLLLLLwwwwwLLLMmwwwwwLLLLLwwwwwLLLLLwww",
+        "LLLLLwwwwwLLLLLwwwwwLLLMmwwwwwLLLLLwwwwwLLLLLwww",
+        "wwwwwLLLLLwwwwwLLLLLwwwMmLLLLLwwwwwLLLLLwwwwwLLL",
+        "wwwwwLLLLLwwwwwLLLLLwwwMmLLLLLwwwwwLLLLLwwwwwLLL",
+        "wwwwwLLLLLwwwwwLLLLLwwwMmLLLLLwwwwwLLLLLwwwwwLLL",
+        "wwwwwLLLLLwwwwwLLLLLwwwMmLLLLLwwwwwLLLLLwwwwwLLL",
+        "wwwwwLLLLLwwwwwLLLLLwwwMmLLLLLwwwwwLLLLLwwwwwLLL",
+        "LLLLLwwwwwLLLLLwwwwwLLLMmwwwwwLLLLLwwwwwLLLLLwww",
+        "LLLLLwwwwwLLLLLwwwwwLLLMmwwwwwLLLLLwwwwwLLLLLwww",
+    ),
+    (
+        "................................................",
+        "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+        "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+        "llllllllllllllllllllllllllllllllllllllllllllllll",
+        ".........m..............m..............m........",
+        ".........m..............m..............m........",
+        "........mm.............mm.............mm........",
+        ".........K..............K..............K........",
+        ".......KKBKK..........KKBKK..........KKBKK......",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        ".......KKKKK..........KKKKK..........KKKKK......",
+        ".........K..............K..............K........",
+        ".......KKKKK..........KKKKK..........KKKKK......",
+        "......KhHBorK........KhHBorK........KhHBorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "llllllllllllllllllllllllllllllllllllllllllllllll",
+        "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+        "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    ),
+    (
+        "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+        "llllllllllllllllllllllllllllllllllllllllllllllll",
+        "llllllllllllllllllllllllllllllllllllllllllllllll",
+        "llllllllllllllllllllllllMlllllllllllllllllllllll",
+        "llllllllllllllllMMMMMMMMMMMMMMMMMlllllllllllllll",
+        "lllllllllllllMMMMMMMMMMMwMMMMMMMMMMMllllllllllll",
+        "kkkkkkkkkkkMMMMMMwwwwwwwwwwwwwwwMMMMMMkkkkkkkkkk",
+        "lllllllllMMMMMwwwwwwwwwwwwwwwwwwwwwMMMMMllllllll",
+        "llllllllMMMwwwwwwwwwwwwwwwwwwwwwwMwwwwMMMlllllll",
+        "lllllllMMMwwwwwwwwwwwwwwwwwwwMMMMeMMMMwMMMllllll",
+        "llllllMMMwwwwwwwwwwwwwwwwwwMMeeeeeeeeeMMMMMlllll",
+        "lllllMMMwwwwwwwwwvtwwwwwwwMeeeeeeeEeeeeeMMMMllll",
+        "kkkkkMMwwwwwwwvtwwwwwwwwwwMeeeeeEyEEEeeeMwMMkkkk",
+        "llllMMwwwwwwwwwwvtwwwwwwwMeeeeeEEEEEEEeeeMwMMlll",
+        "llllMMwwwwwwwvtwwwwwwwwwwwMeeeeeEEEYEeeeMwwMMlll",
+        "llllMMwwwwwwwwwvtwwwwwwwwwMeeeeeeeEeeeeeMwwMMlll",
+        "lllMMwwwwwwwwKwwwwwwwwwwwwwMMeeeeeeeeeMMwwwwMMll",
+        "llllMMwwwwwKKKKKKKKKKKKKKKKwwMMMMeMMMMwwwwwMMlll",
+        "kkkkMMwwwwwKHHoHhhhhrhhKKKKKKKwwwMwwwwwwwwwMMkkk",
+        "llllMMwwBKKKhhroHHHHooHHHHHHHKwwwwwwwwwwwwwMMlll",
+        "lllllMMwwwwKooobboohhrrhhhhhHKwKBwwwwwwwwwMMllll",
+        "lllllMMMwwwKrrrrBBrooobboooooKKwwwwwwwwwwMMMllll",
+        "llllllMMMwwKKKKKKKKKKKKKKKKKKKKKwwwwwwwwMMMlllll",
+        "lllllllMMMwwwKKKKhhhrhhhhhhrrhhKwwwwwwwMMMllllll",
+        "kkkkkkkkMMMwwKHHHHHHooHHHHHHoHHKwKBwwwMMMkkkkkkk",
+        "lllllllllMBKKKhhhhhhhrrrhhoooooKKwwMMMMMllllllll",
+        "lllllllllllMMKoobooooobbborrrrrKMMMMMMllllllllll",
+        "lllllllllllllKrrBBrrrrrrBBbbKKKKMMMMllllllllllll",
+        "lllllllllllllKKKKKKKKKKKKKKKKKKMMlllllllllllllll",
+        "llllllllllllllllllllllllMlllllllllllllllllllllll",
+        "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+        "llllllllllllllllllllllllllllllllllllllllllllllll",
+    ),
+    (
+        "pppppppppppppppppppppppppppppppppppppppppppppppp",
+        "ppppppppppppppppppppppppppppppppppppppsppppppppp",
+        "pppppppppppppppppppppppppppppppppppssssssspppppp",
+        "ppppppppppppppppppppppppppppppppppsssssssssppppp",
+        "pPpPpPpPpPpPpPpPpPpPpPpPpPpPpPpPpPsssssssssPpPpP",
+        "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPsssssssssssPPPP",
+        "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPsssssssssPPPPP",
+        "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPsssssssssPPPPP",
+        "PqPqPqPqPqPqPqPqPqPqPqPqPqPqPqPqPqPsssssssPqPqPq",
+        "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqwqqqqqsqqqqqqqqq",
+        "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqwqqqqqqqqqqqqqqqqq",
+        "wwwwwwwwwwaaaAaaaaaaaaaaaaaaaaaaaawaaaaaaaaaAaaa",
+        "AAAAAAAAAAwwwwaaaAaaaaaaaaawwaaaaaaawaaaaaaaaaaa",
+        "aaaaaaaaaaAAAAwwwaaaaAaaawwaawaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaAAAwwaaaawwAaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaAAwwwwaaaaaaAaKKKKKKKKKaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaAAAwwaaaaaKKKKhhhhHHKaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaAAwwaaaKHHHHHHHHhKKKBaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaAABKaKhhhhhhoooKaAaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaAwKKoooooorrrKaaaaaAaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaAAKrrrrrbKKKKaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaKKKKKKKKKaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaawwwwwwwwwwwwwwaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaMMMMMMMMMMMMaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaAaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaAaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaAaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaAa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaAaaaaaaaaaaaaaaaa",
+    ),
+    (
+        "*DDDDDDDDDDDDDDDDDDDDDD*DDDD*DDDDDDDDDDDDDDD*DDD",
+        "DDDDD*DDDDDDDDDDDDDDDDDDDDD*DDDDDDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD*DDDDDDDdDDDDDDD",
+        "DDDDDDDDDDDDDD*DDDDDDDDDDDDDDDDDDDDDDDddMddDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDdMMMMMdDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDdMMMMMMMdDDD",
+        "DDDDDDDDDD*DDDDDDDDDDDDDDDDDDDDDDDDDDdMMMMMd*DDD",
+        "D*DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDddMddDDDDD",
+        "DDDDDDDDDD*DDDDDDDDDD*DDDDDDDDDD*DDDDDDDdDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDDD*DD*DDDDDDDDDDDDDDDDDDDDD",
+        "DDDDDDD*DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+        "DDDDDDDDD*DDDDDDDDDDDKKKKKKKKKKKDDDDDDDDDDDDDDDD",
+        "DDDDDDDDD*DDD*D*DDDDDKhhhhhhhhKKKDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDBKDKHHHHHHHHHHKDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDKKooohhhhhhhKKKBDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDKrrroooooooKDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDKKKbbrrrrrrKDkkDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDDKKKKKKKKKKKDDDkkkDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDfffDDDDDDDDDDDDDkkkDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDfffffDDDDDDDDDDDDDDDDkkkDDD",
+        "DDDDDDDDDDDDDDDDDDDDfffffffDDDDDDDDDDDDDDDDDDkkk",
+        "DDDDDDDDDDDDDDDDDDDfffffffffDDDDDDDDDDDDDDDDDDDD",
+        "XxxxxxxxxxxXxxxxxxxffFFFFFffxxxxxXxxxxxxxxxxXxxx",
+        "xxxxxxxXxxxxxxxxxxXFFFFWWWFFxXxxxxxxxxxxXxxxxxxx",
+        "xxxXxxxxxxxxxxXxxffFFWWWWWFFfxxxxxxxXxxxxxxxxxxX",
+        "xxxxxxxxxxXxxxxxxFFFFWWWWWFFFFxxXxxxxxxxxxxXxxxx",
+        "xxxxxxXxxxxxxxxxFFFFFWWWWWFFFFxxxxxxxxxXxxxxxxxx",
+        "xxXxxxxxxxxxlkkkkkkkkkkkkkkkkkkkkkxXxxxxxxxxxxXx",
+        "xxxxxxxxxXxxxkkkkkkkkkkkkkkkkkkkkklxxxxxxxXxxxxx",
+        "xxxxxXxxxxxxxxxxXxxxxxxxxxxXxxxxxxxxxxXxxxxxxxxx",
+        "xXxxxxxxxxxxXxxxxxxxxxxXxxxxxxxxxxXxxxxxxxxxxXxx",
+        "xxxxxxxxXxxxxxxxxxxXxxxxxxxxxxXxxxxxxxxxxXxxxxxx",
+    ),
+    (
+        "pppppppppppppppppppppppppppppppppppppppppppppppp",
+        "ppppppppppgppppppppppppppppppppppppppppppppppppp",
+        "pppgggggggggggggggpppppppppppppppppppppppppppppp",
+        "pgggggggggggggggggggpppppppppppppppppppppppppppp",
+        "gggggggggggggggggggggppppppppppppppppppppppppppp",
+        "gggggggggggggggggggggg1ppppppppppppppppppppppppp",
+        "ggggggggggggggggggggggg1pppppppppppppppppppppppp",
+        "gggggggggggggggggggggg11pppppppppppppppppppppppp",
+        "gggggggggggggggggggggg111ppppppppppppppppppppppp",
+        "gggggggggggggggggggg111g11pppppppppppppppppppppp",
+        "ggggggggggggggggg333111111pPpPpPpPpPpPpPpPpPpPpP",
+        "ggggggggggg1111111111111111PPPPPPPPPPPPPPPPPPPPP",
+        "gggggggggg11111111111111111PPPPPPPPPPPPPPPPPPPPP",
+        "gggggggggg11111110110111111PPPPPPPPPPPPPPPPPPPPP",
+        "ggggggg2gg11111111001111111PPPPPPPPPPPPPPPPPPPPP",
+        "gggggg222111111111111111112PPPPPPPPPPPPPPPPPPPPP",
+        "Pggggg2221111111111111111113PPPPPPPPPPPPPPPPPPPP",
+        "P1ggg2232211111111111111112PPPPPPPPPPPPPPPPPPPPP",
+        "P111g122311111111111LL11151PPPPPPPPPPPPPPPPPPPPP",
+        "P111112221111111111111iiiiiiKKKKKKKKKKKKKKKKKPPP",
+        "P11111121111111111111555555KhhhhhrrhhhhhrrhhhKPP",
+        "PP1111111111111111111555555KHHHHHHooHHHHHooHHKPP",
+        "Pq1111111111111111115555BKKKhhhhhhhrrhhhhhrhhKKK",
+        "qqq111111111111111111555555KoobooooobboooooooKqq",
+        "qqqq11111111111111111551555KrrBBrrrrrBBrrrrrrKqq",
+        "qqqqq11111111111111111iiiii5KKKKKKKKKKKKKKKKKqqq",
+        "qqqqq11111111111111111111111qqqqqqqqqqqqqqqqqqqq",
+        "qqqqqq11111111111111111111111qbqqqqqqqqqqqqqqqqq",
+        "qqqqqqqq11111111111111111111qqqqqrqqqqqqqqqqqqqq",
+        "uuuuuuuuuuuuu111111q1111111qqbqqqqqqqqqqqqqqqqqq",
+        "uuuuuuuuuuuuuuuuuuuuuuq1qqqqqqqqqqqqqqqqqqqqqqqq",
+        "uuuuuuuuuuuuuuuuuuuuuuqqqqqqqqqqqqqqqqqqqqqqqqqq",
+    ),
+    (
+        "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu",
+        "uuuuuuuuuuuuuuuuuuuuuuuuwuuuuuuuuuuuuuuuuuuuuuuu",
+        "uuuuuuuuuuuuuuuuwuwwwwwwwwwwwwwuwuuuuuuuuuuuuuuu",
+        "uuuuuuuuuuuuuwwwwwwwwwwwwwwwwwwwwwwwuuuuuuuuuuuu",
+        "uuuuuuuuuuuuwwwwwwwwwwwwwwwwwwwwwwwwwuuuuuuuuuuu",
+        "uuuuuuuuuuuuwwwwwwwwwwwwwwwwwwwwwwwwwuuuuuuuuuuu",
+        "uuuuuuuuuuuwwwwwwwwwwwwwwwwwwwwwwwwwwwuuuKuuuuuu",
+        "uuuuuuuuuuuuwwwwwwwwwwwwwwwwwwwwwwwwwuuKKKKKuuuu",
+        "uuuuuuuuuuuuwwwwwwwwwwwwwwwwwwwwwwwwwuKhHhorKuuu",
+        "uuuuuuuuuuuuuwwwwwwwwwww3wwwwwwwwwwwuuKhHhorKuuu",
+        "uuuuuuuuuuuuuuuMMMMM333313333MMMMMuuuuKhHhorKuuu",
+        "uuuuuuuuuuuuuuuuuu3311111111133uuuuuuuKhHhorKuuu",
+        "uCuCuCuCuCuCuCuCu313331111133313uCuCuCKhHhorKCuC",
+        "CCCCCCCCCCCCCCCC31111111111111113CCCCCKhHhorKCCC",
+        "CCCCCCCCCCCCCCC3111101111111011113CCCCKhHhorKCCC",
+        "CCCCCCCCCCCCCCC3111111111111111113CCCCKhHhorKCCC",
+        "CCCCCCCCCCCCCCC3111111111111111113CCCCKhHhorKCCC",
+        "CCCCCCCCCCCCCC31L111111111111111L13CCCCKKKKKCCCC",
+        "CCCCCCCCCCCCCCC3111111111111111113CCCCCCCKCCCCCC",
+        "CCCCCCCCCCCCCCC31111gggg1gggg11113CCCCmCmCmCCCCC",
+        "CCCCCCCCCCCCCCC3111g111151111g1113CCCCmCmCmCCCCC",
+        "CCCCCCCCCCCCCCCC311111iiiii111113CCCCCmCmCmCCCCC",
+        "CcCcCcCcCcCcCcCcC311155555551113CcCcCcCcmcCcCcCc",
+        "cccccccccccccccccc331155L551133cccccccccmccccccc",
+        "cccccccccccccccccccc333353333cccccccccccmccccccc",
+        "cccccccccccccccccccccccc3cccccccccccccccmccccccc",
+        "ccccccccccccwwwwwwwwwwwMMMwwwwwwwwwwwcccmccccccc",
+        "ccccccccccccwwwwwwwwwwwMgMwwwwwwwwwwwcccmccccccc",
+        "ccccccccccccwwwwwwwwwwwMMMwwwwwwwwwwwcccmccccccc",
+        "ccccccccccccwwwwwwwwwwwMMMwwwwwwwwwwwcccmccccccc",
+        "ccccccccccccwwwwwwwwwwwMgMwwwwwwwwwwwcccmccccccc",
+        "ccccccccccccwwwwwwwwwwwMMMwwwwwwwwwwwcccmccccccc",
+    ),
+    (
+        "cccccccccccccccccccccccccccccccccccccccccccccccc",
+        "cccccccccccccccccccccccccccccccccccccccccccccccc",
+        "ccccccwccccccccc0ccccc0ccccc0ccccccccccccccccccc",
+        "cccwwwwwwwcccc00000c00000c00000ccccccccccccccccc",
+        "ccwwwwwwwwwcc0000000000000000000cccccccccccccccc",
+        "cccwwwwwwwc00000000000000000000000ccccccwccccccc",
+        "ccccccwcccc00000000000000000000000ccwwwwwwwwwccc",
+        "cccccccccc0000000000000000000000000wwwwwwwwwwwcc",
+        "ccccccccccc00000000000000000000000ccwwwwwwwwwccc",
+        "ccccccccccc00000200000200000200000ccccccwccccccc",
+        "ccccccccccccc0222220222220222220cccccccccccccccc",
+        "cccccccccccc442222222222222222244ccccccccccccccc",
+        "cccccccccccc422220222222220222224ccccccccccccccc",
+        "cccccccccccc422202022222202022224ccccccccccccccc",
+        "cccccccccccc422222222222222222224ccccccccccccccc",
+        "ccccccccccc42222222222222222222224cccccccccccccc",
+        "cccccccccccc422222222222222222224ccccccccccccccc",
+        "cccccccccccc422222222222222222224ccccccccccccccc",
+        "cccccccccccc422222222252222222224ccccccccccccccc",
+        "cccccccccccc442222iiiiiiiii222244ccccccccccccccc",
+        "cCcCcCcCcCcCc4222555555555552224cCcCcCcCcCcCcCcC",
+        "CCCCCCCCCCCCCC42R25555555552R24CCccKKKKKKKKKKKCC",
+        "CCCCCCCCCCCCCCC422222252222R24CCCccKohhhhhh3333C",
+        "CCCCCCCCCCCCCCCC4422222222244CCCCccKhHHHHHH2222C",
+        "CCCCCCCCCCCCCCCCCC444424444CCCCCCccKoohhhhh3333K",
+        "CCCCCCCCCCCCCCCCCCCCCC4CCCCCCCCCCccKroooooo2222C",
+        "CCCCCCCCCCCCTTTTTTTTTTTTTTTTTTTTTccKorrrrrr3333C",
+        "CCCCCCCCCCCCtttttttttttttttttttttccKKKKKKKKKKKCC",
+        "CCCCCCCCCCCCtttttttttttttttttttttCCCCCCCCCCCCCCC",
+        "CCCCCCCCCCCCtttttttttttttttttttttCCCCCCCCCCCCCCC",
+        "CCCCCCCCCCCCtttttttttttttttttttttCCCCCCCCCCCCCCC",
+        "CCCCCCCCCCCCtttttttttttttttttttttCCCCCCCCCCCCCCC",
+    ),
+)
+
+
 DESKTOP_APP_LAUNCHERS = {
     "files": "open_default_file_manager",
     "games": "open_games_suite",
@@ -5396,6 +6061,7 @@ DESKTOP_APP_LAUNCHERS = {
     "images": "open_image_viewer",
     "notepad": "open_notepad",
     "editor": "open_text_editor",
+    "dispenser": "open_dispenser",
     "media": "open_media_player",
     "ide": "open_python_ide",
     "browser": "open_browser",

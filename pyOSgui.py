@@ -1687,6 +1687,8 @@ class DesktopGUI:
 
     def _apply_widget_fonts(self, widget):
         """Apply the selected family while retaining intentional text styling."""
+        if getattr(widget, "_skip_font_apply", False):
+            return
         try:
             existing = tkfont.Font(root=self.root, font=widget.cget("font"))
             preserve_size = widget.winfo_class() in {"Text", "ScrolledText"} or getattr(widget, "_keep_font", False)
@@ -5456,6 +5458,7 @@ def build(app, window):
                 browser_area, messages_enabled=False, javascript_enabled=False,
                 crash_prevention_enabled=True,
             )
+            html_frame._skip_font_apply = True
             html_frame.pack(fill=tk.BOTH, expand=True)
             renderer["html_frame"] = html_frame
         else:

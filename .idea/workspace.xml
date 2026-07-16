@@ -146,6 +146,7 @@
       <workItem from="1783182305608" duration="1473000" />
       <workItem from="1783262958746" duration="3437000" />
       <workItem from="1783279252714" duration="71000" />
+      <workItem from="1784230280807" duration="1100000" />
     </task>
     <servers />
   </component>
@@ -154,7 +155,7 @@
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/pyOSgui_py$pyOScli.coverage" NAME="pyOScli Coverage Results" MODIFIED="1783149440259" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
-    <SUITE FILE_PATH="coverage/pyOSgui_py$pyOSgui.coverage" NAME="pyOSgui Coverage Results" MODIFIED="1783265559867" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/pyOSgui_py$pyOSgui.coverage" NAME="pyOSgui Coverage Results" MODIFIED="1784231393613" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
     <SUITE FILE_PATH="coverage/pyOSgui_py$setup.coverage" NAME="setup Coverage Results" MODIFIED="1783112066810" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
     <SUITE FILE_PATH="coverage/Welcome$pyOSgui.coverage" NAME="pyOSgui Coverage Results" MODIFIED="1783022435895" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
     <SUITE FILE_PATH="coverage/Welcome$pyos_auth.coverage" NAME="pyos_auth Coverage Results" MODIFIED="1783022267468" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />

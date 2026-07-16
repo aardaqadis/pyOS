@@ -190,6 +190,7 @@ class PythonOS:
             ("Media Player", "media"),
             ("Python IDE", "ide"),
             ("Internet Browser", "browser"),
+            ("Dispenser", "dispenser"),
         ):
             apps_menu.add_command(
                 label=label,
@@ -720,6 +721,7 @@ class PythonOS:
                 "apps", "games", "snake", "sudoku", "chess", "messenger", "calculator",
                 "calc", "images", "imageviewer", "notepad", "editor", "ide",
                 "filemanager", "desktop_browser", "desktop_media", "pyos_settings",
+                "dispenser",
             }:
                 aliases = {
                     "calc": "calculator", "imageviewer": "images", "filemanager": "files",
@@ -730,7 +732,7 @@ class PythonOS:
                     self.log_message(
                         "Desktop apps: filemanager, games, snake, sudoku, chess, messenger, "
                         "calculator, images, notepad, editor, desktop_media, ide, "
-                        "desktop_browser, pyos_settings\n"
+                        "desktop_browser, dispenser, pyos_settings\n"
                     )
                 else:
                     app_name = aliases.get(command_name, command_name)
@@ -1931,6 +1933,7 @@ APPLICATIONS
   desktop_media             Open the embedded media player
   ide                       Open the Python IDE
   desktop_browser           Open the embedded internet browser
+  dispenser                 Open the dot matrix sausage dispenser
   pyos_settings             Open desktop settings
   play | media <file>       Play audio or video using VLC/default player
   browser [url]             Open the page source inspector

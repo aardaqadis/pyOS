@@ -386,6 +386,64 @@ def evaluate_calculator_expression(expression, x=None, variables=None):
         raise ValueError("Result is not a finite real number.")
     return result
 
+class FlatButton(tk.Label):
+    """Label-based button that honors bg/fg colors on every platform.
+
+    macOS Aqua ignores a tk.Button's background color, which left
+    chrome-colored buttons (white text on a black bar) rendering as white
+    text on the native pale-grey button face. A Label paints its colors
+    faithfully; Enter/Leave swap to the active colors for hover feedback.
+    """
+
+    def __init__(self, master=None, **kwargs):
+        self._command = kwargs.pop("command", None)
+        self._active_bg = kwargs.pop("activebackground", None)
+        self._active_fg = kwargs.pop("activeforeground", None)
+        kwargs.setdefault("cursor", "hand2")
+        super().__init__(master, **kwargs)
+        self._hovered = False
+        self._normal_bg = self.cget("bg")
+        self._normal_fg = self.cget("fg")
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", lambda event: self.invoke())
+
+    def _on_enter(self, _event):
+        self._hovered = True
+        self._normal_bg = self.cget("bg")
+        self._normal_fg = self.cget("fg")
+        super().configure(
+            bg=self._active_bg or self._normal_fg,
+            fg=self._active_fg or self._normal_bg,
+        )
+
+    def _on_leave(self, _event):
+        if self._hovered:
+            self._hovered = False
+            super().configure(bg=self._normal_bg, fg=self._normal_fg)
+
+    def invoke(self):
+        if self._command is not None:
+            self._command()
+
+    def configure(self, cnf=None, **kwargs):
+        options = dict(cnf or {})
+        options.update(kwargs)
+        if "command" in options:
+            self._command = options.pop("command")
+        if "activebackground" in options:
+            self._active_bg = options.pop("activebackground")
+        if "activeforeground" in options:
+            self._active_fg = options.pop("activeforeground")
+        if self._hovered and options.keys() & {"bg", "background", "fg", "foreground"}:
+            self._hovered = False
+        if not options and (cnf is not None or kwargs):
+            return None
+        return super().configure(**options)
+
+    config = configure
+
+
 class DesktopIcon:
     """A text-only desktop launcher styled like an early desktop OS."""
     GRID_MARGIN = 10
@@ -513,11 +571,22 @@ class DesktopIcon:
             outline_box(1, 1, 10, 6)
             block(3, 7, 2, 1); block(2, 8, 2, 1)
             block(3, 3); block(5, 3); block(7, 3)
+        elif kind == "ai_chat":
+            block(5, 0, 2, 1)
+            outline_box(2, 1, 8, 7)
+            block(4, 3); block(7, 3)
+            block(4, 5, 4, 1)
         elif kind == "games":
             block(2, 3, 8, 4)
             block(1, 5, 2, 3); block(9, 5, 2, 3)
             block(4, 4, 1, 3); block(3, 5, 3, 1)
             block(8, 4); block(9, 5)
+        elif kind == "dispenser":
+            block(3, 0, 6, 2)
+            outline_box(1, 2, 10, 4)
+            block(8, 3); block(3, 4, 4, 1)
+            block(3, 6, 6, 3)
+            block(4, 7, 4, 1, fill=background)
         else:
             outline_box(2, 0, 8, 9)
             block(7, 0, 1, 3); block(8, 2, 2, 1)
@@ -718,7 +787,7 @@ class Taskbar:
     def add_minimized_window(self, window):
         if window in self.window_buttons:
             return
-        button = tk.Button(
+        button = FlatButton(
             self.windows_frame,
             text=window.title[:18],
             command=window.restore,
@@ -799,7 +868,7 @@ class DesktopWindow:
         )
         self.title_label.pack(side=tk.LEFT, padx=8)
 
-        self.close_button = tk.Button(
+        self.close_button = FlatButton(
             self.titlebar,
             text="X",
             command=self.close,
@@ -810,7 +879,7 @@ class DesktopWindow:
         )
         self.close_button.pack(side=tk.RIGHT, fill=tk.Y)
 
-        self.minimize_button = tk.Button(
+        self.minimize_button = FlatButton(
             self.titlebar,
             text="_",
             command=self.minimize,
@@ -931,6 +1000,94 @@ class DesktopWindow:
         self.desktop.taskbar.remove_minimized_window(self)
 
 
+class OllamaClient:
+    """Minimal stdlib client for a local Ollama server (pyAI backend)."""
+
+    def __init__(self, base_url="http://localhost:11434"):
+        self.base_url = base_url.rstrip("/")
+
+    def _request(self, path, payload=None, timeout=10):
+        url = f"{self.base_url}{path}"
+        data = None
+        headers = {}
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        return urllib.request.urlopen(
+            urllib.request.Request(url, data=data, headers=headers), timeout=timeout
+        )
+
+    def list_models(self):
+        """Return installed model names; doubles as the server liveness probe."""
+        with self._request("/api/tags", timeout=3) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return [model.get("name", "") for model in payload.get("models", [])]
+
+    def has_model(self, name):
+        wanted = name if ":" in name else f"{name}:"
+        for installed in self.list_models():
+            if installed == name or installed.startswith(wanted):
+                return True
+        return False
+
+    def pull(self, name, on_progress, cancel_event):
+        """Download a model, reporting NDJSON progress lines via on_progress."""
+        # Current Ollama expects "model"; very old servers used "name".
+        with self._request("/api/pull", {"model": name, "stream": True}, timeout=60) as response:
+            for line in response:
+                if cancel_event.is_set():
+                    return False
+                try:
+                    chunk = json.loads(line.decode("utf-8"))
+                except ValueError:
+                    continue
+                if chunk.get("error"):
+                    raise OSError(chunk["error"])
+                on_progress(chunk.get("status", ""), chunk.get("completed"), chunk.get("total"))
+                if chunk.get("status") == "success":
+                    return True
+        return True
+
+    def chat(self, name, messages, on_token, cancel_event):
+        """Stream a chat completion; on_token(text, done) per NDJSON line.
+
+        The 300s timeout is per socket read: a cold model load on CPU can take
+        more than a minute before the first token arrives.
+        """
+        payload = {"model": name, "messages": messages, "stream": True}
+        with self._request("/api/chat", payload, timeout=300) as response:
+            for line in response:
+                if cancel_event.is_set():
+                    return
+                try:
+                    chunk = json.loads(line.decode("utf-8"))
+                except ValueError:
+                    continue
+                if chunk.get("error"):
+                    raise OSError(chunk["error"])
+                on_token(chunk.get("message", {}).get("content", ""), bool(chunk.get("done")))
+                if chunk.get("done"):
+                    return
+
+    @staticmethod
+    def binary_installed():
+        """Detect an Ollama install even before PATH picks it up (fresh winget/brew)."""
+        if shutil.which("ollama"):
+            return True
+        candidates = []
+        if sys.platform == "darwin":
+            candidates.append(Path("/Applications/Ollama.app"))
+            candidates.append(Path.home() / "Applications" / "Ollama.app")
+        elif os.name == "nt":
+            local_appdata = os.environ.get("LOCALAPPDATA", "")
+            if local_appdata:
+                candidates.append(Path(local_appdata) / "Programs" / "Ollama" / "ollama.exe")
+        else:
+            candidates.append(Path("/usr/local/bin/ollama"))
+            candidates.append(Path("/usr/bin/ollama"))
+        return any(candidate.exists() for candidate in candidates)
+
+
 class DesktopGUI:
     """Windows-like desktop GUI"""
     def __init__(self, root):
@@ -1040,7 +1197,7 @@ class DesktopGUI:
         self.system_menu_buttons = []
 
         def add_menu(label, postcommand=None):
-            button = tk.Button(
+            button = FlatButton(
                 self.system_bar, text=label, bg=chrome, fg=chrome_text,
                 activebackground=self.preferences.get("surface_bg", "#ffffff"),
                 activeforeground=self.preferences.get("text_fg", "#000000"),
@@ -1458,6 +1615,8 @@ class DesktopGUI:
             "icon_positions": {},
             "notifications_enabled": True,
             "tips_enabled": True,
+            "ai_chat_model": "llama3.2",
+            "ai_chat_url": "http://localhost:11434",
         }
         try:
             saved = json.loads(self.settings_path.read_text(encoding="utf-8"))
@@ -1513,6 +1672,10 @@ class DesktopGUI:
         defaults["icon_positions"] = valid_positions
         defaults["notifications_enabled"] = bool(defaults["notifications_enabled"])
         defaults["tips_enabled"] = bool(defaults["tips_enabled"])
+        if not isinstance(defaults.get("ai_chat_model"), str) or not defaults["ai_chat_model"].strip():
+            defaults["ai_chat_model"] = "llama3.2"
+        if not isinstance(defaults.get("ai_chat_url"), str) or not defaults["ai_chat_url"].startswith("http"):
+            defaults["ai_chat_url"] = "http://localhost:11434"
         return defaults
 
     def save_preferences(self):
@@ -1907,6 +2070,22 @@ class DesktopGUI:
         )
         for key, icon in built_in_icons:
             self._register_desktop_icon(icon, "builtin:" + key)
+
+        self.dispenser_icon = DesktopIcon(
+            self.icon_container,
+            "Dispenser",
+            "dispenser",
+            self.open_dispenser,
+            890, 84
+        )
+
+        self.ai_chat_icon = DesktopIcon(
+            self.icon_container,
+            "pyAI",
+            "ai_chat",
+            self.open_ai_chat,
+            1000, 84
+        )
         self.refresh_custom_app_icons()
 
     def _custom_app_name(self, path):
@@ -1946,7 +2125,7 @@ class DesktopGUI:
             120, self.icon_container.winfo_width(), self.icon_container.winfo_reqwidth()
         )
         columns = max(1, min(11, (available_width - 10) // 110))
-        first_slot = 19
+        first_slot = 20
         for offset, path in enumerate(apps):
             slot = first_slot + offset
             x = 10 + (slot % columns) * 110
@@ -4268,6 +4447,431 @@ def build(app, window):
         note.focus_set()
         return window
 
+    def open_ai_chat(self):
+        """Open pyAI, the chat assistant backed by a local Ollama server."""
+        surface_bg = self.preferences["surface_bg"]
+        text_fg = self.preferences["text_fg"]
+        font_size = self.preferences["font_size"]
+        window = self.create_window("pyAI", width=640, height=520)
+        window.min_width = 420
+        window.min_height = 360
+
+        state = {
+            "phase": "checking",
+            "closed": False,
+            "cancel": threading.Event(),
+            "history": [],
+        }
+
+        def client():
+            return OllamaClient(self.preferences["ai_chat_url"])
+
+        toolbar = tk.Frame(window.content, bg=surface_bg, relief=tk.RAISED, bd=1)
+        toolbar.pack(fill=tk.X)
+        tk.Label(toolbar, text="Model:", bg=surface_bg, fg=text_fg).pack(side=tk.LEFT, padx=(6, 2), pady=3)
+        model_var = tk.StringVar(value=self.preferences["ai_chat_model"])
+        model_entry = tk.Entry(
+            toolbar, textvariable=model_var, width=16,
+            bg=surface_bg, fg=text_fg, insertbackground=text_fg,
+        )
+        model_entry.pack(side=tk.LEFT, pady=3)
+
+        transcript = scrolledtext.ScrolledText(
+            window.content,
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+            bg=surface_bg,
+            fg=text_fg,
+            font=("Courier New", font_size),
+            relief=tk.FLAT,
+            padx=10,
+            pady=8,
+        )
+        transcript.tag_configure("you", font=("Courier New", font_size, "bold"))
+        transcript.tag_configure("system", font=("Courier New", font_size, "italic"))
+
+        action_frame = tk.Frame(window.content, bg=surface_bg)
+        action_label = tk.Label(
+            action_frame, bg=surface_bg, fg=text_fg,
+            wraplength=560, justify=tk.LEFT, anchor=tk.W,
+        )
+        action_button = tk.Button(action_frame, text="")
+        retry_button = tk.Button(action_frame, text="Retry")
+
+        input_frame = tk.Frame(window.content, bg=surface_bg)
+        input_box = tk.Text(
+            input_frame, height=3, wrap=tk.WORD,
+            bg=surface_bg, fg=text_fg, insertbackground=text_fg,
+            font=("Courier New", font_size), relief=tk.SOLID, bd=1,
+        )
+        input_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 3), pady=4)
+        send_button = tk.Button(input_frame, text="Send", width=6, state=tk.DISABLED)
+        send_button.pack(side=tk.RIGHT, padx=(3, 6), pady=4)
+
+        status_var = tk.StringVar(value="Checking Ollama...")
+        status = tk.Label(window.content, textvariable=status_var, bg=surface_bg, fg=text_fg, anchor=tk.W)
+
+        # Top-to-bottom pack order; action_frame collapses when its children hide.
+        transcript.pack(fill=tk.BOTH, expand=True)
+        action_frame.pack(fill=tk.X)
+        input_frame.pack(fill=tk.X)
+        status.pack(fill=tk.X, padx=6, pady=(0, 3))
+
+        def alive():
+            return not state["closed"] and transcript.winfo_exists()
+
+        def append_transcript(text, tag=None):
+            transcript.config(state=tk.NORMAL)
+            if tag:
+                transcript.insert(tk.END, text, tag)
+            else:
+                transcript.insert(tk.END, text)
+            transcript.see(tk.END)
+            transcript.config(state=tk.DISABLED)
+
+        def hide_action():
+            action_label.pack_forget()
+            action_button.pack_forget()
+            retry_button.pack_forget()
+
+        def show_action(message, button_text=None, command=None, show_retry=True):
+            hide_action()
+            action_label.config(text=message)
+            action_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6, pady=4)
+            if show_retry:
+                retry_button.config(command=run_check)
+                retry_button.pack(side=tk.RIGHT, padx=(3, 6), pady=4)
+            if button_text:
+                action_button.config(text=button_text, command=command)
+                action_button.pack(side=tk.RIGHT, padx=3, pady=4)
+
+        def current_model():
+            return model_var.get().strip() or "llama3.2"
+
+        def set_ready():
+            state["phase"] = "ready"
+            hide_action()
+            send_button.config(state=tk.NORMAL, command=send_message)
+            status_var.set(f"{current_model()} — ready")
+            input_box.focus_set()
+
+        def handle_offline():
+            if OllamaClient.binary_installed():
+                state["phase"] = "not_running"
+                status_var.set("Ollama is not running")
+                show_action(
+                    "Ollama is installed but not running. Start it, or run 'ollama serve' in a terminal.",
+                    "Start Ollama", start_server,
+                )
+            else:
+                state["phase"] = "not_installed"
+                status_var.set("Ollama is not installed")
+                show_action(
+                    "pyAI needs Ollama, a free local AI runtime. Install it from ollama.com/download "
+                    "(or re-run pyOS Setup, which can install it), then press Retry.",
+                    "Get Ollama", lambda: webbrowser.open("https://ollama.com/download"),
+                )
+
+        def handle_models(names, model):
+            wanted = model if ":" in model else f"{model}:"
+            if any(installed == model or installed.startswith(wanted) for installed in names):
+                set_ready()
+            else:
+                state["phase"] = "model_missing"
+                status_var.set(f"Model {model} not downloaded")
+                show_action(
+                    f"The model '{model}' is not downloaded yet (about 2 GB for llama3.2). "
+                    "Download it now? This is a one-time step.",
+                    "Download model", start_pull,
+                )
+
+        def run_check():
+            state["phase"] = "checking"
+            hide_action()
+            send_button.config(state=tk.DISABLED)
+            status_var.set("Checking Ollama...")
+            model = current_model()
+
+            def worker():
+                try:
+                    names = client().list_models()
+                except (urllib.error.URLError, OSError, ValueError):
+                    self.root.after(0, lambda: alive() and handle_offline())
+                    return
+                self.root.after(0, lambda found=names: alive() and handle_models(found, model))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def poll_server(attempts):
+            def worker():
+                try:
+                    client().list_models()
+                except (urllib.error.URLError, OSError, ValueError):
+                    if attempts > 1:
+                        self.root.after(1000, lambda: alive() and poll_server(attempts - 1))
+                    else:
+                        self.root.after(0, lambda: alive() and handle_offline())
+                    return
+                self.root.after(0, lambda: alive() and run_check())
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def start_server():
+            try:
+                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+                subprocess.Popen(
+                    ["ollama", "serve"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=flags,
+                )
+            except OSError as error:
+                status_var.set(f"Could not start Ollama: {error}")
+                return
+            hide_action()
+            status_var.set("Starting Ollama...")
+            poll_server(10)
+
+        def start_pull():
+            model = current_model()
+            hide_action()
+            state["phase"] = "pulling"
+            state["cancel"] = threading.Event()
+            cancel_event = state["cancel"]
+            status_var.set(f"Pulling {model}...")
+            show_action(f"Downloading '{model}'. You can keep using the desktop meanwhile.",
+                        "Cancel", cancel_event.set, show_retry=False)
+
+            def on_progress(status_text, completed, total):
+                if completed and total:
+                    message = f"Pulling {model}: {int(completed * 100 / total)}%"
+                else:
+                    message = f"Pulling {model}: {status_text or '...'}"
+                self.root.after(0, lambda text=message: alive() and status_var.set(text))
+
+            def worker():
+                try:
+                    client().pull(model, on_progress, cancel_event)
+                    error = None
+                except (urllib.error.URLError, OSError, ValueError) as exc:
+                    error = str(exc)
+
+                def done():
+                    if not alive():
+                        return
+                    if cancel_event.is_set():
+                        status_var.set("Download cancelled")
+                        handle_models([], model)
+                    elif error:
+                        status_var.set(f"Download failed: {error}")
+                        handle_models([], model)
+                    else:
+                        run_check()
+
+                self.root.after(0, done)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def finish_generation(tokens, error, cancel_event):
+            if not alive():
+                return
+            reply = "".join(tokens)
+            if reply:
+                # A stopped partial reply is still valid conversation context.
+                state["history"].append({"role": "assistant", "content": reply})
+            if cancel_event.is_set():
+                append_transcript(" [stopped]\n\n", "system")
+            elif error:
+                append_transcript(f"\n[error: {error}]\n\n", "system")
+            else:
+                append_transcript("\n\n")
+            set_ready()
+
+        def send_message(event=None):
+            if state["phase"] != "ready":
+                return "break"
+            prompt = input_box.get("1.0", "end-1c").strip()
+            if not prompt:
+                return "break"
+            input_box.delete("1.0", tk.END)
+            model = current_model()
+            state["history"].append({"role": "user", "content": prompt})
+            append_transcript(f"YOU> {prompt}\n", "you")
+            append_transcript(f"{model.upper()}> ")
+            state["phase"] = "generating"
+            state["cancel"] = threading.Event()
+            cancel_event = state["cancel"]
+            send_button.config(state=tk.DISABLED)
+            status_var.set("Generating... (Stop below)")
+            show_action("", "Stop", cancel_event.set, show_retry=False)
+            tokens = []
+
+            def on_token(text, done):
+                if text:
+                    tokens.append(text)
+                    self.root.after(0, lambda chunk=text: alive() and append_transcript(chunk))
+
+            def worker():
+                try:
+                    client().chat(model, list(state["history"]), on_token, cancel_event)
+                    error = None
+                except (urllib.error.URLError, OSError, ValueError) as exc:
+                    error = str(exc)
+                self.root.after(0, lambda: finish_generation(tokens, error, cancel_event))
+
+            threading.Thread(target=worker, daemon=True).start()
+            return "break"
+
+        def new_chat():
+            if state["phase"] in {"generating", "pulling"}:
+                state["cancel"].set()
+            state["history"] = []
+            transcript.config(state=tk.NORMAL)
+            transcript.delete("1.0", tk.END)
+            transcript.config(state=tk.DISABLED)
+
+        def apply_model(event=None):
+            name = model_var.get().strip()
+            if not name:
+                model_var.set(self.preferences["ai_chat_model"])
+                return
+            if name != self.preferences["ai_chat_model"]:
+                self.preferences["ai_chat_model"] = name
+                self.save_preferences()
+                if state["phase"] not in {"generating", "pulling"}:
+                    run_check()
+
+        def close_chat():
+            state["closed"] = True
+            state["cancel"].set()
+            window.close()
+
+        tk.Button(toolbar, text="New Chat", command=new_chat).pack(side=tk.LEFT, padx=6, pady=3)
+        model_entry.bind("<Return>", apply_model)
+        model_entry.bind("<FocusOut>", apply_model)
+        input_box.bind("<Return>", send_message)
+        input_box.bind("<Shift-Return>", lambda event: None)
+        window.close_button.configure(command=close_chat)
+
+        append_transcript(
+            "pyAI runs a language model locally through Ollama.\n"
+            "Nothing you type leaves this computer.\n\n", "system",
+        )
+        run_check()
+        return window
+
+    def open_dispenser(self):
+        """Open the Dispenser, a dot matrix printer that prints sausage pixel art."""
+        surface_bg = self.preferences["surface_bg"]
+        text_fg = self.preferences["text_fg"]
+        window = self.create_window("Dispenser", width=700, height=520)
+
+        scale = 10
+        art_width = len(DISPENSER_ARTWORK[0][0]) * scale
+        line_height = 20
+
+        scrollbar = tk.Scrollbar(window.content, orient=tk.VERTICAL)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 4), pady=8)
+        paper = tk.Canvas(
+            window.content,
+            bg=surface_bg,
+            highlightthickness=0,
+            yscrollcommand=scrollbar.set,
+        )
+        paper.pack(fill=tk.BOTH, expand=True, padx=(8, 0), pady=8)
+        scrollbar.configure(command=paper.yview)
+
+        prompt = tk.Frame(window.content, bg=surface_bg, relief=tk.RAISED, bd=1)
+        tk.Label(
+            prompt,
+            text="Sausage complete. Would you like another sausage?",
+            bg=surface_bg,
+            fg=text_fg,
+        ).pack(side=tk.LEFT, padx=10, pady=8)
+
+        state = {"cursor": 12, "photos": [], "last_rows": None}
+
+        def show_bottom(extent):
+            paper.configure(scrollregion=(0, 0, art_width, extent))
+            paper.yview_moveto(1.0)
+
+        def pick_rows():
+            """Serve a random artwork, never the same sausage twice in a row."""
+            choices = [rows for rows in DISPENSER_ARTWORK if rows is not state["last_rows"]]
+            state["last_rows"] = random.choice(choices)
+            return state["last_rows"]
+
+        def print_art(on_done):
+            rows = pick_rows()
+            photo = tk.PhotoImage(width=art_width, height=len(rows) * scale)
+            state["photos"].append(photo)
+            width = paper.winfo_width()
+            x = max(12, ((width if width > 1 else art_width + 24) - art_width) // 2)
+            top = state["cursor"]
+            paper.create_image(x, top, image=photo, anchor=tk.NW)
+            job = {"row": 0}
+
+            def tick():
+                if not window.frame.winfo_exists():
+                    return
+                if job["row"] >= len(rows):
+                    state["cursor"] = top + len(rows) * scale + line_height
+                    show_bottom(state["cursor"])
+                    on_done()
+                    return
+                colors = (DISPENSER_PALETTE[c] for c in rows[job["row"]])
+                data = "{" + " ".join(" ".join([color] * scale) for color in colors) + "}"
+                photo.put(data, to=(0, job["row"] * scale, art_width, (job["row"] + 1) * scale))
+                job["row"] += 1
+                show_bottom(top + job["row"] * scale + line_height)
+                self.root.after(45, tick)
+
+            tick()
+
+        def print_text(message, on_done):
+            item = paper.create_text(
+                12, state["cursor"], anchor=tk.NW, fill=text_fg,
+                font=("Courier New", 10), text="",
+            )
+            job = {"shown": 0}
+
+            def tick():
+                if not window.frame.winfo_exists():
+                    return
+                job["shown"] += 2
+                paper.itemconfigure(item, text=message[:job["shown"]])
+                show_bottom(state["cursor"] + line_height)
+                if job["shown"] >= len(message):
+                    state["cursor"] += line_height
+                    on_done()
+                else:
+                    self.root.after(25, tick)
+
+            tick()
+
+        def show_prompt():
+            prompt.pack(side=tk.BOTTOM, fill=tk.X, before=scrollbar)
+
+        def another_sausage():
+            prompt.pack_forget()
+            paper.delete("all")
+            state["photos"].clear()
+            state["cursor"] = 12
+            show_bottom(1)
+            print_art(show_prompt)
+
+        def refuse_sausage():
+            prompt.pack_forget()
+            print_text(
+                "You selected No, but everyone loves sausages, so here's another one.",
+                lambda: print_art(show_prompt),
+            )
+
+        tk.Button(prompt, text="No", width=6, command=refuse_sausage).pack(side=tk.RIGHT, padx=(4, 10), pady=6)
+        tk.Button(prompt, text="Yes", width=6, command=another_sausage).pack(side=tk.RIGHT, padx=4, pady=6)
+
+        print_art(show_prompt)
+        return window
+
     def open_text_editor(self, path=None):
         """Open an embedded text editor window."""
         file_path = Path(path) if path else Path.home() / "untitled.txt"
@@ -5526,6 +6130,544 @@ Features:
         messagebox.showinfo("Refresh", "Desktop refreshed!")
 
 
+# Dispenser artwork: 48x32 pixel-art sausage scenes, one char per pixel,
+# rendered through DISPENSER_PALETTE by open_dispenser.
+DISPENSER_PALETTE = {
+    ".": "#f2ecdc",
+    "w": "#ffffff",
+    "0": "#141317",
+    "K": "#33180d",
+    "B": "#5f2a12",
+    "b": "#7d3c18",
+    "r": "#9c4f1e",
+    "o": "#b96530",
+    "h": "#d98a4e",
+    "H": "#f0b476",
+    "R": "#c22321",
+    "Y": "#e0a512",
+    "y": "#f4cf47",
+    "n": "#c98f4b",
+    "N": "#e8bd7d",
+    "e": "#f7f1df",
+    "E": "#f2b21b",
+    "v": "#6f9c2c",
+    "G": "#26251f",
+    "g": "#4a4a48",
+    "m": "#8b8b8b",
+    "M": "#c9c9c4",
+    "S": "#dedbcd",
+    "F": "#e6541c",
+    "f": "#f7952b",
+    "W": "#ffe8a3",
+    "c": "#8fd3f0",
+    "C": "#4ba3d8",
+    "u": "#2a6fb0",
+    "p": "#f4a25b",
+    "P": "#e2643c",
+    "q": "#a03a56",
+    "Q": "#5c2a5e",
+    "D": "#221a3e",
+    "d": "#37306b",
+    "*": "#f7f3d0",
+    "s": "#ffd94a",
+    "t": "#3f7d3a",
+    "T": "#295c2d",
+    "a": "#2e6e8e",
+    "A": "#7fc4d8",
+    "k": "#6b4a2f",
+    "l": "#8a6a43",
+    "x": "#5a5566",
+    "X": "#38344a",
+    "z": "#c7b9a5",
+    "1": "#f0c29a",
+    "2": "#d99b6b",
+    "3": "#b06f44",
+    "4": "#8a5a33",
+    "5": "#5e3a20",
+    "L": "#d95f5f",
+    "i": "#f6ead2",
+}
+
+DISPENSER_ARTWORK = (
+    (
+        "................................................",
+        "................................................",
+        "................................................",
+        "................................................",
+        "................................................",
+        "................................................",
+        "................................................",
+        "........................S.......................",
+        ".......................S........................",
+        "................S......S........S...............",
+        "...............S........S......S................",
+        "...............S.........S.....S................",
+        "................S........S......S...............",
+        ".................S......S........S..............",
+        ".................S...............S..............",
+        "................S...............S...............",
+        "................................................",
+        "...........KKKKK................................",
+        ".........KKKKKKKKKKKKKKKKKKKKKKK................",
+        ".........KHhhrhhhhhrrhhhhhhKKKKKKKKKKK..........",
+        "kkkkkkkkkKHHHooHHHHHooHHHHorhhhhhrrhhKKkkkkkkkkk",
+        "llllllBKKKhhhhrrhhhhhooHHHHooHHHHHoHHHKwwlllllll",
+        "lllllllwwKooooobboooohrrhhhhrrhhhhhhhHKwKBllllll",
+        "llllllwwwKrrrrrobbooooobooooobboooooohKKwwwlllll",
+        "lllllMMwwKKbrrrrrBBrrrrrBrrrrrBBooooooKwwwMMllll",
+        "kkkkkkMMwwKKKvKKKKKKKbbbBBbbbrrBBrrrrrKwwMMkkkkk",
+        "lllllllMMMwwvvwwKKKKKKKKKKKKKKKKKKKvvKKMMMllllll",
+        "llllllllMMMMMMwwwwwwwwwwwwwwwwwwKKKKKMMMMlllllll",
+        "llllllllllMMMMMMMMMMMMMMwMMMMMMMMMMMMMMlllllllll",
+        "llllllllllllllMMMMMMMMMMMMMMMMMMMMMlllllllllllll",
+        "kkkkkkkkkkkkkkkkkkkkkkkkMkkkkkkkkkkkkkkkkkkkkkkk",
+        "llllllllllllllllllllllllllllllllllllllllllllllll",
+    ),
+    (
+        "................................................",
+        "...............S...............S................",
+        "..............S...............S.................",
+        "..............S...............S.................",
+        "...............S...............S................",
+        "................S...............S...............",
+        "................S...............S...............",
+        "...............S...............S................",
+        "................................................",
+        "................................................",
+        "................................................",
+        "................................................",
+        "........KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK........",
+        "......KKyhhhhhhhyhhhhhhhyhhhhhhhyhhhhhhhKK......",
+        "......KHYyHHHHHyYyHHHHHyYyHHHHHyYyHHHHHyHK......",
+        "......KHHYyHHHyYHYyHHHyYHYyHHHyYHYyHHHyYHK......",
+        "...BKKKhhhYyhyYhhhYyhyYhhhYyhyYhhhYyhyYhhKKKB...",
+        "......KooooYyYoooooYyYoooooYyYoooooYyYoooK......",
+        "......KrrrrrYrrrrrrrYrrrrrrrYrrrrrrrYrrrrK......",
+        "......KKbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbKK......",
+        "........KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKn.......",
+        "........nnNnnNnnNnnNnnNnnNnnNnnNnnNnnNnnn.......",
+        ".......nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn......",
+        ".......knnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnk......",
+        "........nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn.......",
+        ".........nknnnnnnnnnnnnnnnnnnnnnnnnnnnkn........",
+        "LLLLwwwwLLLkkknnnnnnnnnnnnnnnnnnnnnkkkwwLLLLwwww",
+        "LLLLwwwwLLLLwwkkkkkkkkkknkkkkkkkkkkLwwwwLLLLwwww",
+        "wwwwLLLLwwwwLLLLwwwwLLLLkwwwLLLLwwwwLLLLwwwwLLLL",
+        "wwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLL",
+        "wwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLL",
+        "wwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLL",
+    ),
+    (
+        "000000000000000000000000000000000000000000000000",
+        "000000000000000000000000000000000000000000000000",
+        "000000000000000000000000000000M00000000000000000",
+        "00000000000000M00000000000000M000000000000000000",
+        "0000000000000M000000000000000M000000000000000000",
+        "0000000000000M0000000000000000M00000000000000000",
+        "00000000000000M0000000000000000M0000000000000000",
+        "G0G0G0G0G0G0G0GMG0G0G0G0G0G0G0GMG0G0G0G0G0G0G0G0",
+        "GGGGGGGGGGGGGGGMGGGGGGGGGGGGGGMGGGGGGGGGGGGGGGGG",
+        "GGGGGGGGGGGGGGMGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG",
+        "GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG",
+        "0000000000000000000000000000000000KKKK0000000000",
+        "000g0000000g00KKKKKKKKKKKKKKKKKKKKKKKKK0000g0000",
+        "000g00000KKKKKKKKKKKhhhhhhhhhhhhhrrhhhhK000g0000",
+        "mmmgmmmmKKhhrrhhhhhroHHHHHHooHHHHHooHHHKmmmgmmmm",
+        "ggggggggKHHHHooHHHHHooHHHHHHrrhhhhhrhhhKKKBggggg",
+        "000g0BK0KhhhhhrrhhhhhrrhhhhhobbooooooooK000g0000",
+        "000g000KKoooooobbooooobbbooooobboorrrrrK000g0000",
+        "000g0000KooooorrBBrrrrrBBBrrrrrBBrrrrrKK000g0000",
+        "000g0000KrrrrrrrrBBbbbbbbBBbKKKKKKKKKKK0000g0000",
+        "mmmgmmmmmKKKKKKKKKKKKKKKKKKKKKKKKKmgmmmmmmmgmmmm",
+        "ggggggggggKKKKgggggggggggggggggggggggggggggggggg",
+        "00Wg0000WW0g000WW00g000W000g00W0000gW000000gW000",
+        "0WWW0000Wf00000WW00000Wf00000WfW0000fW00000fWW00",
+        "0fff0000ff00000ff00000ff0000Wfff0000ffW0000fff00",
+        "Wfff0000ffWW000ffW000WffW000ffff0000fff0000fff00",
+        "ffff000Wffff00Wfff000ffff00Wffff000Wfff00WWfffW0",
+        "fFFFW0WfFFff00fFFfW0WfFFfWWffFFFW00fFFfW0ffFFFf0",
+        "FFFFf0ffFFFF00fFFFf0fFFFFfffFFFFf0ffFFFf0ffFFFf0",
+        "FFFFFfFFFFFFffFFFFFfFFFFFFFFFFFFFffFFFFFfFFFFFFf",
+        "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+        "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+    ),
+    (
+        "QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ",
+        "QQQQQQQQQQQQQQQQQQQQQQQQyQQQQQQQQQQQQQQQQQQQQQQQ",
+        "QQQQQQQQQQQQQQQQQQQQQQQQyQQQQQQQQQQQQQQQQQQQQQQQ",
+        "QQQQQQQQQQQQQQQQQQyQQQQQQQQQQQyQQQQQQQQQQQQQQQQQ",
+        "QQQQQQQQQQQQQQQQQQQyQQQQsQQQQyQQQQQQQQQQQQQQQQQQ",
+        "qQqQqQqQqQqQqQqQqQqsssssssssssqQqQqQqQqQqQqQqQqQ",
+        "qqqqqqqqqqqqqqqqqqsssssssssssssqqqqqqqqqqqqqqqqq",
+        "qqqqqqqqqqqqqyqqssssssssWssssssssqqyqqqqqqqqqqqq",
+        "qqqqqqqqqqqqqqysssssWWWWWWWWWsssssyqqqqqqqqqqqqq",
+        "qqqqqqqqqqqqqqqssssWWWWWWWWWWWssssqqqqqqqqqqqqqq",
+        "qPqPqPqPqPqPqPssKKKKKKKKKKKKKKKKsssPqPqPqPqPqPqP",
+        "PPPPPPPPPPPPPPsKhhhrrhhhhhrrhhhhKssPPPPPPPPPPPPP",
+        "PPPPPPPPPPPPPPsKHHHHooHHHHHooHHHKssPPPPPPPPPPPPP",
+        "PPPPPPPPPPyyBKKKhhhhhrrhhhhhrrhhKKKBPyyPPPMPPPPP",
+        "PPPPPPPPPPPPPPsKoooooobbooooobooKssPPPPPPMMMPPPP",
+        "pPpPpPpMpPpPpPsKrrrrrrrBBrrrrrrrKssPpPpPMMMMMPpP",
+        "ppppppMMMpppppssKKKKKKKKKKKKKKKKsssppppXXXXXXXpp",
+        "pppppMMMMMpppppssssWWWWWWWWWWWsssspppXXXXXXXXXXX",
+        "pppXXXXXXXXXpppsssssWWWWWWWWWsssssppXXXXXXXXXXXX",
+        "ppXXXXXXXXXXXpppssssssssWssssssssppXXXXXXXXXXXXX",
+        "XXXXXXXXXXXXXXXspssssssssssssssspsXXXXXXXXXXXXXX",
+        "XXXXXXXXXXXXXXXXssssssssssssssssXXXXXXXXXXXXXXXX",
+        "XXXXXXXXXXXXXXXXXXsssssssssssssXXXXXXXXXXXXXXXXX",
+        "XXXXXXXXXXXXXXXXXXXsssssssssssXXXXXXXXXXXXXXXXXX",
+        "ttttttTttttttTttttttTttttttTttttttTttttttTtttttt",
+        "tTttttttTttttttTttttttTttttttTttttttTttttttTtttt",
+        "tttTttttttTttttttTttttttTttttttTttttttTttttttTtt",
+        "tttttTttttttTttttttTttttttTttttttTttttttTttttttT",
+        "TttttttTttttttTttttttTttttttTttttttTttttttTttttt",
+        "ttTttttttTttttttTttttttTttttttTttttttTttttttTttt",
+        "ttttTttttttTttttttTttttttTttttttTttttttTttttttTt",
+        "ttttttTttttttTttttttTttttttTttttttTttttttTtttttt",
+    ),
+    (
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD*DDDDDDDD*",
+        "DDDDDDDDDDDDDDDDDDD*DDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+        "DDDDDD*DDD*DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+        "DDDDDDDDMMDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+        "DDDDDDMMDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD*D*D*DDD",
+        "DDDDwMDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDD*DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDKKKKKKKDDDD*DDDDDDDDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDKhhhhhKKKKKKKDDDDDDDDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDBKDKHHHHHrrhhhhKKKKKKDDDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDKKhhhHHHooHHHhrrhhKKKDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDKooohhhhroHHHHooHhhhKDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDKrooboooorhhhhhoHHHHKD*DDDDDDDDDDDD",
+        "DDDDDDDDDDDDDKrrrBrrrooboooohrhhhKDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDD*KKKbBbrrrBBroooboooKKKBDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDKKKKKKbbBBrrrrrroKDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDKKKKKKKbbbrrKDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDKKKKKKKDDDDDDd*DDDDDDD",
+        "DD*DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDdddudddDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDddCuuuuuuddDDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDMDDDDdCCCCCuuuuuddDD",
+        "DDDDDDDD*DDDDDDDDDDDDDDDDDDDDMMMMCCCCCCCuuuuudDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDD*DDDDDDdCCCCCuuuuuudDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDduuuCuuuuuuuuudD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDduuuuuuuuuuudMM",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDduuuuuuuCuuudDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDD*DDDDDDDdduuuuuuuuuddDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDdduuuuuuuddDDD",
+        "DDDDDDDDDDDD*DDDD*DDDDD*DDDDDDDDDD*DdddudddDDDDD",
+        "DDDDDDDD*DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDdDDDDDDDD",
+    ),
+    (
+        "DDD*DDDDD*D*DDDDDDDDXDDDDDDDDDDDD*DyWy***DDDXDDD",
+        "DDDDDDDDDDDD*DDXXXXXXXXXXXDDDDDDDDyWyDDXXXXXXXXX",
+        "DDDDDDXDDDDDDDXXXXXXXXXXXXXD**DDDyWyDDXXXXXXXXXX",
+        "DXXXXXXXXXXXDDDXXXXXXXXXXXDDDXXXXXXyWyXXXXXXXXXX",
+        "XXXXXXXXXXXXXDDDDDDDXDDDDDDDXXXXXXyWyXXXXDDDXDD*",
+        "*XXXXXXXXXXXDX*DDDDDDDDDDDDDXXXXyWyXXXXXDDDDDDDD",
+        "DQDQDQXQXXXXXXXXXXXQDQDXXXXXXXXyWyXQDQDQDQDQDQDQ",
+        "QQQQQQQXXXXXXXXXXXXXQQXX*XXXXXXXXyWyQQQQQQQQQQQQ",
+        "QQQQQQQQXXXXXXXXXXXQQQQXXXXXXXyWyXQQQQQQQQQQQQQQ",
+        "QQQQQQQQQQQQQXQQQQQ*QQQQQQQQyWyQQQQQQQQQQQQQQQQQ",
+        "QQQQQQQQQQQQQQQQQQQQQQQQKQQyW*QQQQQQQQQQQQQQQQQQ",
+        "QQQQQQQQQQQQQQQQQQQQQKKKKKKKQQQQQQQQQQQQQQQQQQQQ",
+        "QqQqQqQqQqQqQqQqQqQqQKHHhorKQqQqQqQqQqQqQqQqQqQq",
+        "qqqqqqqqqqqqqqqqqqqqKhHHhorbKqqqqqqqqqqqqqqqqqqq",
+        "qqqqqqqqqqqqqqqqqqqqKhHHhorbKqqqqqqqqqqqqqqqqqqq",
+        "qqqqqqqqqqqqqqqqqqqqKhHHhorbKqqqqqqqqqqqqqqqqqqq",
+        "xxxxxxxxxxxxxxxxxxxxKhHHhorbKxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxKhHHhorbKxxxxxxxxxxxxxxxxxxx",
+        "XxxXxxXxxXxxXxxXxxXxKhHHhorbKxXxxXxxXxxXxxXxxXxx",
+        "xxxxxxxxxxxxxxxxxxxxKhHHhorbKxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxxxxxKhHHhorbKxxxxxxxxxxxxxxxxxxx",
+        "xXxxXxxXxxXxxXxxXxxXKhHHhorbKxxXxxXxxXxxXxxXxxXx",
+        "xxxxxxxxxxxxxxxxxxxxKhHHhorbKxxxxxxxxxxxxxxxxxxx",
+        "xxxxxxxxxxxxxxxxXXXXKhHHhorbKXXXXxxxxxxxxxxxxxxx",
+        "xxXxxXxxXxxXxXXXzzzzzKHHhorKzzzzzXXXxxXxxXxxXxxX",
+        "xxxxxxxxxxxxXzzzzzzzzKKKKKKKzzzzzzzzXxxxxxxxxxxx",
+        "xxxxxxxxxxxXzzzzzzzzzXzzzzzXzzzzzzzzzXxxxxxxxxxx",
+        "XxxXxxXxxXXzzzzzzzzzzzzzXzzzzzxzzzzzzzXXxxXxxXxx",
+        "xxxxxxxxxxxXzzzzzzxzzzzzzzzzzzzzzzzzzXxxxxxxxxxx",
+        "xxxxxxxxxxxxXzzzzzzzzzzzzxzzzzzzzzzzXxxxxxxxxxxx",
+        "xXxxXxxXxxXxxXXXzzzzzzzzzzzzzzzzzXXXxXxxXxxXxxXx",
+        "xxxxxxxxxxxxxxxxXXXXXXXXzXXXXXXXXxxxxxxxxxxxxxxx",
+    ),
+    (
+        "LLLLLwwwwwLLLLLwMwwwLLLLLwwwwwMLLLLwwwwwLLLLLwww",
+        "LLLLLwwwwwLLLLLwwMwwLLLLLwwwwwLMLLLwwwwwLLLLLwww",
+        "LLLLLwwwwwLLLLLwwMwwLLLLLwwwwwLMLLLwwwwwLLLLLwww",
+        "LLLLLwwwwwLLLLLwMwwwLLLLLwwwwwMLLLLwwwwwLLLLLwww",
+        "LLLLLwwwwwLLLLLwwwwwLLLLLwwwwwLLLLLwwwwwLLLLLwww",
+        "wwwwwLLLLLwwwKwLLLLLwwwwwLLLLLwwwwwLLLLLwwwwwLLL",
+        "wwwwwLLLLLwKKKKKKKKKKKKKKKKKKKKKKKwLLLLLwwwwwLLL",
+        "wwwwwLLLLLKhhhhhhhhrhhhhhhhhKKKKKKKKKLLLwwwwwLLL",
+        "wwwwwLLLLLKHHHoHHHHHooHHHHoohhhhhrhhhKLLwwwwwLLL",
+        "wwwwwLLBKKKhhhrrhhhhHooHHHHooHHHHHHHHKLLwwwwwLLL",
+        "LLLLLwwwwwKoooobbooohhrrhhhhrrhhhhhhhKwKBLLLLwww",
+        "LLLLLwwwwwKrrroobbooooobooooobbooooooKKwLLLLLwww",
+        "LLLLLwwwwwKrrrrrrBBrrrrrBrrrrrBBrroooKwwLLLLLwww",
+        "LLLLLwwwwwLKKKKKKKKKbbbbBBbbbbrBBrrrrKwwLLLLLwww",
+        "LLLLLwwwwwLLLLKKKKKKKKKKKKKKKKKKKKKKKwwwLLLLLwww",
+        "wwwwwLLLLLwwwwwLLLLLwmwwmLLmLLwwwwKLLLLLwwwwwLLL",
+        "wwwwwLLLLLwwwwwLLLLLwmwwmLLmLLwwwwwLLLLLwwwwwLLL",
+        "wwwwwLLLLLwwwwwLLLLLwmwwmLLmLLwwwwwLLLLLwwwwwLLL",
+        "wwwwwLLLLLwwwwwLLLLLwmmmmmmmLLwwwwwLLLLLwwwwwLLL",
+        "wwwwwLLLLLwwwwwLLLLLwmmmmmmmLLwwwwwLLLLLwwwwwLLL",
+        "LLLLLwwwwwLLLLLwwwwwLLLmmmwwwwLLLLLwwwwwLLLLLwww",
+        "LLLLLwwwwwLLLLLwwwwwLLLmmmwwwwLLLLLwwwwwLLLLLwww",
+        "LLLLLwwwwwLLLLLwwwwwLLLMmwwwwwLLLLLwwwwwLLLLLwww",
+        "LLLLLwwwwwLLLLLwwwwwLLLMmwwwwwLLLLLwwwwwLLLLLwww",
+        "LLLLLwwwwwLLLLLwwwwwLLLMmwwwwwLLLLLwwwwwLLLLLwww",
+        "wwwwwLLLLLwwwwwLLLLLwwwMmLLLLLwwwwwLLLLLwwwwwLLL",
+        "wwwwwLLLLLwwwwwLLLLLwwwMmLLLLLwwwwwLLLLLwwwwwLLL",
+        "wwwwwLLLLLwwwwwLLLLLwwwMmLLLLLwwwwwLLLLLwwwwwLLL",
+        "wwwwwLLLLLwwwwwLLLLLwwwMmLLLLLwwwwwLLLLLwwwwwLLL",
+        "wwwwwLLLLLwwwwwLLLLLwwwMmLLLLLwwwwwLLLLLwwwwwLLL",
+        "LLLLLwwwwwLLLLLwwwwwLLLMmwwwwwLLLLLwwwwwLLLLLwww",
+        "LLLLLwwwwwLLLLLwwwwwLLLMmwwwwwLLLLLwwwwwLLLLLwww",
+    ),
+    (
+        "................................................",
+        "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+        "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+        "llllllllllllllllllllllllllllllllllllllllllllllll",
+        ".........m..............m..............m........",
+        ".........m..............m..............m........",
+        "........mm.............mm.............mm........",
+        ".........K..............K..............K........",
+        ".......KKBKK..........KKBKK..........KKBKK......",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        ".......KKKKK..........KKKKK..........KKKKK......",
+        ".........K..............K..............K........",
+        ".......KKKKK..........KKKKK..........KKKKK......",
+        "......KhHBorK........KhHBorK........KhHBorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "......KhHhorK........KhHhorK........KhHhorK.....",
+        "llllllllllllllllllllllllllllllllllllllllllllllll",
+        "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+        "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    ),
+    (
+        "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+        "llllllllllllllllllllllllllllllllllllllllllllllll",
+        "llllllllllllllllllllllllllllllllllllllllllllllll",
+        "llllllllllllllllllllllllMlllllllllllllllllllllll",
+        "llllllllllllllllMMMMMMMMMMMMMMMMMlllllllllllllll",
+        "lllllllllllllMMMMMMMMMMMwMMMMMMMMMMMllllllllllll",
+        "kkkkkkkkkkkMMMMMMwwwwwwwwwwwwwwwMMMMMMkkkkkkkkkk",
+        "lllllllllMMMMMwwwwwwwwwwwwwwwwwwwwwMMMMMllllllll",
+        "llllllllMMMwwwwwwwwwwwwwwwwwwwwwwMwwwwMMMlllllll",
+        "lllllllMMMwwwwwwwwwwwwwwwwwwwMMMMeMMMMwMMMllllll",
+        "llllllMMMwwwwwwwwwwwwwwwwwwMMeeeeeeeeeMMMMMlllll",
+        "lllllMMMwwwwwwwwwvtwwwwwwwMeeeeeeeEeeeeeMMMMllll",
+        "kkkkkMMwwwwwwwvtwwwwwwwwwwMeeeeeEyEEEeeeMwMMkkkk",
+        "llllMMwwwwwwwwwwvtwwwwwwwMeeeeeEEEEEEEeeeMwMMlll",
+        "llllMMwwwwwwwvtwwwwwwwwwwwMeeeeeEEEYEeeeMwwMMlll",
+        "llllMMwwwwwwwwwvtwwwwwwwwwMeeeeeeeEeeeeeMwwMMlll",
+        "lllMMwwwwwwwwKwwwwwwwwwwwwwMMeeeeeeeeeMMwwwwMMll",
+        "llllMMwwwwwKKKKKKKKKKKKKKKKwwMMMMeMMMMwwwwwMMlll",
+        "kkkkMMwwwwwKHHoHhhhhrhhKKKKKKKwwwMwwwwwwwwwMMkkk",
+        "llllMMwwBKKKhhroHHHHooHHHHHHHKwwwwwwwwwwwwwMMlll",
+        "lllllMMwwwwKooobboohhrrhhhhhHKwKBwwwwwwwwwMMllll",
+        "lllllMMMwwwKrrrrBBrooobboooooKKwwwwwwwwwwMMMllll",
+        "llllllMMMwwKKKKKKKKKKKKKKKKKKKKKwwwwwwwwMMMlllll",
+        "lllllllMMMwwwKKKKhhhrhhhhhhrrhhKwwwwwwwMMMllllll",
+        "kkkkkkkkMMMwwKHHHHHHooHHHHHHoHHKwKBwwwMMMkkkkkkk",
+        "lllllllllMBKKKhhhhhhhrrrhhoooooKKwwMMMMMllllllll",
+        "lllllllllllMMKoobooooobbborrrrrKMMMMMMllllllllll",
+        "lllllllllllllKrrBBrrrrrrBBbbKKKKMMMMllllllllllll",
+        "lllllllllllllKKKKKKKKKKKKKKKKKKMMlllllllllllllll",
+        "llllllllllllllllllllllllMlllllllllllllllllllllll",
+        "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+        "llllllllllllllllllllllllllllllllllllllllllllllll",
+    ),
+    (
+        "pppppppppppppppppppppppppppppppppppppppppppppppp",
+        "ppppppppppppppppppppppppppppppppppppppsppppppppp",
+        "pppppppppppppppppppppppppppppppppppssssssspppppp",
+        "ppppppppppppppppppppppppppppppppppsssssssssppppp",
+        "pPpPpPpPpPpPpPpPpPpPpPpPpPpPpPpPpPsssssssssPpPpP",
+        "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPsssssssssssPPPP",
+        "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPsssssssssPPPPP",
+        "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPsssssssssPPPPP",
+        "PqPqPqPqPqPqPqPqPqPqPqPqPqPqPqPqPqPsssssssPqPqPq",
+        "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqwqqqqqsqqqqqqqqq",
+        "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqwqqqqqqqqqqqqqqqqq",
+        "wwwwwwwwwwaaaAaaaaaaaaaaaaaaaaaaaawaaaaaaaaaAaaa",
+        "AAAAAAAAAAwwwwaaaAaaaaaaaaawwaaaaaaawaaaaaaaaaaa",
+        "aaaaaaaaaaAAAAwwwaaaaAaaawwaawaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaAAAwwaaaawwAaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaAAwwwwaaaaaaAaKKKKKKKKKaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaAAAwwaaaaaKKKKhhhhHHKaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaAAwwaaaKHHHHHHHHhKKKBaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaAABKaKhhhhhhoooKaAaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaAwKKoooooorrrKaaaaaAaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaAAKrrrrrbKKKKaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaKKKKKKKKKaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaawwwwwwwwwwwwwwaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaMMMMMMMMMMMMaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaAaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaAaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaAaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaAa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaAaaaaaaaaaaaaaaaa",
+    ),
+    (
+        "*DDDDDDDDDDDDDDDDDDDDDD*DDDD*DDDDDDDDDDDDDDD*DDD",
+        "DDDDD*DDDDDDDDDDDDDDDDDDDDD*DDDDDDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD*DDDDDDDdDDDDDDD",
+        "DDDDDDDDDDDDDD*DDDDDDDDDDDDDDDDDDDDDDDddMddDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDdMMMMMdDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDdMMMMMMMdDDD",
+        "DDDDDDDDDD*DDDDDDDDDDDDDDDDDDDDDDDDDDdMMMMMd*DDD",
+        "D*DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDddMddDDDDD",
+        "DDDDDDDDDD*DDDDDDDDDD*DDDDDDDDDD*DDDDDDDdDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDDD*DD*DDDDDDDDDDDDDDDDDDDDD",
+        "DDDDDDD*DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+        "DDDDDDDDD*DDDDDDDDDDDKKKKKKKKKKKDDDDDDDDDDDDDDDD",
+        "DDDDDDDDD*DDD*D*DDDDDKhhhhhhhhKKKDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDBKDKHHHHHHHHHHKDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDKKooohhhhhhhKKKBDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDKrrroooooooKDDDDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDKKKbbrrrrrrKDkkDDDDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDDKKKKKKKKKKKDDDkkkDDDDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDDDfffDDDDDDDDDDDDDkkkDDDDDD",
+        "DDDDDDDDDDDDDDDDDDDDDfffffDDDDDDDDDDDDDDDDkkkDDD",
+        "DDDDDDDDDDDDDDDDDDDDfffffffDDDDDDDDDDDDDDDDDDkkk",
+        "DDDDDDDDDDDDDDDDDDDfffffffffDDDDDDDDDDDDDDDDDDDD",
+        "XxxxxxxxxxxXxxxxxxxffFFFFFffxxxxxXxxxxxxxxxxXxxx",
+        "xxxxxxxXxxxxxxxxxxXFFFFWWWFFxXxxxxxxxxxxXxxxxxxx",
+        "xxxXxxxxxxxxxxXxxffFFWWWWWFFfxxxxxxxXxxxxxxxxxxX",
+        "xxxxxxxxxxXxxxxxxFFFFWWWWWFFFFxxXxxxxxxxxxxXxxxx",
+        "xxxxxxXxxxxxxxxxFFFFFWWWWWFFFFxxxxxxxxxXxxxxxxxx",
+        "xxXxxxxxxxxxlkkkkkkkkkkkkkkkkkkkkkxXxxxxxxxxxxXx",
+        "xxxxxxxxxXxxxkkkkkkkkkkkkkkkkkkkkklxxxxxxxXxxxxx",
+        "xxxxxXxxxxxxxxxxXxxxxxxxxxxXxxxxxxxxxxXxxxxxxxxx",
+        "xXxxxxxxxxxxXxxxxxxxxxxXxxxxxxxxxxXxxxxxxxxxxXxx",
+        "xxxxxxxxXxxxxxxxxxxXxxxxxxxxxxXxxxxxxxxxxXxxxxxx",
+    ),
+    (
+        "pppppppppppppppppppppppppppppppppppppppppppppppp",
+        "ppppppppppgppppppppppppppppppppppppppppppppppppp",
+        "pppgggggggggggggggpppppppppppppppppppppppppppppp",
+        "pgggggggggggggggggggpppppppppppppppppppppppppppp",
+        "gggggggggggggggggggggppppppppppppppppppppppppppp",
+        "gggggggggggggggggggggg1ppppppppppppppppppppppppp",
+        "ggggggggggggggggggggggg1pppppppppppppppppppppppp",
+        "gggggggggggggggggggggg11pppppppppppppppppppppppp",
+        "gggggggggggggggggggggg111ppppppppppppppppppppppp",
+        "gggggggggggggggggggg111g11pppppppppppppppppppppp",
+        "ggggggggggggggggg333111111pPpPpPpPpPpPpPpPpPpPpP",
+        "ggggggggggg1111111111111111PPPPPPPPPPPPPPPPPPPPP",
+        "gggggggggg11111111111111111PPPPPPPPPPPPPPPPPPPPP",
+        "gggggggggg11111110110111111PPPPPPPPPPPPPPPPPPPPP",
+        "ggggggg2gg11111111001111111PPPPPPPPPPPPPPPPPPPPP",
+        "gggggg222111111111111111112PPPPPPPPPPPPPPPPPPPPP",
+        "Pggggg2221111111111111111113PPPPPPPPPPPPPPPPPPPP",
+        "P1ggg2232211111111111111112PPPPPPPPPPPPPPPPPPPPP",
+        "P111g122311111111111LL11151PPPPPPPPPPPPPPPPPPPPP",
+        "P111112221111111111111iiiiiiKKKKKKKKKKKKKKKKKPPP",
+        "P11111121111111111111555555KhhhhhrrhhhhhrrhhhKPP",
+        "PP1111111111111111111555555KHHHHHHooHHHHHooHHKPP",
+        "Pq1111111111111111115555BKKKhhhhhhhrrhhhhhrhhKKK",
+        "qqq111111111111111111555555KoobooooobboooooooKqq",
+        "qqqq11111111111111111551555KrrBBrrrrrBBrrrrrrKqq",
+        "qqqqq11111111111111111iiiii5KKKKKKKKKKKKKKKKKqqq",
+        "qqqqq11111111111111111111111qqqqqqqqqqqqqqqqqqqq",
+        "qqqqqq11111111111111111111111qbqqqqqqqqqqqqqqqqq",
+        "qqqqqqqq11111111111111111111qqqqqrqqqqqqqqqqqqqq",
+        "uuuuuuuuuuuuu111111q1111111qqbqqqqqqqqqqqqqqqqqq",
+        "uuuuuuuuuuuuuuuuuuuuuuq1qqqqqqqqqqqqqqqqqqqqqqqq",
+        "uuuuuuuuuuuuuuuuuuuuuuqqqqqqqqqqqqqqqqqqqqqqqqqq",
+    ),
+    (
+        "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu",
+        "uuuuuuuuuuuuuuuuuuuuuuuuwuuuuuuuuuuuuuuuuuuuuuuu",
+        "uuuuuuuuuuuuuuuuwuwwwwwwwwwwwwwuwuuuuuuuuuuuuuuu",
+        "uuuuuuuuuuuuuwwwwwwwwwwwwwwwwwwwwwwwuuuuuuuuuuuu",
+        "uuuuuuuuuuuuwwwwwwwwwwwwwwwwwwwwwwwwwuuuuuuuuuuu",
+        "uuuuuuuuuuuuwwwwwwwwwwwwwwwwwwwwwwwwwuuuuuuuuuuu",
+        "uuuuuuuuuuuwwwwwwwwwwwwwwwwwwwwwwwwwwwuuuKuuuuuu",
+        "uuuuuuuuuuuuwwwwwwwwwwwwwwwwwwwwwwwwwuuKKKKKuuuu",
+        "uuuuuuuuuuuuwwwwwwwwwwwwwwwwwwwwwwwwwuKhHhorKuuu",
+        "uuuuuuuuuuuuuwwwwwwwwwww3wwwwwwwwwwwuuKhHhorKuuu",
+        "uuuuuuuuuuuuuuuMMMMM333313333MMMMMuuuuKhHhorKuuu",
+        "uuuuuuuuuuuuuuuuuu3311111111133uuuuuuuKhHhorKuuu",
+        "uCuCuCuCuCuCuCuCu313331111133313uCuCuCKhHhorKCuC",
+        "CCCCCCCCCCCCCCCC31111111111111113CCCCCKhHhorKCCC",
+        "CCCCCCCCCCCCCCC3111101111111011113CCCCKhHhorKCCC",
+        "CCCCCCCCCCCCCCC3111111111111111113CCCCKhHhorKCCC",
+        "CCCCCCCCCCCCCCC3111111111111111113CCCCKhHhorKCCC",
+        "CCCCCCCCCCCCCC31L111111111111111L13CCCCKKKKKCCCC",
+        "CCCCCCCCCCCCCCC3111111111111111113CCCCCCCKCCCCCC",
+        "CCCCCCCCCCCCCCC31111gggg1gggg11113CCCCmCmCmCCCCC",
+        "CCCCCCCCCCCCCCC3111g111151111g1113CCCCmCmCmCCCCC",
+        "CCCCCCCCCCCCCCCC311111iiiii111113CCCCCmCmCmCCCCC",
+        "CcCcCcCcCcCcCcCcC311155555551113CcCcCcCcmcCcCcCc",
+        "cccccccccccccccccc331155L551133cccccccccmccccccc",
+        "cccccccccccccccccccc333353333cccccccccccmccccccc",
+        "cccccccccccccccccccccccc3cccccccccccccccmccccccc",
+        "ccccccccccccwwwwwwwwwwwMMMwwwwwwwwwwwcccmccccccc",
+        "ccccccccccccwwwwwwwwwwwMgMwwwwwwwwwwwcccmccccccc",
+        "ccccccccccccwwwwwwwwwwwMMMwwwwwwwwwwwcccmccccccc",
+        "ccccccccccccwwwwwwwwwwwMMMwwwwwwwwwwwcccmccccccc",
+        "ccccccccccccwwwwwwwwwwwMgMwwwwwwwwwwwcccmccccccc",
+        "ccccccccccccwwwwwwwwwwwMMMwwwwwwwwwwwcccmccccccc",
+    ),
+    (
+        "cccccccccccccccccccccccccccccccccccccccccccccccc",
+        "cccccccccccccccccccccccccccccccccccccccccccccccc",
+        "ccccccwccccccccc0ccccc0ccccc0ccccccccccccccccccc",
+        "cccwwwwwwwcccc00000c00000c00000ccccccccccccccccc",
+        "ccwwwwwwwwwcc0000000000000000000cccccccccccccccc",
+        "cccwwwwwwwc00000000000000000000000ccccccwccccccc",
+        "ccccccwcccc00000000000000000000000ccwwwwwwwwwccc",
+        "cccccccccc0000000000000000000000000wwwwwwwwwwwcc",
+        "ccccccccccc00000000000000000000000ccwwwwwwwwwccc",
+        "ccccccccccc00000200000200000200000ccccccwccccccc",
+        "ccccccccccccc0222220222220222220cccccccccccccccc",
+        "cccccccccccc442222222222222222244ccccccccccccccc",
+        "cccccccccccc422220222222220222224ccccccccccccccc",
+        "cccccccccccc422202022222202022224ccccccccccccccc",
+        "cccccccccccc422222222222222222224ccccccccccccccc",
+        "ccccccccccc42222222222222222222224cccccccccccccc",
+        "cccccccccccc422222222222222222224ccccccccccccccc",
+        "cccccccccccc422222222222222222224ccccccccccccccc",
+        "cccccccccccc422222222252222222224ccccccccccccccc",
+        "cccccccccccc442222iiiiiiiii222244ccccccccccccccc",
+        "cCcCcCcCcCcCc4222555555555552224cCcCcCcCcCcCcCcC",
+        "CCCCCCCCCCCCCC42R25555555552R24CCccKKKKKKKKKKKCC",
+        "CCCCCCCCCCCCCCC422222252222R24CCCccKohhhhhh3333C",
+        "CCCCCCCCCCCCCCCC4422222222244CCCCccKhHHHHHH2222C",
+        "CCCCCCCCCCCCCCCCCC444424444CCCCCCccKoohhhhh3333K",
+        "CCCCCCCCCCCCCCCCCCCCCC4CCCCCCCCCCccKroooooo2222C",
+        "CCCCCCCCCCCCTTTTTTTTTTTTTTTTTTTTTccKorrrrrr3333C",
+        "CCCCCCCCCCCCtttttttttttttttttttttccKKKKKKKKKKKCC",
+        "CCCCCCCCCCCCtttttttttttttttttttttCCCCCCCCCCCCCCC",
+        "CCCCCCCCCCCCtttttttttttttttttttttCCCCCCCCCCCCCCC",
+        "CCCCCCCCCCCCtttttttttttttttttttttCCCCCCCCCCCCCCC",
+        "CCCCCCCCCCCCtttttttttttttttttttttCCCCCCCCCCCCCCC",
+    ),
+)
+
+
 DESKTOP_APP_LAUNCHERS = {
     "files": "open_default_file_manager",
     "games": "open_games_suite",
@@ -5537,6 +6679,7 @@ DESKTOP_APP_LAUNCHERS = {
     "images": "open_image_viewer",
     "notepad": "open_notepad",
     "editor": "open_text_editor",
+    "dispenser": "open_dispenser",
     "media": "open_media_player",
     "ide": "open_python_ide",
     "browser": "open_browser",
@@ -5547,6 +6690,7 @@ DESKTOP_APP_LAUNCHERS = {
     "virtual-drives": "open_virtual_drive_manager",
     "weather": "open_weather",
     "news": "open_news",
+    "pyai": "open_ai_chat",
     "about": "show_about",
 }
 

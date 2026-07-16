@@ -81,7 +81,7 @@ On first use, pyOS asks you to create a username and password. The account is st
 ## Desktop Basics
 
 - Click a desktop launcher to open its application.
-- Drag launchers to move them; they snap to the desktop grid.
+- Drag launchers to move them; they snap to the desktop grid and remember their positions across sessions.
 - Drag an application title bar to move its window.
 - Drag the bottom-right handle to resize a window.
 - Application windows are constrained to the usable pyOS desktop and automatically fitted when the host window shrinks, keeping title bars and close controls reachable.

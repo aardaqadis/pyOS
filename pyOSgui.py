@@ -404,6 +404,7 @@ class DesktopIcon:
         self._drag_start = None
         self._drag_origin = None
         self._dragged = False
+        self.position_changed = None
         self.frame = tk.Frame(parent, bg="white", relief=tk.RAISED, bd=2)
         self.frame._desktop_icon = self
         self.frame.place(x=x, y=y, width=width, height=height)
@@ -553,6 +554,8 @@ class DesktopIcon:
             self.double_click()
         else:
             self.snap_to_grid()
+            if self.position_changed:
+                self.position_changed(self.x, self.y)
 
     def snap_to_grid(self):
         """Snap the launcher to the nearest classic desktop grid cell."""
@@ -566,6 +569,38 @@ class DesktopIcon:
         self.x = max(0, min(snapped_x, max_x))
         self.y = max(0, min(snapped_y, max_y))
         self.frame.place_configure(x=self.x, y=self.y)
+
+    def restore_position(self, x, y):
+        """Restore a persisted position and constrain it once layout is available."""
+        self.x = max(0, int(x))
+        self.y = max(0, int(y))
+        self.frame.place_configure(x=self.x, y=self.y)
+
+        def constrain(attempt=0):
+            try:
+                parent_width = self.parent.winfo_width()
+                parent_height = self.parent.winfo_height()
+                if (parent_width <= 1 or parent_height <= 1) and attempt < 5:
+                    self.parent.after(25, lambda: constrain(attempt + 1))
+                    return
+                try:
+                    configured_width = int(self.parent.cget("width"))
+                    configured_height = int(self.parent.cget("height"))
+                except (tk.TclError, TypeError, ValueError):
+                    configured_width = configured_height = 1
+                parent_width = max(
+                    self.width, parent_width, self.parent.winfo_reqwidth(), configured_width,
+                )
+                parent_height = max(
+                    self.height, parent_height, self.parent.winfo_reqheight(), configured_height,
+                )
+                self.x = max(0, min(self.x, parent_width - self.width))
+                self.y = max(0, min(self.y, parent_height - self.height))
+                self.frame.place_configure(x=self.x, y=self.y)
+            except tk.TclError:
+                pass
+
+        self.parent.after_idle(constrain)
     
     def double_click(self):
         """Execute command on double-click"""
@@ -1420,6 +1455,7 @@ class DesktopGUI:
             "show_hidden_files": False,
             "file_manager_start": "Home",
             "taskbar_shortcuts": [],
+            "icon_positions": {},
             "notifications_enabled": True,
             "tips_enabled": True,
         }
@@ -1462,6 +1498,19 @@ class DesktopGUI:
             item for item in defaults["taskbar_shortcuts"]
             if isinstance(item, dict) and isinstance(item.get("path"), str)
         ][:12]
+        if not isinstance(defaults["icon_positions"], dict):
+            defaults["icon_positions"] = {}
+        valid_positions = {}
+        for key, position in defaults["icon_positions"].items():
+            if not isinstance(key, str) or not isinstance(position, dict):
+                continue
+            try:
+                x = max(0, min(10000, int(position["x"])))
+                y = max(0, min(10000, int(position["y"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+            valid_positions[key[:260]] = {"x": x, "y": y}
+        defaults["icon_positions"] = valid_positions
         defaults["notifications_enabled"] = bool(defaults["notifications_enabled"])
         defaults["tips_enabled"] = bool(defaults["tips_enabled"])
         return defaults
@@ -1612,6 +1661,66 @@ class DesktopGUI:
             self._background_photo = None
             self.background_label.configure(image="", bg=color)
         self.background_label.lower()
+
+    def _register_desktop_icon(self, icon, key):
+        """Restore a launcher without allowing startup-time icon collisions."""
+        placed_icons = getattr(self, "_placed_desktop_icons", [])
+        # Custom launchers may have been destroyed during a refresh.
+        active_icons = []
+        for existing in placed_icons:
+            try:
+                if existing.frame.winfo_exists():
+                    active_icons.append(existing)
+            except tk.TclError:
+                pass
+        self._placed_desktop_icons = active_icons
+
+        position = self.preferences["icon_positions"].get(key)
+        if position:
+            candidate_x, candidate_y = position["x"], position["y"]
+        else:
+            candidate_x, candidate_y = icon.x, icon.y
+
+        def overlaps(x, y):
+            padding = 4
+            return any(
+                x < existing.x + existing.width + padding
+                and x + icon.width + padding > existing.x
+                and y < existing.y + existing.height + padding
+                and y + icon.height + padding > existing.y
+                for existing in self._placed_desktop_icons
+            )
+
+        moved_to_free_cell = False
+        if overlaps(candidate_x, candidate_y):
+            available_width = max(
+                icon.width, self.icon_container.winfo_width(), self.icon_container.winfo_reqwidth()
+            )
+            columns = max(1, (available_width - DesktopIcon.GRID_MARGIN) // DesktopIcon.GRID_X)
+            slot = 0
+            while True:
+                x = DesktopIcon.GRID_MARGIN + (slot % columns) * DesktopIcon.GRID_X
+                y = DesktopIcon.GRID_MARGIN + (slot // columns) * DesktopIcon.GRID_Y
+                if not overlaps(x, y):
+                    candidate_x, candidate_y = x, y
+                    moved_to_free_cell = True
+                    break
+                slot += 1
+
+        if position or moved_to_free_cell:
+            icon.restore_position(candidate_x, candidate_y)
+        if moved_to_free_cell:
+            self.preferences["icon_positions"][key] = {
+                "x": int(candidate_x), "y": int(candidate_y),
+            }
+            self.save_preferences()
+        self._placed_desktop_icons.append(icon)
+
+        def remember(x, y):
+            self.preferences["icon_positions"][key] = {"x": int(x), "y": int(y)}
+            self.save_preferences()
+
+        icon.position_changed = remember
     
     def create_icons(self):
         """Create desktop icons"""
@@ -1775,6 +1884,29 @@ class DesktopGUI:
             self.open_news,
             780, 84
         )
+        built_in_icons = (
+            ("terminal", self.terminal_icon),
+            ("files", self.file_manager_icon),
+            ("drive-a", self.drive_a_icon),
+            ("drive-b", self.drive_b_icon),
+            ("settings", self.settings_icon),
+            ("about", self.about_icon),
+            ("editor", self.text_editor_icon),
+            ("browser", self.browser_icon),
+            ("ide", self.python_ide_icon),
+            ("media", self.media_player_icon),
+            ("notepad", self.notepad_icon),
+            ("images", self.image_viewer_icon),
+            ("calculator", self.calculator_icon),
+            ("messenger", self.messenger_icon),
+            ("games", self.games_icon),
+            ("modding", self.modding_icon),
+            ("virtual-drives", self.virtual_drives_icon),
+            ("weather", self.weather_icon),
+            ("news", self.news_icon),
+        )
+        for key, icon in built_in_icons:
+            self._register_desktop_icon(icon, "builtin:" + key)
         self.refresh_custom_app_icons()
 
     def _custom_app_name(self, path):
@@ -1828,6 +1960,7 @@ class DesktopGUI:
                 y,
             )
             icon.set_colors(self.preferences["surface_bg"], self.preferences["text_fg"])
+            self._register_desktop_icon(icon, "custom:" + path.name.casefold())
             self.custom_app_icons.append(icon)
     
     def open_cli(self):
@@ -2522,6 +2655,12 @@ def build(app, window):
                 destination.write_text(source, encoding="utf-8")
                 if old_path and old_path != destination and old_path.exists():
                     old_path.unlink()
+                    old_key = "custom:" + old_path.name.casefold()
+                    new_key = "custom:" + destination.name.casefold()
+                    old_position = self.preferences["icon_positions"].pop(old_key, None)
+                    if old_position is not None:
+                        self.preferences["icon_positions"][new_key] = old_position
+                        self.save_preferences()
                 current["path"] = destination
                 editor.edit_modified(False)
                 refresh(destination)
@@ -2553,6 +2692,8 @@ def build(app, window):
             except OSError as error:
                 messagebox.showerror("App Maker", str(error), parent=self.root)
                 return
+            self.preferences["icon_positions"].pop("custom:" + path.name.casefold(), None)
+            self.save_preferences()
             new_app()
             refresh()
             self.refresh_custom_app_icons()

@@ -374,6 +374,19 @@ Messenger discovers other running pyOS Messenger instances by their shared pyOS 
 
 Messenger is LAN-only: discovery uses local broadcasts and messages use direct TCP connections. Messages are not end-to-end encrypted. Connecting exposes your username, IP address, and online status to peers, and hackers or malicious peers could obtain information or send harmful content. Only use Messenger on trusted networks and only open images from people you trust.
 
+### SSH Client
+
+Open **SSH Client** from the desktop, Applications menu, context menu, or with `--app ssh`.
+
+- Connect to SSH servers with a password, private key and optional passphrase, or an SSH agent.
+- Use the embedded interactive command terminal without leaving the pyOS desktop.
+- Unknown host keys are rejected until you explicitly confirm their SHA-256 fingerprint.
+- Trusted host keys are stored per pyOS profile in `ssh_known_hosts`.
+- Passwords and key passphrases are kept only for the connection attempt and are cleared afterwards.
+
+Confirm every new server fingerprint through a trusted channel before accepting it. pyOS does not silently trust
+unknown SSH servers.
+
 ### Notifications
 
 <img width="361" height="108" alt="image" src="https://github.com/user-attachments/assets/fdbe465b-017e-4ca8-80aa-1874e4f1e4ab" />
@@ -491,7 +504,7 @@ play <file>               Play audio or video
 
 The Command Center's **Apps** menu and CLI commands can launch every pyOS desktop
 application directly. Run `apps` to list them, or use commands such as
-`calculator`, `messenger`, `games`, `ide`, `notepad`, `images`,
+`calculator`, `messenger`, `ssh`, `games`, `ide`, `notepad`, `images`,
 `desktop_browser`, and `desktop_media`. The GUI also accepts `--app weather`,
 `--app news`, `--app modding`, `--app virtual-drives`, and `--app pyai`.
 

@@ -89,7 +89,9 @@ $arguments = @(
     "--add-data", "$(Join-Path $ProjectRoot 'LICENSE.md');.",
     "--add-data", "$ResolvedIcon;.", "--hidden-import", "chess", "--hidden-import", "vlc",
     "--collect-all", "fido2", "--collect-all", "PIL", "--collect-all", "mido",
-    "--collect-all", "pygame", "--collect-all", "psutil", "--collect-all", "tkinterweb",
+    "--collect-all", "paramiko",
+    "--collect-all", "pygame", "--collect-all", "psutil", "--collect-all", "pythonmonkey",
+    "--collect-all", "tkinterweb",
     (Join-Path $ProjectRoot "pyOSgui.py")
 )
 

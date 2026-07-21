@@ -16,6 +16,7 @@ import math
 import ast
 import functools
 import base64
+import hashlib
 import socket
 import struct
 import time
@@ -1460,6 +1461,7 @@ class DesktopGUI:
         applications_menu.add_command(label="Calculator", command=self.open_calculator)
         applications_menu.add_command(label="Paint", command=self.open_paint)
         applications_menu.add_command(label="Network & Hosting", command=self.open_network_hosting)
+        applications_menu.add_command(label="SSH Client", command=self.open_ssh_client)
         applications_menu.add_command(label="Website Designer", command=self.open_website_designer)
         applications_menu.add_command(label="Games Suite", command=self.open_games_suite)
         applications_menu.add_separator()
@@ -2769,6 +2771,13 @@ class DesktopGUI:
             self.open_website_designer,
             10, 158
         )
+        self.ssh_client_icon = DesktopIcon(
+            self.icon_container,
+            "SSH Client",
+            "terminal",
+            self.open_ssh_client,
+            120, 158,
+        )
         built_in_icons = (
             ("terminal", self.terminal_icon),
             ("files", self.file_manager_icon),
@@ -2792,6 +2801,7 @@ class DesktopGUI:
             ("paint", self.paint_icon),
             ("network", self.network_icon),
             ("website-designer", self.website_designer_icon),
+            ("ssh", self.ssh_client_icon),
         )
         for key, icon in built_in_icons:
             self._register_desktop_icon(icon, "builtin:" + key)
@@ -4902,6 +4912,374 @@ img { max-width: 100%; height: auto; }
         window.close_button.configure(command=close_designer)
         if project_path:
             open_project(project_path)
+
+    def open_ssh_client(self):
+        """Open a secure interactive SSH client inside the pyOS desktop."""
+        try:
+            import paramiko
+        except (ImportError, OSError) as import_error:
+            if getattr(sys, "frozen", False):
+                messagebox.showerror(
+                    "SSH Client",
+                    "Paramiko could not be loaded from this pyOS executable. "
+                    "Reinstall or rebuild pyOS with its bundled SSH components.\n\n"
+                    f"Technical details: {import_error}",
+                    parent=self.root,
+                )
+                return
+            if not messagebox.askyesno(
+                "Repair SSH Client",
+                "The active pyOS Python environment is missing Paramiko 4. "
+                "Install the SSH components now?",
+                parent=self.root,
+            ):
+                return
+            progress, close_progress = self.open_task_progress(
+                "Repair SSH Client", "Installing Paramiko 4..."
+            )
+
+            def install_paramiko():
+                version = ""
+                try:
+                    progress("Downloading and installing Paramiko 4...")
+                    result = subprocess.run(
+                        [
+                            sys.executable, "-m", "pip", "install",
+                            "--disable-pip-version-check", "--upgrade", "paramiko>=4.0,<5.0",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        errors="replace",
+                        timeout=300,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                    if result.returncode:
+                        output = (result.stderr or result.stdout or "pip returned an error").strip()
+                        error = output[-1600:]
+                    else:
+                        progress("Verifying the SSH components...")
+                        verification = subprocess.run(
+                            [
+                                sys.executable, "-c",
+                                "import paramiko; print(paramiko.__version__)",
+                            ],
+                            capture_output=True,
+                            text=True,
+                            errors="replace",
+                            timeout=30,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        )
+                        if verification.returncode:
+                            output = (
+                                verification.stderr or verification.stdout
+                                or "Paramiko still could not be imported"
+                            ).strip()
+                            error = output[-1600:]
+                        else:
+                            error = None
+                            version = verification.stdout.strip()
+                except (OSError, subprocess.SubprocessError) as exc:
+                    error = str(exc)
+
+                def finish_install():
+                    close_progress()
+                    if error:
+                        messagebox.showerror(
+                            "SSH Client",
+                            f"Paramiko could not be installed:\n{error}",
+                            parent=self.root,
+                        )
+                        return
+                    messagebox.showinfo(
+                        "SSH Client",
+                        f"Paramiko {version or '4'} was installed successfully. "
+                        "The SSH Client will now open.",
+                        parent=self.root,
+                    )
+                    self.open_ssh_client()
+
+                self.root.after(0, finish_install)
+
+            threading.Thread(target=install_paramiko, daemon=True).start()
+            return
+
+        window = self.create_window("SSH Client", width=820, height=570)
+        surface = self.preferences["surface_bg"]
+        foreground = self.preferences["text_fg"]
+        chrome = self.preferences["chrome_bg"]
+        chrome_text = self.preferences["chrome_fg"]
+        state = {"client": None, "channel": None, "closing": False, "reader": None}
+
+        connection = tk.Frame(window.content, bg=surface, padx=8, pady=7)
+        connection.pack(fill=tk.X)
+        host_var = tk.StringVar()
+        port_var = tk.StringVar(value="22")
+        username_var = tk.StringVar()
+        auth_var = tk.StringVar(value="Password")
+        secret_var = tk.StringVar()
+        key_var = tk.StringVar()
+        status_var = tk.StringVar(value="Disconnected")
+
+        def field(label, variable, width, column, show=None):
+            box = tk.Frame(connection, bg=surface)
+            box.grid(row=0, column=column, sticky="ew", padx=3)
+            tk.Label(box, text=label, bg=surface, fg=foreground, anchor=tk.W).pack(fill=tk.X)
+            entry = tk.Entry(box, textvariable=variable, width=width, show=show or "",
+                             bg=surface, fg=foreground, insertbackground=foreground)
+            entry.pack(fill=tk.X)
+            return entry
+
+        host_entry = field("Host", host_var, 24, 0)
+        port_entry = field("Port", port_var, 6, 1)
+        username_entry = field("Username", username_var, 18, 2)
+        auth_box = tk.Frame(connection, bg=surface)
+        auth_box.grid(row=0, column=3, sticky="ew", padx=3)
+        tk.Label(auth_box, text="Authentication", bg=surface, fg=foreground, anchor=tk.W).pack(fill=tk.X)
+        auth_menu = ttk.Combobox(
+            auth_box, textvariable=auth_var,
+            values=("Password", "Private Key", "SSH Agent"), state="readonly", width=13,
+        )
+        auth_menu.pack(fill=tk.X)
+        for column in (0, 2):
+            connection.columnconfigure(column, weight=1)
+
+        credentials = tk.Frame(window.content, bg=surface, padx=8)
+        credentials.pack(fill=tk.X)
+        secret_label = tk.Label(credentials, text="Password", bg=surface, fg=foreground)
+        secret_label.pack(side=tk.LEFT)
+        secret_entry = tk.Entry(
+            credentials, textvariable=secret_var, show="*", width=24,
+            bg=surface, fg=foreground, insertbackground=foreground,
+        )
+        secret_entry.pack(side=tk.LEFT, padx=(5, 12))
+        key_label = tk.Label(credentials, text="Private key", bg=surface, fg=foreground)
+        key_entry = tk.Entry(
+            credentials, textvariable=key_var,
+            bg=surface, fg=foreground, insertbackground=foreground,
+        )
+        browse_key = tk.Button(
+            credentials, text="Browse...",
+            command=lambda: key_var.set(filedialog.askopenfilename(
+                title="Select SSH Private Key", parent=self.root
+            ) or key_var.get()),
+        )
+
+        def refresh_auth_fields(*_args):
+            for widget in (key_label, key_entry, browse_key):
+                widget.pack_forget()
+            secret_entry.pack_forget()
+            secret_label.pack_forget()
+            if auth_var.get() == "Password":
+                secret_label.configure(text="Password")
+                secret_label.pack(side=tk.LEFT)
+                secret_entry.pack(side=tk.LEFT, padx=(5, 12))
+            elif auth_var.get() == "Private Key":
+                key_label.pack(side=tk.LEFT)
+                key_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+                browse_key.pack(side=tk.LEFT, padx=(0, 12))
+                secret_label.configure(text="Key passphrase")
+                secret_label.pack(side=tk.LEFT)
+                secret_entry.pack(side=tk.LEFT, padx=(5, 0))
+
+        auth_var.trace_add("write", refresh_auth_fields)
+        refresh_auth_fields()
+
+        toolbar = tk.Frame(window.content, bg=surface, padx=8, pady=7)
+        toolbar.pack(fill=tk.X)
+        connect_button = tk.Button(toolbar, text="Connect")
+        connect_button.pack(side=tk.LEFT)
+        disconnect_button = tk.Button(toolbar, text="Disconnect", state=tk.DISABLED)
+        disconnect_button.pack(side=tk.LEFT, padx=5)
+        tk.Label(toolbar, textvariable=status_var, bg=surface, fg=foreground, anchor=tk.W).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=10
+        )
+
+        terminal = scrolledtext.ScrolledText(
+            window.content, bg="#101418", fg="#d7e0ea", insertbackground="#ffffff",
+            font=("Consolas", 10), wrap=tk.WORD, state=tk.DISABLED,
+        )
+        terminal.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
+        command_frame = tk.Frame(window.content, bg=chrome, padx=6, pady=6)
+        command_frame.pack(fill=tk.X)
+        tk.Label(command_frame, text="$", bg=chrome, fg=chrome_text,
+                 font=("Consolas", 11, "bold")).pack(side=tk.LEFT)
+        command_entry = tk.Entry(
+            command_frame, bg=surface, fg=foreground, insertbackground=foreground,
+            font=("Consolas", 10), state=tk.DISABLED,
+        )
+        command_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        send_button = tk.Button(command_frame, text="Send", state=tk.DISABLED)
+        send_button.pack(side=tk.RIGHT)
+
+        def append_output(text):
+            if not terminal.winfo_exists():
+                return
+            # Remove common terminal control sequences unsupported by Tk Text.
+            clean = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))", "", text)
+            terminal.configure(state=tk.NORMAL)
+            terminal.insert(tk.END, clean)
+            terminal.see(tk.END)
+            terminal.configure(state=tk.DISABLED)
+
+        def set_connected(connected, text):
+            status_var.set(text)
+            connect_button.configure(state=tk.DISABLED if connected else tk.NORMAL)
+            disconnect_button.configure(state=tk.NORMAL if connected else tk.DISABLED)
+            command_entry.configure(state=tk.NORMAL if connected else tk.DISABLED)
+            send_button.configure(state=tk.NORMAL if connected else tk.DISABLED)
+            if connected:
+                command_entry.focus_set()
+
+        known_hosts = get_profile_dir() / "ssh_known_hosts"
+
+        def confirm_unknown_host(hostname, key):
+            decision = {"accepted": False}
+            ready = threading.Event()
+            fingerprint = base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip("=")
+
+            def ask():
+                decision["accepted"] = messagebox.askyesno(
+                    "Unknown SSH Host Key",
+                    f"The identity of {hostname} has not been verified.\n\n"
+                    f"Key type: {key.get_name()}\nSHA256 fingerprint: {fingerprint}\n\n"
+                    "Confirm this fingerprint with the server administrator before accepting. "
+                    "Trust this host and save its key?",
+                    icon=messagebox.WARNING, parent=self.root,
+                )
+                ready.set()
+
+            self.root.after(0, ask)
+            ready.wait()
+            return decision["accepted"]
+
+        class ConfirmHostKeyPolicy(paramiko.MissingHostKeyPolicy):
+            def missing_host_key(self, client, hostname, key):
+                if not confirm_unknown_host(hostname, key):
+                    raise paramiko.SSHException("Unknown host key was not accepted.")
+                client.get_host_keys().add(hostname, key.get_name(), key)
+                known_hosts.parent.mkdir(parents=True, exist_ok=True)
+                client.save_host_keys(str(known_hosts))
+
+        def disconnect(show_message=True):
+            channel, client = state.get("channel"), state.get("client")
+            state["channel"] = state["client"] = None
+            for resource in (channel, client):
+                if resource:
+                    try:
+                        resource.close()
+                    except Exception:
+                        pass
+            secret_var.set("")
+            if window.frame.winfo_exists():
+                set_connected(False, "Disconnected")
+                if show_message:
+                    append_output("\n[Disconnected]\n")
+
+        def reader(channel):
+            try:
+                while not state["closing"] and not channel.closed:
+                    if channel.recv_ready():
+                        data = channel.recv(32768).decode("utf-8", "replace")
+                        self.root.after(0, lambda value=data: append_output(value))
+                    elif channel.exit_status_ready():
+                        break
+                    else:
+                        time.sleep(0.05)
+            except (OSError, paramiko.SSHException) as error:
+                self.root.after(0, lambda value=str(error): append_output(f"\n[SSH error: {value}]\n"))
+            finally:
+                if not state["closing"]:
+                    self.root.after(0, lambda: disconnect(show_message=True))
+
+        def connect():
+            host, username = host_var.get().strip(), username_var.get().strip()
+            try:
+                port = int(port_var.get())
+            except ValueError:
+                port = 0
+            if not host or not username or not 1 <= port <= 65535:
+                messagebox.showerror("SSH Client", "Enter a host, username, and valid port.", parent=self.root)
+                return
+            key_filename = key_var.get().strip() if auth_var.get() == "Private Key" else None
+            if key_filename and not Path(key_filename).is_file():
+                messagebox.showerror("SSH Client", "The selected private key does not exist.", parent=self.root)
+                return
+            connect_button.configure(state=tk.DISABLED)
+            status_var.set(f"Connecting to {host}:{port}...")
+            mode = auth_var.get()
+            supplied_secret = secret_var.get()
+
+            def worker():
+                client = paramiko.SSHClient()
+                client.load_system_host_keys()
+                if known_hosts.exists():
+                    try:
+                        client.load_host_keys(str(known_hosts))
+                    except (OSError, paramiko.SSHException):
+                        pass
+                client.set_missing_host_key_policy(ConfirmHostKeyPolicy())
+                try:
+                    client.connect(
+                        hostname=host, port=port, username=username,
+                        password=supplied_secret if mode == "Password" else None,
+                        key_filename=key_filename,
+                        passphrase=supplied_secret if mode == "Private Key" else None,
+                        allow_agent=mode == "SSH Agent", look_for_keys=mode == "SSH Agent",
+                        timeout=15, banner_timeout=15, auth_timeout=20,
+                    )
+                    transport = client.get_transport()
+                    if transport:
+                        transport.set_keepalive(30)
+                    channel = client.invoke_shell(term="xterm", width=100, height=32)
+                    channel.settimeout(0.0)
+                except Exception as error:
+                    client.close()
+                    self.root.after(0, lambda value=str(error): (
+                        set_connected(False, "Connection failed"),
+                        append_output(f"[Connection failed: {value}]\n"),
+                        secret_var.set(""),
+                    ))
+                    return
+
+                def finish():
+                    if state["closing"] or not window.frame.winfo_exists():
+                        channel.close()
+                        client.close()
+                        return
+                    state["client"], state["channel"] = client, channel
+                    set_connected(True, f"Connected to {username}@{host}:{port}")
+                    append_output(f"[Connected securely to {host}]\n")
+                    state["reader"] = threading.Thread(target=reader, args=(channel,), daemon=True)
+                    state["reader"].start()
+                    secret_var.set("")
+
+                self.root.after(0, finish)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def send_command(event=None):
+            channel = state.get("channel")
+            command = command_entry.get()
+            if channel and not channel.closed and command.strip():
+                try:
+                    channel.sendall((command + "\n").encode("utf-8"))
+                    command_entry.delete(0, tk.END)
+                except (OSError, paramiko.SSHException) as error:
+                    append_output(f"\n[Send failed: {error}]\n")
+            return "break"
+
+        def destroyed(event):
+            if event.widget is window.frame:
+                state["closing"] = True
+                disconnect(show_message=False)
+
+        connect_button.configure(command=connect)
+        disconnect_button.configure(command=disconnect)
+        send_button.configure(command=send_command)
+        command_entry.bind("<Return>", send_command)
+        host_entry.bind("<Return>", lambda _event: connect())
+        window.frame.bind("<Destroy>", destroyed, add="+")
+        host_entry.focus_set()
 
     def open_network_hosting(self, folder=None):
         """Open HTTP hosting controls and a network connection monitor."""
@@ -8729,6 +9107,7 @@ Features:
         context_menu.add_command(label="Open Media Player", command=self.open_media_player)
         context_menu.add_command(label="Open Calculator", command=self.open_calculator)
         context_menu.add_command(label="Open Messenger", command=self.open_messenger)
+        context_menu.add_command(label="Open SSH Client", command=self.open_ssh_client)
         context_menu.add_command(label="Open Games Suite", command=self.open_games_suite)
         context_menu.add_command(label="Open Modding Environment", command=self.open_modding_environment)
         context_menu.add_command(label="Manage Virtual Drives", command=self.open_virtual_drive_manager)
@@ -8760,6 +9139,8 @@ DESKTOP_APP_LAUNCHERS = {
     "paint": "open_paint",
     "network": "open_network_hosting",
     "hosting": "open_network_hosting",
+    "ssh": "open_ssh_client",
+    "ssh-client": "open_ssh_client",
     "website-designer": "open_website_designer",
     "web-designer": "open_website_designer",
     "notepad": "open_notepad",

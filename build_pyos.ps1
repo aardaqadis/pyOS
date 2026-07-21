@@ -30,8 +30,10 @@ Set-Location -LiteralPath $ProjectRoot
     --collect-all fido2 `
     --collect-all PIL `
     --collect-all mido `
+    --collect-all paramiko `
     --collect-all pygame `
     --collect-all psutil `
+    --collect-all pythonmonkey `
     --collect-all tkinterweb `
     "pyOSgui.py"
 

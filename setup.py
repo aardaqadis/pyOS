@@ -26,10 +26,17 @@ PYTHON_PACKAGES = (
     "fido2>=2.2,<3.0",
     "Pillow>=12.0",
     "mido>=1.3",
+    "paramiko>=4.0,<5.0",
     "pygame-ce>=2.5",
     "psutil>=6.0",
     "python-vlc>=3.0",
+    "pythonmonkey>=1.3,<2.0",
     "tkinterweb[javascript]>=4.25,<5.0",
+)
+OPTIONAL_PYTHON_PACKAGES = (
+    # No CPython 3.14 Windows wheel is currently published; Setup tries it
+    # without making the otherwise functional installation fail.
+    "miniupnpc>=2.3,<3.0",
 )
 
 OPTIONAL_APPS = (
@@ -138,6 +145,16 @@ class InstallerCore:
             [self.python_executable, "-m", "pip", "install", *PYTHON_PACKAGES],
             "Downloading and installing pyOS Python components",
         )
+        for package in OPTIONAL_PYTHON_PACKAGES:
+            try:
+                self.run_command(
+                    [self.python_executable, "-m", "pip", "install", package],
+                    f"Installing optional Python component: {package}",
+                )
+            except RuntimeError as error:
+                warning = f"Optional component {package} was unavailable: {error}"
+                self.warnings.append(warning)
+                self.log("WARNING: " + warning)
 
     @staticmethod
     def vlc_installed():
@@ -282,7 +299,11 @@ class InstallerCore:
         if not self.dry_run:
             save_config(config)
             (self.install_dir / "install_manifest.json").write_text(
-                json.dumps({**config, "packages": PYTHON_PACKAGES}, indent=2), encoding="utf-8"
+                json.dumps({
+                    **config,
+                    "packages": PYTHON_PACKAGES,
+                    "optional_packages": OPTIONAL_PYTHON_PACKAGES,
+                }, indent=2), encoding="utf-8"
             )
 
     def install(self):

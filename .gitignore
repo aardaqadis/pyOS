@@ -1,9 +1,21 @@
 # Local developer utilities
 dev.py
 
-# Generated Python and PyInstaller output
+# Generated Python cache files
 __pycache__/
 *.py[cod]
-build/
-dist/
 
+# IDE and test state
+.idea/
+.pytest_cache/
+.coverage
+
+# Reproducible build output; keep only the public release executable
+build/
+dist/*
+!dist/pyOS.exe
+
+# Temporary files and logs
+*.log
+*.tmp
+*.bak

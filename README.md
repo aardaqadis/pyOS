@@ -32,15 +32,34 @@ Setup creates an isolated virtual environment and installs the Python packages r
 pyOS can also be packaged as a single Windows executable. The executable contains the Python runtime and the
 GUI dependencies, so a recipient does not need the project virtual environment or build directory.
 
-Build it from the project root with:
+Build a factory-isolated release from the project root with:
 
 ```powershell
-.\build_pyos.ps1
+.\exe_tools\Build-pyOSExe.ps1
 ```
 
-The result is written to `dist\pyOS.exe`. Building does not delete or replace the Python source files; the
-source, generated `pyOS.spec`, build script, intermediate files, and executable are retained separately so the
-build remains reproducible.
+The result is written to `dist\pyOS.exe`. Release builds use their own
+`%LOCALAPPDATA%\pyOS-Release-2.0-Factory` profile, so developer accounts and preferences are not loaded or
+packaged. Building does not delete or replace the Python source files. PyInstaller intermediates are reproducible
+and excluded from Git.
+
+Verify the executable's PE structure, SHA-256 hash, version resources, signature state, and packaged-file privacy:
+
+```powershell
+.\exe_tools\Test-pyOSExe.ps1
+```
+
+To rebuild with a different icon or Windows version metadata:
+
+```powershell
+.\exe_tools\Set-pyOSExeResources.ps1 `
+  -IconPath pyos2.0.png `
+  -Version 2.0.0.0 `
+  -ProductVersion 2.0
+```
+
+`Reset-pyOSFactory.ps1`, `Start-pyOSExe.ps1`, and `Clear-pyOSBuild.ps1` provide confirmed factory reset,
+launch, and cleanup operations. Reset and cleanup support `-WhatIf`; destructive actions request confirmation.
 
 Approximate sizes for the current Windows build are:
 

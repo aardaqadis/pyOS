@@ -8782,11 +8782,13 @@ def main():
     """Main entry point"""
     relaunch_in_configured_environment(__file__)
     root = tk.Tk()
+    root.withdraw()
     username = authenticate(root, cancellable=False, allow_remembered=True)
     app = DesktopGUI(root)
     app.username = username
     app.system_user_var.set(username)
     root.update_idletasks()
+    root.deiconify()
     app.start_notifications()
     if len(sys.argv) >= 3 and sys.argv[1] == "--app":
         launcher = DESKTOP_APP_LAUNCHERS.get(sys.argv[2].casefold())

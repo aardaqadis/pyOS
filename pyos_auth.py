@@ -544,7 +544,8 @@ class _AccountDialog:
         x = parent.winfo_screenwidth() // 2 - self.window.winfo_reqwidth() // 2
         y = parent.winfo_screenheight() // 2 - self.window.winfo_reqheight() // 2
         self.window.geometry(f"+{max(0, x)}+{max(0, y)}")
-        self.window.transient(parent)
+        if parent.state() != "withdrawn":
+            self.window.transient(parent)
         self.window.grab_set()
         self.window.lift()
         first_entry.focus_set()

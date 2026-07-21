@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('pyOSgui.py', '.'), ('pyOScli.py', '.'), ('pyos_config.py', '.'), ('pyos_auth.py', '.'), ('pyos_updater.py', '.'), ('setup.py', '.'), ('README.md', '.'), ('LICENSE.md', '.'), ('pyos1.2.png', '.')]
+datas = [('pyOSgui.py', '.'), ('pyOScli.py', '.'), ('pyos_config.py', '.'), ('pyos_auth.py', '.'), ('pyos_updater.py', '.'), ('setup.py', '.'), ('README.md', '.'), ('LICENSE.md', '.'), ('pyos1.2.png', '.'), ('icons', 'icons')]
 binaries = []
 hiddenimports = ['chess', 'vlc']
 tmp_ret = collect_all('fido2')

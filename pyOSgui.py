@@ -8589,7 +8589,6 @@ DESKTOP_APP_LAUNCHERS = {
     "about": "show_about",
 }
 
-
 def main():
     """Main entry point"""
     relaunch_in_configured_environment(__file__)

@@ -27,6 +27,40 @@ The wizard lets you choose:
 
 Setup creates an isolated virtual environment and installs the Python packages required by pyOS GUI and CLI.
 
+### Standalone Windows Executable and Disk Usage
+
+pyOS can also be packaged as a single Windows executable. The executable contains the Python runtime and the
+GUI dependencies, so a recipient does not need the project virtual environment or build directory.
+
+Build it from the project root with:
+
+```powershell
+.\build_pyos.ps1
+```
+
+The result is written to `dist\pyOS.exe`. Building does not delete or replace the Python source files; the
+source, generated `pyOS.spec`, build script, intermediate files, and executable are retained separately so the
+build remains reproducible.
+
+Approximate sizes for the current Windows build are:
+
+| Item | Size | Needed by an end user? |
+| --- | ---: | --- |
+| `dist\pyOS.exe` | 42.37 MB | Yes, for standalone distribution |
+| Core source and resource files | 714 KB | No, unless developing or rebuilding |
+| `.venv` development environment | 88.07 MB | No |
+| `build` intermediate files | 53.70 MB | No |
+| Complete development project | 188.07 MB | No |
+
+These figures are a snapshot and will change as applications and dependencies are added. For ordinary Windows
+distribution, only `dist\pyOS.exe` is required. Keep the source tree when developing, rebuilding, or installing
+source-based updates.
+
+pyOS checks GitHub for Stable releases or Unstable commits only after the user chooses an update channel, and
+always asks before downloading and installing. Source installations can apply GitHub source archives directly.
+A packaged executable can replace itself only when the corresponding GitHub release publishes a `pyOS.exe`
+asset; otherwise pyOS leaves the executable unchanged and explains that no executable update is available.
+
 ### Unattended Setup
 
 ```powershell

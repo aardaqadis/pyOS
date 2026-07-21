@@ -1,0 +1,9 @@
+# Local developer utilities
+dev.py
+
+# Generated Python and PyInstaller output
+__pycache__/
+*.py[cod]
+build/
+dist/
+

@@ -24,6 +24,7 @@ from pyos_config import (
     get_downloads_dir,
     get_drive_b_dir,
     get_gui_settings_path,
+    get_profile_dir,
     relaunch_in_configured_environment,
 )
 from pyos_auth import authenticate, change_credentials_dialog, has_account
@@ -131,7 +132,7 @@ class PythonOS:
         self.authenticated_username = None
         
         # Virtual Drives
-        self.drive_a = VirtualDrive("A", is_temporary=True)  # Temporary storage
+        self.drive_a = VirtualDrive("A", custom_path=get_profile_dir() / "Drive_A")
         self.drive_b = VirtualDrive("B", is_temporary=False, custom_path=get_drive_b_dir())  # Permanent storage
         self.drives = {
             "C": str(Path.home()),
@@ -1996,5 +1997,9 @@ Built with Python & Tkinter
 if __name__ == "__main__":
     relaunch_in_configured_environment(__file__)
     root = tk.Tk()
+    username = authenticate(root, cancellable=False, allow_remembered=True)
     app = PythonOS(root)
+    app.authenticated = True
+    app.authenticated_username = username
+    app.user_var.set(f"User: {username}")
     root.mainloop()

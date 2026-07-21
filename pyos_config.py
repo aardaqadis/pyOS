@@ -3,7 +3,13 @@
 import json
 import os
 import sys
+import hashlib
+import shutil
 from pathlib import Path
+
+
+_ACTIVE_USERNAME = None
+_ACTIVE_PROFILE_ID = None
 
 
 CONFIG_FILE = Path(
@@ -49,6 +55,65 @@ def get_data_dir(create=True):
     return path
 
 
+def set_active_user(username, profile_id=None):
+    """Select the authenticated profile used by per-user storage helpers."""
+    global _ACTIVE_USERNAME, _ACTIVE_PROFILE_ID
+    _ACTIVE_USERNAME = str(username).strip() if username else None
+    _ACTIVE_PROFILE_ID = str(profile_id).strip() if profile_id else None
+    if _ACTIVE_USERNAME:
+        _migrate_legacy_profile_data()
+
+
+def get_active_user():
+    return _ACTIVE_USERNAME
+
+
+def _migrate_legacy_profile_data():
+    """Copy former single-user app data into the first profile once."""
+    data_root = get_data_dir()
+    profile_id = _ACTIVE_PROFILE_ID or hashlib.sha256(
+        _ACTIVE_USERNAME.casefold().encode("utf-8")
+    ).hexdigest()[:24]
+    profile = data_root / "profiles" / profile_id
+    marker = data_root / ".legacy_profile_migration_complete"
+    if marker.exists():
+        return
+    profile.mkdir(parents=True, exist_ok=True)
+    for name in ("gui_settings.json", "cli_settings.json", "virtual_drives.json",
+                 "email_settings.json", "apps"):
+        source, destination = data_root / name, profile / name
+        try:
+            if source.is_dir() and not destination.exists():
+                shutil.copytree(source, destination)
+            elif source.is_file() and not destination.exists():
+                shutil.copy2(source, destination)
+        except OSError:
+            pass
+    legacy_drive_b = Path(load_config().get("drive_b_dir") or data_root / "Drive_B").expanduser()
+    try:
+        if legacy_drive_b.is_dir() and not (profile / "Drive_B").exists():
+            shutil.copytree(legacy_drive_b, profile / "Drive_B")
+    except OSError:
+        pass
+    try:
+        marker.touch(exist_ok=True)
+    except OSError:
+        pass
+
+
+def get_profile_dir(create=True):
+    """Return a stable, filesystem-safe directory for the active pyOS user."""
+    if not _ACTIVE_USERNAME:
+        return get_data_dir(create=create)
+    profile_id = _ACTIVE_PROFILE_ID or hashlib.sha256(
+        _ACTIVE_USERNAME.casefold().encode("utf-8")
+    ).hexdigest()[:24]
+    path = get_data_dir(create=create) / "profiles" / profile_id
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def get_downloads_dir(create=True):
     path = Path(load_config()["downloads_dir"]).expanduser()
     if create:
@@ -58,7 +123,10 @@ def get_downloads_dir(create=True):
 
 def get_drive_b_dir(create=True):
     config = load_config()
-    path = Path(config.get("drive_b_dir") or Path(config["data_dir"]) / "Drive_B").expanduser()
+    if _ACTIVE_USERNAME:
+        path = get_profile_dir(create=create) / "Drive_B"
+    else:
+        path = Path(config.get("drive_b_dir") or Path(config["data_dir"]) / "Drive_B").expanduser()
     if create:
         path.mkdir(parents=True, exist_ok=True)
     return path
@@ -67,14 +135,14 @@ def get_drive_b_dir(create=True):
 def get_gui_settings_path():
     config = load_config()
     if config.get("configured"):
-        return get_data_dir() / "gui_settings.json"
+        return get_profile_dir() / "gui_settings.json"
     return Path.home() / ".pyos_gui_settings.json"
 
 
 def get_cli_settings_path():
     config = load_config()
     if config.get("configured"):
-        return get_data_dir() / "cli_settings.json"
+        return get_profile_dir() / "cli_settings.json"
     return Path.home() / ".pyOS_settings.json"
 
 

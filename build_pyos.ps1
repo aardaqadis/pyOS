@@ -15,7 +15,7 @@ Set-Location -LiteralPath $ProjectRoot
     --onefile `
     --windowed `
     --name pyOS `
-    --icon "pyos1.2.png" `
+    --icon "pyos2.0.png" `
     --add-data "pyOSgui.py;." `
     --add-data "pyOScli.py;." `
     --add-data "pyos_config.py;." `
@@ -24,7 +24,7 @@ Set-Location -LiteralPath $ProjectRoot
     --add-data "setup.py;." `
     --add-data "README.md;." `
     --add-data "LICENSE.md;." `
-    --add-data "pyos1.2.png;." `
+    --add-data "pyos2.0.png;." `
     --hidden-import chess `
     --hidden-import vlc `
     --collect-all fido2 `

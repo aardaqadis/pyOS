@@ -16,7 +16,7 @@ from pathlib import Path, PurePosixPath
 REPOSITORY = "aardaqadis/pyOS"
 API_ROOT = f"https://api.github.com/repos/{REPOSITORY}"
 USER_AGENT = "pyOS-Updater/1.0"
-MAX_ARCHIVE_BYTES = 100 * 1024 * 1024
+MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024
 EXCLUDED_PARTS = {".git", ".github", ".idea", ".venv", "venv", "__pycache__", "build", "dist"}
 
 
@@ -86,24 +86,35 @@ def git_has_local_changes(project_dir):
         return False
 
 
-def _download(url, destination):
+def _report_progress(callback, phase, completed=None, total=None):
+    if callback:
+        callback(phase, completed, total)
+
+
+def _download(url, destination, progress=None):
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     digest = hashlib.sha256()
     total = 0
     with urllib.request.urlopen(request, timeout=30) as response, destination.open("wb") as output:
+        try:
+            expected = int(response.headers.get("Content-Length", 0)) or None
+        except (TypeError, ValueError):
+            expected = None
+        _report_progress(progress, "Downloading update", 0, expected)
         while True:
             chunk = response.read(1024 * 1024)
             if not chunk:
                 break
             total += len(chunk)
             if total > MAX_ARCHIVE_BYTES:
-                raise ValueError("The update archive exceeds the 100 MB safety limit.")
+                raise ValueError("The update archive exceeds the 1 GB safety limit.")
             digest.update(chunk)
             output.write(chunk)
+            _report_progress(progress, "Downloading update", total, expected)
     return digest.hexdigest()
 
 
-def install_source_update(update, install_dir, data_dir):
+def install_source_update(update, install_dir, data_dir, progress=None):
     """Download, validate, back up, and overlay a GitHub source archive."""
     install_dir, data_dir = Path(install_dir).resolve(), Path(data_dir).resolve()
     if not (install_dir / "pyOSgui.py").is_file():
@@ -111,7 +122,7 @@ def install_source_update(update, install_dir, data_dir):
     work = Path(tempfile.mkdtemp(prefix="pyos-update-"))
     try:
         archive = work / "update.zip"
-        checksum = _download(update["archive_url"], archive)
+        checksum = _download(update["archive_url"], archive, progress)
         extracted = work / "source"
         extracted.mkdir()
         with zipfile.ZipFile(archive) as bundle:
@@ -124,7 +135,9 @@ def install_source_update(update, install_dir, data_dir):
                     raise ValueError("The update archive contains an unsafe path.")
                 if member.file_size > MAX_ARCHIVE_BYTES:
                     raise ValueError("The update archive contains an oversized file.")
-            bundle.extractall(extracted)
+            for index, member in enumerate(members, 1):
+                bundle.extract(member, extracted)
+                _report_progress(progress, "Extracting update", index, len(members))
         roots = [item for item in extracted.iterdir() if item.is_dir()]
         source = roots[0] if len(roots) == 1 else extracted
         if not (source / "pyOSgui.py").is_file() or not (source / "setup.py").is_file():
@@ -132,10 +145,13 @@ def install_source_update(update, install_dir, data_dir):
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         backup = data_dir / "update_backups" / stamp
         copied = []
-        for candidate in source.rglob("*"):
+        candidates = [
+            candidate for candidate in source.rglob("*")
+            if candidate.is_file()
+            and not any(part in EXCLUDED_PARTS for part in candidate.relative_to(source).parts)
+        ]
+        for index, candidate in enumerate(candidates, 1):
             relative = candidate.relative_to(source)
-            if any(part in EXCLUDED_PARTS for part in relative.parts) or not candidate.is_file():
-                continue
             target = install_dir / relative
             if target.exists():
                 saved = backup / relative
@@ -146,6 +162,7 @@ def install_source_update(update, install_dir, data_dir):
             shutil.copy2(candidate, temporary)
             os.replace(temporary, target)
             copied.append(str(relative))
+            _report_progress(progress, "Installing files", index, len(candidates))
         backup.mkdir(parents=True, exist_ok=True)
         (backup / "update.json").write_text(json.dumps({
             "update": update, "sha256": checksum, "files": copied,
@@ -164,14 +181,15 @@ def executable_asset(update):
     return None
 
 
-def stage_executable_update(asset, data_dir):
+def stage_executable_update(asset, data_dir, progress=None):
     """Download and validate a future official pyOS.exe release asset."""
     if not asset or not asset.get("url"):
         raise ValueError("The release does not contain a downloadable executable.")
     updates = Path(data_dir).resolve() / "pending_updates"
     updates.mkdir(parents=True, exist_ok=True)
     staged = updates / "pyOS-update.exe"
-    checksum = _download(asset["url"], staged)
+    checksum = _download(asset["url"], staged, progress)
+    _report_progress(progress, "Validating executable", None, None)
     if staged.stat().st_size < 1024 * 1024 or staged.read_bytes()[:2] != b"MZ":
         staged.unlink(missing_ok=True)
         raise ValueError("The downloaded release asset is not a valid Windows executable.")

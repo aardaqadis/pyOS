@@ -42,6 +42,7 @@ from pyos_config import (
     get_downloads_dir,
     get_drive_b_dir,
     get_gui_settings_path,
+    get_profile_dir,
     load_config,
     relaunch_in_configured_environment,
 )
@@ -51,6 +52,8 @@ from pyos_auth import (
     credentials_path,
     get_username,
     has_passkey,
+    is_admin,
+    manage_accounts_dialog,
     passkey_support_status,
     register_passkey_dialog,
     remove_passkeys_dialog,
@@ -1396,10 +1399,20 @@ class DesktopGUI:
 
     def lock_desktop(self, allow_remembered=False):
         """Block all desktop interaction until valid credentials are supplied."""
+        previous_username = self.username
         self.system_user_var.set("Locked")
         self.username = authenticate(
             self.root, cancellable=False, allow_remembered=allow_remembered,
         )
+        if (previous_username and self.username
+                and previous_username.casefold() != self.username.casefold()):
+            messagebox.showinfo(
+                "Switching User", "pyOS will restart to load the selected user's profile.",
+                parent=self.root,
+            )
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve())])
+            self.root.destroy()
+            return self.username
         self.system_user_var.set(self.username or "Locked")
         return self.username
 
@@ -1744,6 +1757,163 @@ class DesktopGUI:
             except tk.TclError:
                 pass
 
+    def open_task_progress(self, title, initial_status="Preparing..."):
+        """Create an internal pyOS task monitor with progress and resource statistics."""
+        window = self.create_window(title, width=580, height=330)
+        window.close_button.configure(command=window.minimize)
+        surface = self.preferences.get("surface_bg", "#ffffff")
+        foreground = self.preferences.get("text_fg", "#000000")
+        accent = self.preferences.get("chrome_bg", "#000000")
+        frame = tk.Frame(window.content, bg=surface, padx=20, pady=16)
+        frame.pack(fill=tk.BOTH, expand=True)
+        status = tk.StringVar(value=initial_status)
+        detail = tk.StringVar(value="")
+        percentage = tk.StringVar(value="Working...")
+        top = tk.Frame(frame, bg=surface)
+        top.pack(fill=tk.X)
+        tk.Label(top, textvariable=status, bg=surface, fg=foreground,
+                 font=("Courier New", 12, "bold"), anchor=tk.W).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(top, textvariable=percentage, bg=surface, fg=foreground,
+                 font=("Courier New", 12, "bold")).pack(side=tk.RIGHT)
+        style_name = f"Task{len(self.windows)}.Horizontal.TProgressbar"
+        style = ttk.Style(self.root)
+        style.configure(style_name, troughcolor=surface, background=accent,
+                        bordercolor=foreground, lightcolor=accent, darkcolor=accent, thickness=22)
+        progress_bar = ttk.Progressbar(
+            frame, mode="indeterminate", maximum=100, style=style_name
+        )
+        progress_bar.pack(fill=tk.X, pady=(13, 5))
+        tk.Label(frame, textvariable=detail, bg=surface, fg=foreground, anchor=tk.W).pack(fill=tk.X)
+
+        divider = tk.Frame(frame, bg=foreground, height=1)
+        divider.pack(fill=tk.X, pady=13)
+        metrics = tk.Frame(frame, bg=surface)
+        metrics.pack(fill=tk.BOTH, expand=True)
+        metric_vars = {name: tk.StringVar(value="—") for name in (
+            "elapsed", "speed", "eta", "process_memory", "system_memory", "disk"
+        )}
+        metric_names = (
+            ("ELAPSED", "elapsed"), ("SPEED", "speed"), ("REMAINING", "eta"),
+            ("PYOS MEMORY", "process_memory"), ("SYSTEM MEMORY", "system_memory"),
+            ("DISK SPACE", "disk"),
+        )
+        for index, (label, key) in enumerate(metric_names):
+            card = tk.Frame(metrics, bg=surface, bd=1, relief=tk.SOLID)
+            card.grid(row=index // 3, column=index % 3, sticky="nsew", padx=3, pady=3)
+            tk.Label(card, text=label, bg=surface, fg=foreground,
+                     font=("Courier New", 8, "bold")).pack(anchor=tk.W, padx=8, pady=(5, 0))
+            tk.Label(card, textvariable=metric_vars[key], bg=surface, fg=foreground,
+                     font=("Courier New", 9)).pack(anchor=tk.W, padx=8, pady=(0, 5))
+        for column in range(3):
+            metrics.columnconfigure(column, weight=1, uniform="metrics")
+        progress_bar.start(12)
+        state = {
+            "indeterminate": True, "closed": False, "phase": initial_status,
+            "completed": None, "total": None, "started": time.monotonic(),
+            "phase_started": time.monotonic(), "phase_initial": 0,
+        }
+
+        def format_size(value):
+            value = float(value)
+            for unit in ("B", "KB", "MB", "GB", "TB"):
+                if value < 1024 or unit == "TB":
+                    return f"{value:,.1f} {unit}"
+                value /= 1024
+
+        def current_speed():
+            completed = state["completed"]
+            if completed is None:
+                return 0
+            duration = max(0.001, time.monotonic() - state["phase_started"])
+            return max(0, completed - state["phase_initial"]) / duration
+
+        def refresh_metrics():
+            if state["closed"] or not window.frame.winfo_exists():
+                return
+            elapsed = int(time.monotonic() - state["started"])
+            metric_vars["elapsed"].set(f"{elapsed // 60:02d}:{elapsed % 60:02d}")
+            speed = current_speed()
+            downloading = "download" in str(state["phase"]).casefold()
+            metric_vars["speed"].set(
+                f"{format_size(speed)}/s" if downloading and speed else
+                (f"{speed:,.1f} items/s" if speed else "Calculating...")
+            )
+            if speed and state["total"] and state["completed"] is not None:
+                seconds = max(0, int((state["total"] - state["completed"]) / speed))
+                metric_vars["eta"].set(f"{seconds // 60:02d}:{seconds % 60:02d}")
+            else:
+                metric_vars["eta"].set("Calculating...")
+            try:
+                import psutil
+                process = psutil.Process(os.getpid())
+                metric_vars["process_memory"].set(format_size(process.memory_info().rss))
+                memory = psutil.virtual_memory()
+                metric_vars["system_memory"].set(
+                    f"{memory.percent:.0f}% · {format_size(memory.used)} / {format_size(memory.total)}"
+                )
+            except (ImportError, OSError, AttributeError):
+                metric_vars["process_memory"].set("Unavailable")
+                metric_vars["system_memory"].set("Unavailable")
+            try:
+                disk = shutil.disk_usage(get_data_dir())
+                used_percent = disk.used * 100 / disk.total if disk.total else 0
+                metric_vars["disk"].set(
+                    f"{used_percent:.0f}% · {format_size(disk.free)} free"
+                )
+            except OSError:
+                metric_vars["disk"].set("Unavailable")
+            self.root.after(1000, refresh_metrics)
+
+        def update(phase, completed=None, total=None):
+            def apply_update():
+                if state["closed"] or not window.frame.winfo_exists():
+                    return
+                if str(phase) != state["phase"]:
+                    state["phase"] = str(phase)
+                    state["phase_started"] = time.monotonic()
+                    state["phase_initial"] = completed or 0
+                state["completed"], state["total"] = completed, total
+                status.set(str(phase))
+                if total and completed is not None:
+                    if state["indeterminate"]:
+                        progress_bar.stop()
+                        progress_bar.configure(mode="determinate")
+                        state["indeterminate"] = False
+                    progress_bar["value"] = min(100, max(0, completed * 100 / total))
+                    percentage.set(f"{completed * 100 / total:.0f}%")
+                    if "download" in str(phase).casefold():
+                        detail.set(f"{format_size(completed)} of {format_size(total)}")
+                    else:
+                        detail.set(f"{completed:,} of {total:,} items")
+                else:
+                    if not state["indeterminate"]:
+                        progress_bar.configure(mode="indeterminate")
+                        progress_bar.start(12)
+                        state["indeterminate"] = True
+                    detail.set("")
+                    percentage.set("Working...")
+            try:
+                self.root.after(0, apply_update)
+            except tk.TclError:
+                pass
+
+        def close():
+            def apply_close():
+                state["closed"] = True
+                try:
+                    progress_bar.stop()
+                    if window.frame.winfo_exists():
+                        window.close()
+                except tk.TclError:
+                    pass
+            try:
+                self.root.after(0, apply_close)
+            except tk.TclError:
+                pass
+
+        refresh_metrics()
+        return update, close
+
     def dismiss_notification(self, frame):
         for record in list(self.notification_toasts):
             if record["frame"] is frame:
@@ -1940,15 +2110,19 @@ class DesktopGUI:
     def _install_executable_update(self, update, asset):
         """Stage an approved executable and replace this process after it exits."""
         self.show_notification("pyOS Update", f"Downloading {update['name']}...", duration=12000)
+        progress, close_progress = self.open_task_progress(
+            "pyOS Update", f"Preparing {update['name']}..."
+        )
 
         def worker():
             try:
-                staged = stage_executable_update(asset, get_data_dir())
+                staged = stage_executable_update(asset, get_data_dir(), progress=progress)
                 error = None
             except (OSError, ValueError, urllib.error.URLError, urllib.error.HTTPError) as exc:
                 staged, error = None, str(exc)
 
             def finish():
+                close_progress()
                 if error:
                     messagebox.showerror("pyOS Update", f"Executable update failed:\n{error}", parent=self.root)
                     return
@@ -1988,16 +2162,22 @@ class DesktopGUI:
     def _install_confirmed_update(self, update, project_dir):
         """Install an already-approved source update in a worker thread."""
         self.show_notification("pyOS Update", f"Downloading {update['name']}...", duration=12000)
+        progress, close_progress = self.open_task_progress(
+            "pyOS Update", f"Preparing {update['name']}..."
+        )
 
         def worker():
             try:
-                result = install_source_update(update, project_dir, get_data_dir())
+                result = install_source_update(
+                    update, project_dir, get_data_dir(), progress=progress
+                )
                 error = None
             except (OSError, ValueError, zipfile.BadZipFile, urllib.error.URLError,
                     urllib.error.HTTPError) as exc:
                 result, error = None, str(exc)
 
             def finish():
+                close_progress()
                 if error:
                     messagebox.showerror("pyOS Update", f"Update installation failed:\n{error}", parent=self.root)
                     return
@@ -3017,7 +3197,7 @@ class DesktopGUI:
         return window
 
     def get_drive_a_path(self):
-        path = Path(os.getenv("TEMP", Path.home())) / "pyOS_Drive_A"
+        path = get_profile_dir() / "Drive_A"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -6720,12 +6900,16 @@ img { max-width: 100%; height: auto; }
             status_var.set(f"Pulling {model}...")
             show_action(f"Downloading '{model}'. You can keep using the desktop meanwhile.",
                         "Cancel", cancel_event.set, show_retry=False)
+            task_progress, close_task_progress = self.open_task_progress(
+                "pyAI Model Download", f"Preparing {model}..."
+            )
 
             def on_progress(status_text, completed, total):
                 if completed and total:
                     message = f"Pulling {model}: {int(completed * 100 / total)}%"
                 else:
                     message = f"Pulling {model}: {status_text or '...'}"
+                task_progress(status_text or f"Downloading {model}", completed, total)
                 self.root.after(0, lambda text=message: alive() and status_var.set(text))
 
             def worker():
@@ -6736,6 +6920,7 @@ img { max-width: 100%; height: auto; }
                     error = str(exc)
 
                 def done():
+                    close_task_progress()
                     if not alive():
                         return
                     if cancel_event.is_set():
@@ -8286,6 +8471,10 @@ Features:
         tk.Button(security, text="Change Username / Password", command=change_account_settings).pack(
             anchor=tk.W, padx=16, pady=5
         )
+        if is_admin():
+            tk.Button(
+                security, text="Manage Users", command=lambda: manage_accounts_dialog(self.root)
+            ).pack(anchor=tk.W, padx=16, pady=5)
         tk.Button(security, text="Lock Desktop Now", command=self.lock_desktop).pack(
             anchor=tk.W, padx=16, pady=5
         )
@@ -8593,9 +8782,11 @@ def main():
     """Main entry point"""
     relaunch_in_configured_environment(__file__)
     root = tk.Tk()
+    username = authenticate(root, cancellable=False, allow_remembered=True)
     app = DesktopGUI(root)
+    app.username = username
+    app.system_user_var.set(username)
     root.update_idletasks()
-    app.lock_desktop(allow_remembered=True)
     app.start_notifications()
     if len(sys.argv) >= 3 and sys.argv[1] == "--app":
         launcher = DESKTOP_APP_LAUNCHERS.get(sys.argv[2].casefold())

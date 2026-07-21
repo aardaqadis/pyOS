@@ -28,6 +28,51 @@ def credentials_path():
     return Path.home() / ".pyos_credentials.json"
 
 
+def remembered_session_path():
+    return credentials_path().with_name("remembered_session.json")
+
+
+def clear_remembered_session():
+    try:
+        remembered_session_path().unlink()
+    except OSError:
+        pass
+    data = load_credentials()
+    if data and data.pop("remember_token_hash", None):
+        _save_credentials(data)
+
+
+def create_remembered_session():
+    data = load_credentials()
+    if not data:
+        return
+    token = secrets.token_urlsafe(48)
+    data["remember_token_hash"] = hashlib.sha256(token.encode()).hexdigest()
+    _save_credentials(data)
+    path = remembered_session_path()
+    path.write_text(json.dumps({"username": data["username"], "token": token}), encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def remembered_username():
+    data = load_credentials()
+    expected = data.get("remember_token_hash") if data else None
+    if not expected:
+        return None
+    try:
+        session = json.loads(remembered_session_path().read_text(encoding="utf-8"))
+        actual = hashlib.sha256(str(session["token"]).encode()).hexdigest()
+        if (hmac.compare_digest(actual, expected) and
+                hmac.compare_digest(str(session["username"]).casefold(), data["username"].casefold())):
+            return data["username"]
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    return None
+
+
 def validate_account(username, password):
     username = username.strip()
     if not 3 <= len(username) <= 32:
@@ -306,6 +351,7 @@ class _AccountDialog:
         self.password = tk.StringVar()
         self.new_password = tk.StringVar()
         self.confirmation = tk.StringVar()
+        self.remember_me = tk.BooleanVar(value=False)
         row = 1
         if mode == "change":
             ttk.Label(frame, text="Current password:").grid(row=row, column=0, sticky="w", pady=4)
@@ -339,6 +385,12 @@ class _AccountDialog:
             )
             row += 1
 
+        if mode == "login":
+            ttk.Checkbutton(
+                frame, text="Remember me on this computer", variable=self.remember_me,
+            ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(9, 3))
+            row += 1
+
         self.error = tk.StringVar()
         ttk.Label(frame, textvariable=self.error, foreground="#a00000", wraplength=390).grid(
             row=row, column=0, columnspan=2, sticky="w", pady=(8, 2)
@@ -370,6 +422,7 @@ class _AccountDialog:
                 if not verify_credentials(self.username.get(), self.password.get()):
                     raise ValueError("Incorrect username or password.")
                 self.result = get_username()
+                create_remembered_session() if self.remember_me.get() else clear_remembered_session()
             elif self.mode == "create":
                 if self.password.get() != self.confirmation.get():
                     raise ValueError("Passwords do not match.")
@@ -395,6 +448,7 @@ class _AccountDialog:
         self.window.update_idletasks()
         try:
             self.result = authenticate_passkey(self.window)
+            create_remembered_session() if self.remember_me.get() else clear_remembered_session()
         except Exception as error:
             self.result = None
             self.error.set(f"Passkey failed: {error}")
@@ -413,8 +467,12 @@ class _AccountDialog:
         return self.result
 
 
-def authenticate(parent, cancellable=True):
+def authenticate(parent, cancellable=True, allow_remembered=True):
     """Create an account when needed, otherwise request credentials."""
+    if allow_remembered:
+        remembered = remembered_username()
+        if remembered:
+            return remembered
     mode = "login" if has_account() else "create"
     return _AccountDialog(parent, mode, cancellable).run()
 

@@ -13,12 +13,13 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
-from pyos_config import CONFIG_FILE, save_config
+from pyos_config import CONFIG_FILE, load_config, save_config
 
 
 SOURCE_DIR = Path(__file__).resolve().parent
 APPLICATION_FILES = (
-    "pyOSgui.py", "pyOScli.py", "pyos_config.py", "pyos_auth.py", "setup.py", "README.md"
+    "pyOSgui.py", "pyOScli.py", "pyos_config.py", "pyos_auth.py", "pyos_updater.py",
+    "setup.py", "README.md"
 )
 PYTHON_PACKAGES = (
     "chess>=1.11,<2.0",
@@ -29,6 +30,14 @@ PYTHON_PACKAGES = (
     "psutil>=6.0",
     "python-vlc>=3.0",
     "tkinterweb[javascript]>=4.25,<5.0",
+)
+
+OPTIONAL_APPS = (
+    ("pyai", "pyAI assistant"), ("browser", "Internet browser"),
+    ("media", "Media player"), ("messenger", "LAN Messenger"),
+    ("games", "Games suite, Chess, Snake and Sudoku"),
+    ("weather", "Weather"), ("news", "News reader"),
+    ("ide", "Python IDE and App Maker"), ("modding", "Modding tools"),
 )
 
 
@@ -46,13 +55,15 @@ class InstallerCore:
     """Performs installation independently from the wizard UI."""
 
     def __init__(self, install_dir, data_dir, downloads_dir, install_vlc=True,
-                 install_ollama=True, create_shortcuts=True, dry_run=False, logger=print):
+                 install_ollama=True, create_shortcuts=True, enabled_apps=None,
+                 dry_run=False, logger=print):
         self.install_dir = Path(install_dir).expanduser().resolve()
         self.data_dir = Path(data_dir).expanduser().resolve()
         self.downloads_dir = Path(downloads_dir).expanduser().resolve()
         self.install_vlc = install_vlc
         self.install_ollama = install_ollama
         self.create_shortcuts = create_shortcuts
+        self.enabled_apps = list(enabled_apps or (app_id for app_id, _label in OPTIONAL_APPS))
         self.dry_run = dry_run
         self.log = logger
         self.warnings = []
@@ -265,6 +276,7 @@ class InstallerCore:
             "python_executable": str(self.python_executable),
             "installed_at": datetime.now().isoformat(timespec="seconds"),
             "installer_version": 1,
+            "enabled_apps": self.enabled_apps,
         }
         self.log(f"Writing shared configuration: {CONFIG_FILE}")
         if not self.dry_run:
@@ -303,7 +315,11 @@ class SetupWizard:
         self.page = 0
         self.installing = False
         self.install_result = None
+        existing = load_config()
+        self.existing_config = existing if existing.get("configured") else None
         defaults = default_locations()
+        if self.existing_config:
+            defaults.update({key: Path(self.existing_config[key]) for key in defaults})
         self.install_var = tk.StringVar(value=str(defaults["install_dir"]))
         self.data_var = tk.StringVar(value=str(defaults["data_dir"]))
         self.downloads_var = tk.StringVar(value=str(defaults["downloads_dir"]))
@@ -311,6 +327,14 @@ class SetupWizard:
         self.ollama_var = tk.BooleanVar(value=True)
         self.shortcuts_var = tk.BooleanVar(value=True)
         self.launch_var = tk.BooleanVar(value=True)
+        configured_apps = existing.get("enabled_apps") if self.existing_config else None
+        selected_apps = set(configured_apps or ())
+        if configured_apps is None:
+            selected_apps = {app_id for app_id, _label in OPTIONAL_APPS}
+        self.app_vars = {
+            app_id: tk.BooleanVar(value=app_id in selected_apps)
+            for app_id, _label in OPTIONAL_APPS
+        }
 
         style = ttk.Style(root)
         style.theme_use("clam")
@@ -360,8 +384,22 @@ class SetupWizard:
             self.render_complete()
 
     def render_welcome(self):
-        tk.Label(self.content, text="Install Python OS", bg="white", fg="black",
+        heading = "Maintain Python OS" if self.existing_config else "Install Python OS"
+        tk.Label(self.content, text=heading, bg="white", fg="black",
                  font=("Courier New", 16, "bold"), anchor=tk.W).pack(fill=tk.X, pady=(16, 14))
+        if self.existing_config:
+            tk.Label(
+                self.content,
+                text=f"pyOS is installed at:\n{self.existing_config['install_dir']}",
+                bg="white", fg="black", justify=tk.LEFT, anchor=tk.W,
+            ).pack(fill=tk.X, pady=(0, 16))
+            actions = tk.Frame(self.content, bg="white")
+            actions.pack(fill=tk.X, pady=8)
+            ttk.Button(actions, text="Repair / Modify", command=self.start_repair).pack(fill=tk.X, pady=4)
+            ttk.Button(actions, text="Clear Cached Memory", command=self.clear_cached_memory).pack(fill=tk.X, pady=4)
+            ttk.Button(actions, text="Uninstall pyOS", command=self.uninstall_existing).pack(fill=tk.X, pady=4)
+            self.next_button.configure(state=tk.DISABLED)
+            return
         text = (
             "This wizard installs pyOS GUI and CLI, downloads their Python components, "
             "configures shared storage, and creates launchers.\n\n"
@@ -401,6 +439,12 @@ class SetupWizard:
                        bg="white", fg="black", anchor=tk.W).pack(fill=tk.X, pady=5)
         tk.Checkbutton(self.content, text="Create desktop shortcuts", variable=self.shortcuts_var,
                        bg="white", fg="black", anchor=tk.W).pack(fill=tk.X, pady=5)
+        apps = tk.LabelFrame(self.content, text="pyOS APPS", bg="white", fg="black", padx=8, pady=5)
+        apps.pack(fill=tk.X, pady=(10, 0))
+        for index, (app_id, label) in enumerate(OPTIONAL_APPS):
+            tk.Checkbutton(
+                apps, text=label, variable=self.app_vars[app_id], bg="white", fg="black", anchor=tk.W,
+            ).grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 18), pady=2)
 
     def render_installation(self):
         self.back_button.configure(state=tk.DISABLED)
@@ -435,6 +479,7 @@ class SetupWizard:
                 self.install_var.get(), self.data_var.get(), self.downloads_var.get(),
                 install_vlc=self.vlc_var.get(), install_ollama=self.ollama_var.get(),
                 create_shortcuts=self.shortcuts_var.get(),
+                enabled_apps=[app_id for app_id, variable in self.app_vars.items() if variable.get()],
                 logger=self.append_log,
             )
             self.install_result = installer.install()
@@ -462,6 +507,83 @@ class SetupWizard:
                  justify=tk.LEFT, anchor=tk.W).pack(fill=tk.X, pady=8)
         tk.Checkbutton(self.content, text="Launch pyOS GUI when setup closes", variable=self.launch_var,
                        bg="white", fg="black", anchor=tk.W).pack(fill=tk.X, pady=12)
+
+    def start_repair(self):
+        """Reuse the normal installer to verify files, libraries, runtimes and app choices."""
+        self.page = 2
+        self.next_button.configure(state=tk.NORMAL)
+        self.render_page()
+
+    def clear_cached_memory(self):
+        """Remove regenerable Python/browser caches while preserving accounts and user files."""
+        config = self.existing_config or {}
+        roots = [Path(config[key]).expanduser().resolve() for key in ("install_dir", "data_dir") if config.get(key)]
+        home = Path.home().resolve()
+        removed_files = 0
+        removed_dirs = 0
+        try:
+            for root in roots:
+                if not root.is_dir() or root in {Path(root.anchor), home}:
+                    continue
+                for cache in list(root.rglob("__pycache__")) + list(root.rglob("cache")):
+                    if cache.is_dir() and cache.resolve().is_relative_to(root):
+                        removed_files += sum(1 for item in cache.rglob("*") if item.is_file())
+                        shutil.rmtree(cache)
+                        removed_dirs += 1
+                for compiled in root.rglob("*.py[co]"):
+                    if compiled.is_file() and compiled.resolve().is_relative_to(root):
+                        compiled.unlink()
+                        removed_files += 1
+        except OSError as error:
+            messagebox.showerror("pyOS Maintenance", f"Cache cleanup stopped:\n{error}")
+            return
+        messagebox.showinfo(
+            "pyOS Maintenance",
+            f"Cleared {removed_files} cached files from {removed_dirs} cache folders.\n"
+            "Accounts, settings, custom apps, downloads, and Drive B were preserved.",
+        )
+
+    def uninstall_existing(self):
+        """Remove installed program files and configuration while preserving user data."""
+        config = self.existing_config or {}
+        install_dir = Path(config.get("install_dir", "")).expanduser().resolve()
+        home = Path.home().resolve()
+        if (not install_dir.is_dir() or install_dir in {Path(install_dir.anchor), home} or
+                home.is_relative_to(install_dir)):
+            messagebox.showerror("Uninstall pyOS", "The configured installation directory is unsafe to remove.")
+            return
+        if not messagebox.askyesno(
+            "Uninstall pyOS",
+            f"Remove pyOS and its installed libraries from:\n{install_dir}\n\n"
+            "Your account, settings, custom apps, Drive B, and downloads will be preserved?",
+            icon=messagebox.WARNING,
+        ):
+            return
+        desktop = Path(os.environ.get("USERPROFILE", home)) / "Desktop"
+        for shortcut in (desktop / "pyOS GUI.lnk", desktop / "pyOS CLI.lnk"):
+            try:
+                shortcut.unlink()
+            except OSError:
+                pass
+        try:
+            CONFIG_FILE.unlink(missing_ok=True)
+            if SOURCE_DIR.resolve().is_relative_to(install_dir):
+                command = (
+                    f"Start-Sleep -Seconds 2; Remove-Item -LiteralPath '{str(install_dir).replace(chr(39), chr(39)*2)}' "
+                    "-Recurse -Force"
+                )
+                subprocess.Popen(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                self.root.destroy()
+            else:
+                shutil.rmtree(install_dir)
+                self.existing_config = None
+                messagebox.showinfo("Uninstall pyOS", "pyOS was uninstalled. User data was preserved.")
+                self.root.destroy()
+        except OSError as error:
+            messagebox.showerror("Uninstall pyOS", f"Uninstall failed:\n{error}")
 
     def browse_directory(self, variable):
         selected = filedialog.askdirectory(parent=self.root, initialdir=variable.get() or str(Path.home()))

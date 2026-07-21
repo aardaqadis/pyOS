@@ -11,7 +11,7 @@
     <option name="LAST_RESOLUTION" value="IGNORE" />
   </component>
   <component name="EmbeddingIndexingInfo">
-    <option name="cachedIndexableFilesCount" value="17" />
+    <option name="cachedIndexableFilesCount" value="19" />
   </component>
   <component name="FileTemplateManagerImpl">
     <option name="RECENT_TEMPLATES">
@@ -26,23 +26,23 @@
   </component>
   <component name="NextEditCompletionFeaturesState">
     <decayedCancelled>
-      <entry key="MS100" value="1.0583709208598517" />
-      <entry key="MS500" value="3.1850966922578223" />
-      <entry key="S2" value="10.29890898086901" />
-      <entry key="S5" value="22.419350987901836" />
-      <entry key="S10" value="38.178708243240976" />
-      <entry key="S30" value="71.44743888604758" />
-      <entry key="S60" value="89.51057621661897" />
-      <entry key="M2" value="109.29448806112956" />
-      <entry key="M5" value="175.66822867975725" />
-      <entry key="M10" value="298.09534236280166" />
-      <entry key="M15" value="419.9558155539461" />
-      <entry key="M30" value="692.8581548590082" />
-      <entry key="H1" value="997.5892109287412" />
-      <entry key="H2" value="1426.5378496625087" />
-      <entry key="H4" value="2304.0830212746528" />
-      <entry key="D1" value="6258.727177933862" />
-      <entry key="W1" value="8102.039188214849" />
+      <entry key="MS100" value="1.1076736894047137" />
+      <entry key="MS500" value="2.356233281869362" />
+      <entry key="S2" value="9.5296395334437" />
+      <entry key="S5" value="22.566513365218867" />
+      <entry key="S10" value="38.86905993585406" />
+      <entry key="S30" value="83.14169070782577" />
+      <entry key="S60" value="119.69202748391947" />
+      <entry key="M2" value="152.96826883917888" />
+      <entry key="M5" value="202.5343599141137" />
+      <entry key="M10" value="281.03219135076154" />
+      <entry key="M15" value="360.07577546436636" />
+      <entry key="M30" value="567.9039338825911" />
+      <entry key="H1" value="914.1665154447994" />
+      <entry key="H2" value="1598.6932206041565" />
+      <entry key="H4" value="2819.8659455150464" />
+      <entry key="D1" value="7990.874626721974" />
+      <entry key="W1" value="10661.546163267885" />
     </decayedCancelled>
     <decayedSelected>
       <entry key="MS100" value="0.0" />
@@ -52,35 +52,35 @@
       <entry key="S10" value="0.0" />
       <entry key="S30" value="0.0" />
       <entry key="S60" value="0.0" />
-      <entry key="M2" value="2.017524406063551E-184" />
-      <entry key="M5" value="3.3260403903079906E-74" />
-      <entry key="M10" value="1.8237435100112476E-37" />
-      <entry key="M15" value="3.215949148527907E-25" />
-      <entry key="M30" value="5.670933916497243E-13" />
-      <entry key="H1" value="7.530560348671155E-7" />
-      <entry key="H2" value="8.677880126315811E-4" />
-      <entry key="H4" value="0.029458241845559015" />
-      <entry key="D1" value="0.555735069765733" />
-      <entry key="W1" value="0.9195017146127323" />
+      <entry key="M2" value="2.892427171870385E-228" />
+      <entry key="M5" value="9.649503613353004E-92" />
+      <entry key="M10" value="3.1063650161167297E-46" />
+      <entry key="M15" value="4.586713965351969E-31" />
+      <entry key="M30" value="6.772528305848635E-16" />
+      <entry key="H1" value="2.6024081743357406E-8" />
+      <entry key="H2" value="1.6131981199888425E-4" />
+      <entry key="H4" value="0.01270117364651161" />
+      <entry key="D1" value="0.483029856384445" />
+      <entry key="W1" value="0.9012669075961773" />
     </decayedSelected>
     <decayedShown>
-      <entry key="MS100" value="1.0218700885508347" />
-      <entry key="MS500" value="3.1626798839580887" />
-      <entry key="S2" value="10.281367511347945" />
-      <entry key="S5" value="22.40402480448399" />
-      <entry key="S10" value="38.16538453254811" />
-      <entry key="S30" value="71.43889081583008" />
-      <entry key="S60" value="89.50517786258709" />
-      <entry key="M2" value="109.29117339474222" />
-      <entry key="M5" value="175.6660587778814" />
-      <entry key="M10" value="298.0934157224114" />
-      <entry key="M15" value="419.9539458929499" />
-      <entry key="M30" value="692.8565532800906" />
-      <entry key="H1" value="997.5880402172734" />
-      <entry key="H2" value="1426.537872649253" />
-      <entry key="H4" value="2304.1117670411077" />
-      <entry key="D1" value="6259.28252648668" />
-      <entry key="W1" value="8102.95861489555" />
+      <entry key="MS100" value="1.0788373440707233" />
+      <entry key="MS500" value="2.3437268081581757" />
+      <entry key="S2" value="9.513553563766813" />
+      <entry key="S5" value="22.5500295576382" />
+      <entry key="S10" value="38.85455694088531" />
+      <entry key="S30" value="83.13125094638866" />
+      <entry key="S60" value="119.68446966249769" />
+      <entry key="M2" value="152.96340964480885" />
+      <entry key="M5" value="202.53176120669906" />
+      <entry key="M10" value="281.0303459149852" />
+      <entry key="M15" value="360.07411771620076" />
+      <entry key="M30" value="567.9024415786467" />
+      <entry key="H1" value="914.1651991666339" />
+      <entry key="H2" value="1598.6922244615123" />
+      <entry key="H4" value="2819.8776519016665" />
+      <entry key="D1" value="7991.357161364579" />
+      <entry key="W1" value="10662.44733240399" />
     </decayedShown>
   </component>
   <component name="ProjectColorInfo">{
@@ -112,7 +112,7 @@
     &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
     &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
     &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
-    &quot;settings.editor.selected.configurable&quot;: &quot;ml.llm.LLMConfigurable&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;ml.llm.AcpAgentsConfigurable&quot;,
     &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
   }
 }</component>
@@ -147,6 +147,14 @@
       <workItem from="1783262958746" duration="3437000" />
       <workItem from="1783279252714" duration="71000" />
       <workItem from="1784230280807" duration="1100000" />
+      <workItem from="1784361357367" duration="2000" />
+      <workItem from="1784361377326" duration="118000" />
+      <workItem from="1784361508754" duration="3466000" />
+      <workItem from="1784365090807" duration="2063000" />
+      <workItem from="1784395840260" duration="812000" />
+      <workItem from="1784542541549" duration="2189000" />
+      <workItem from="1784548815648" duration="32000" />
+      <workItem from="1784642606592" duration="5246000" />
     </task>
     <servers />
   </component>
@@ -155,8 +163,8 @@
   </component>
   <component name="com.intellij.coverage.CoverageDataManagerImpl">
     <SUITE FILE_PATH="coverage/pyOSgui_py$pyOScli.coverage" NAME="pyOScli Coverage Results" MODIFIED="1783149440259" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
-    <SUITE FILE_PATH="coverage/pyOSgui_py$pyOSgui.coverage" NAME="pyOSgui Coverage Results" MODIFIED="1784231393613" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
-    <SUITE FILE_PATH="coverage/pyOSgui_py$setup.coverage" NAME="setup Coverage Results" MODIFIED="1783112066810" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/pyOSgui_py$pyOSgui.coverage" NAME="pyOSgui Coverage Results" MODIFIED="1784646200952" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
+    <SUITE FILE_PATH="coverage/pyOSgui_py$setup.coverage" NAME="setup Coverage Results" MODIFIED="1784364367768" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
     <SUITE FILE_PATH="coverage/Welcome$pyOSgui.coverage" NAME="pyOSgui Coverage Results" MODIFIED="1783022435895" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
     <SUITE FILE_PATH="coverage/Welcome$pyos_auth.coverage" NAME="pyos_auth Coverage Results" MODIFIED="1783022267468" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />
     <SUITE FILE_PATH="coverage/pyOSgui_py$pyOS_Algar.coverage" NAME="pyOS_Algar Coverage Results" MODIFIED="1783182941265" SOURCE_PROVIDER="com.intellij.coverage.DefaultCoverageFileProvider" RUNNER="coverage.py" COVERAGE_BY_TEST_ENABLED="false" COVERAGE_TRACING_ENABLED="false" WORKING_DIRECTORY="$PROJECT_DIR$" />

@@ -30,6 +30,9 @@ import re
 import webbrowser
 import xml.etree.ElementTree as ET
 import platform
+import tempfile
+import http.server
+import zipfile
 from pathlib import Path
 
 from pyos_config import (
@@ -53,6 +56,10 @@ from pyos_auth import (
     remove_passkeys_dialog,
     verify_credentials,
 )
+from pyos_updater import (
+    current_git_ref, executable_asset, git_has_local_changes,
+    install_source_update, latest_update, stage_executable_update,
+)
 
 AUDIO_EXTENSIONS = {
     ".aac", ".aiff", ".flac", ".m4a", ".mid", ".midi", ".mp3", ".ogg", ".opus", ".wav", ".wma",
@@ -64,6 +71,209 @@ MEDIA_EXTENSIONS = AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
 IMAGE_EXTENSIONS = {
     ".apng", ".bmp", ".gif", ".ico", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp",
 }
+
+THEME_PRESETS = {
+    "Classic": {
+        "description": "The original monochrome pyOS appearance.",
+        "desktop_bg": "#ffffff", "surface_bg": "#ffffff", "text_fg": "#000000",
+        "chrome_bg": "#000000", "chrome_fg": "#ffffff",
+        "font_family": "Courier New", "font_size": 9,
+    },
+    "Modern Light": {
+        "description": "A clean, bright interface with blue accents.",
+        "desktop_bg": "#e8edf5", "surface_bg": "#f8fafc", "text_fg": "#172033",
+        "chrome_bg": "#2563eb", "chrome_fg": "#ffffff",
+        "font_family": "Segoe UI", "font_size": 10,
+    },
+    "Modern Dark": {
+        "description": "A low-glare dark interface with violet accents.",
+        "desktop_bg": "#111827", "surface_bg": "#1f2937", "text_fg": "#f3f4f6",
+        "chrome_bg": "#7c3aed", "chrome_fg": "#ffffff",
+        "font_family": "Segoe UI", "font_size": 10,
+    },
+    "Ocean": {
+        "description": "Deep navy chrome over a calm blue desktop.",
+        "desktop_bg": "#b9e3f5", "surface_bg": "#eefaff", "text_fg": "#073b4c",
+        "chrome_bg": "#0369a1", "chrome_fg": "#ffffff",
+        "font_family": "Segoe UI", "font_size": 10,
+    },
+    "High Contrast": {
+        "description": "Strong black, white, and yellow for maximum clarity.",
+        "desktop_bg": "#000000", "surface_bg": "#000000", "text_fg": "#ffffff",
+        "chrome_bg": "#ffff00", "chrome_fg": "#000000",
+        "font_family": "Arial", "font_size": 11,
+    },
+}
+
+GM_INSTRUMENTS = tuple(name.strip() for name in """
+Acoustic Grand Piano|Bright Acoustic Piano|Electric Grand Piano|Honky-tonk Piano|Electric Piano 1|Electric Piano 2|Harpsichord|Clavinet|
+Celesta|Glockenspiel|Music Box|Vibraphone|Marimba|Xylophone|Tubular Bells|Dulcimer|
+Drawbar Organ|Percussive Organ|Rock Organ|Church Organ|Reed Organ|Accordion|Harmonica|Tango Accordion|
+Acoustic Guitar (nylon)|Acoustic Guitar (steel)|Electric Guitar (jazz)|Electric Guitar (clean)|Electric Guitar (muted)|Overdriven Guitar|Distortion Guitar|Guitar Harmonics|
+Acoustic Bass|Electric Bass (finger)|Electric Bass (pick)|Fretless Bass|Slap Bass 1|Slap Bass 2|Synth Bass 1|Synth Bass 2|
+Violin|Viola|Cello|Contrabass|Tremolo Strings|Pizzicato Strings|Orchestral Harp|Timpani|
+String Ensemble 1|String Ensemble 2|Synth Strings 1|Synth Strings 2|Choir Aahs|Voice Oohs|Synth Voice|Orchestra Hit|
+Trumpet|Trombone|Tuba|Muted Trumpet|French Horn|Brass Section|Synth Brass 1|Synth Brass 2|
+Soprano Sax|Alto Sax|Tenor Sax|Baritone Sax|Oboe|English Horn|Bassoon|Clarinet|
+Piccolo|Flute|Recorder|Pan Flute|Blown Bottle|Shakuhachi|Whistle|Ocarina|
+Lead 1 (square)|Lead 2 (sawtooth)|Lead 3 (calliope)|Lead 4 (chiff)|Lead 5 (charang)|Lead 6 (voice)|Lead 7 (fifths)|Lead 8 (bass + lead)|
+Pad 1 (new age)|Pad 2 (warm)|Pad 3 (polysynth)|Pad 4 (choir)|Pad 5 (bowed)|Pad 6 (metallic)|Pad 7 (halo)|Pad 8 (sweep)|
+FX 1 (rain)|FX 2 (soundtrack)|FX 3 (crystal)|FX 4 (atmosphere)|FX 5 (brightness)|FX 6 (goblins)|FX 7 (echoes)|FX 8 (sci-fi)|
+Sitar|Banjo|Shamisen|Koto|Kalimba|Bag Pipe|Fiddle|Shanai|
+Tinkle Bell|Agogo|Steel Drums|Woodblock|Taiko Drum|Melodic Tom|Synth Drum|Reverse Cymbal|
+Guitar Fret Noise|Breath Noise|Seashore|Bird Tweet|Telephone Ring|Helicopter|Applause|Gunshot
+""".replace("\n", "").split("|"))
+
+
+def read_midi_channel_configuration(path):
+    """Return channel configuration and note statistics from a Standard MIDI file."""
+    data = Path(path).read_bytes()
+    if len(data) < 14 or data[:4] != b"MThd":
+        raise ValueError("Not a Standard MIDI file")
+    header_size = int.from_bytes(data[4:8], "big")
+    track_count = int.from_bytes(data[10:12], "big")
+    channels = {}
+    offset = 8 + header_size
+
+    def variable_length(track, index):
+        value = 0
+        for _ in range(4):
+            byte = track[index]
+            index += 1
+            value = (value << 7) | (byte & 0x7f)
+            if not byte & 0x80:
+                return value, index
+        return value, index
+
+    for _ in range(track_count):
+        if data[offset:offset + 4] != b"MTrk":
+            break
+        length = int.from_bytes(data[offset + 4:offset + 8], "big")
+        track = data[offset + 8:offset + 8 + length]
+        offset += 8 + length
+        index, running_status = 0, None
+        while index < len(track):
+            _, index = variable_length(track, index)
+            if index >= len(track):
+                break
+            first = track[index]
+            if first & 0x80:
+                status = first
+                index += 1
+                if status < 0xf0:
+                    running_status = status
+            elif running_status is not None:
+                status = running_status
+            else:
+                raise ValueError("Invalid MIDI running status")
+            if status == 0xff:
+                index += 1
+                size, index = variable_length(track, index)
+                index += size
+                continue
+            if status in (0xf0, 0xf7):
+                size, index = variable_length(track, index)
+                index += size
+                continue
+            event_type, channel = status & 0xf0, status & 0x0f
+            size = 1 if event_type in (0xc0, 0xd0) else 2
+            event_data = track[index:index + size]
+            index += size
+            if len(event_data) != size:
+                break
+            info = channels.setdefault(channel, {
+                "program": 0, "bank_msb": 0, "bank_lsb": 0, "volume": 100,
+                "pan": 64, "expression": 127, "velocities": [], "notes": 0,
+            })
+            if event_type == 0xc0:
+                info["program"] = event_data[0]
+            elif event_type == 0xb0:
+                controller, value = event_data
+                key = {0: "bank_msb", 32: "bank_lsb", 7: "volume", 10: "pan", 11: "expression"}.get(controller)
+                if key:
+                    info[key] = value
+            elif event_type == 0x90 and event_data[1] > 0:
+                info["notes"] += 1
+                info["velocities"].append(event_data[1])
+    return channels
+
+
+def rewrite_midi_channels(path, overrides):
+    """Return MIDI bytes with channel program, controller, and velocity overrides."""
+    source = Path(path).read_bytes()
+    header_size = int.from_bytes(source[4:8], "big")
+    output = bytearray(source[:8 + header_size])
+    offset = 8 + header_size
+
+    def variable_length(track, index):
+        value = 0
+        for _ in range(4):
+            byte = track[index]
+            index += 1
+            value = (value << 7) | (byte & 0x7f)
+            if not byte & 0x80:
+                break
+        return value, index
+
+    while offset + 8 <= len(source):
+        chunk_type = source[offset:offset + 4]
+        length = int.from_bytes(source[offset + 4:offset + 8], "big")
+        chunk = bytearray(source[offset + 8:offset + 8 + length])
+        offset += 8 + length
+        if chunk_type != b"MTrk":
+            output.extend(chunk_type + len(chunk).to_bytes(4, "big") + chunk)
+            continue
+        index, running_status, used_channels = 0, None, set()
+        while index < len(chunk):
+            _, index = variable_length(chunk, index)
+            if index >= len(chunk):
+                break
+            first = chunk[index]
+            if first & 0x80:
+                status = first
+                index += 1
+                if status < 0xf0:
+                    running_status = status
+            elif running_status is not None:
+                status = running_status
+            else:
+                break
+            if status == 0xff:
+                index += 1
+                size, index = variable_length(chunk, index)
+                index += size
+                continue
+            if status in (0xf0, 0xf7):
+                size, index = variable_length(chunk, index)
+                index += size
+                continue
+            event_type, channel = status & 0xf0, status & 0x0f
+            size = 1 if event_type in (0xc0, 0xd0) else 2
+            data_index = index
+            index += size
+            if index > len(chunk):
+                break
+            used_channels.add(channel)
+            values = overrides.get(channel)
+            if not values:
+                continue
+            if event_type == 0xc0:
+                chunk[data_index] = values["program"]
+            elif event_type == 0x90 and chunk[data_index + 1] > 0:
+                chunk[data_index + 1] = values["velocity"]
+            elif event_type == 0xb0:
+                replacement = {7: "volume", 10: "pan", 11: "expression"}.get(chunk[data_index])
+                if replacement:
+                    chunk[data_index + 1] = values[replacement]
+        prefix = bytearray()
+        for channel in sorted(used_channels & overrides.keys()):
+            values = overrides[channel]
+            prefix.extend((0, 0xc0 | channel, values["program"]))
+            for controller, key in ((7, "volume"), (10, "pan"), (11, "expression")):
+                prefix.extend((0, 0xb0 | channel, controller, values[key]))
+        chunk = prefix + chunk
+        output.extend(b"MTrk" + len(chunk).to_bytes(4, "big") + chunk)
+    return bytes(output)
 
 WEATHER_DESCRIPTIONS = {
     0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
@@ -581,12 +791,6 @@ class DesktopIcon:
             block(1, 5, 2, 3); block(9, 5, 2, 3)
             block(4, 4, 1, 3); block(3, 5, 3, 1)
             block(8, 4); block(9, 5)
-        elif kind == "dispenser":
-            block(3, 0, 6, 2)
-            outline_box(1, 2, 10, 4)
-            block(8, 3); block(3, 4, 4, 1)
-            block(3, 6, 6, 3)
-            block(4, 7, 4, 1, fill=background)
         else:
             outline_box(2, 0, 8, 9)
             block(7, 0, 1, 3); block(8, 2, 2, 1)
@@ -1101,6 +1305,9 @@ class DesktopGUI:
         self.tip_after = None
         self.tip_index = 0
         self._notifications_started = False
+        self._accessibility_focus_bound = False
+        self._update_check_running = False
+        self._update_after = None
         self.settings_path = get_gui_settings_path()
         self.virtual_drives_path = self.settings_path.with_name("virtual_drives.json")
         self.preferences = self.load_preferences()
@@ -1127,11 +1334,17 @@ class DesktopGUI:
         self.root.option_add("*Menu.foreground", "black")
         self.root.option_add("*Menu.activeBackground", "black")
         self.root.option_add("*Menu.activeForeground", "white")
+        self.root.option_add("*Menu.borderWidth", 1)
+        self.root.option_add("*Menu.activeBorderWidth", 0)
+        self.root.option_add("*Menu.relief", "solid")
+        self.root.option_add("*Menu.selectColor", "black")
 
         style = ttk.Style(self.root)
         style.theme_use("clam")
         style.configure("TScale", background="white", troughcolor="white", bordercolor="black")
         style.configure("TScrollbar", background="white", troughcolor="white", bordercolor="black")
+        style.configure("TCombobox", padding=(8, 5), arrowsize=16, fieldbackground="white",
+                        background="white", foreground="black", bordercolor="black")
 
         self.create_system_bar()
         
@@ -1177,13 +1390,16 @@ class DesktopGUI:
         self.background_label.bind("<Button-1>", self.show_desktop_menu)
 
         self.apply_preferences()
+        self.root.after(3500, self.start_update_checks)
         self.root.bind("<Destroy>", self._shutdown_messenger, add="+")
         self.root.after(200, self._poll_messenger_events)
 
-    def lock_desktop(self):
+    def lock_desktop(self, allow_remembered=False):
         """Block all desktop interaction until valid credentials are supplied."""
         self.system_user_var.set("Locked")
-        self.username = authenticate(self.root, cancellable=False)
+        self.username = authenticate(
+            self.root, cancellable=False, allow_remembered=allow_remembered,
+        )
         self.system_user_var.set(self.username or "Locked")
         return self.username
 
@@ -1229,6 +1445,9 @@ class DesktopGUI:
         applications_menu.add_command(label="Internet Browser", command=self.open_browser)
         applications_menu.add_command(label="Messenger", command=self.open_messenger)
         applications_menu.add_command(label="Calculator", command=self.open_calculator)
+        applications_menu.add_command(label="Paint", command=self.open_paint)
+        applications_menu.add_command(label="Network & Hosting", command=self.open_network_hosting)
+        applications_menu.add_command(label="Website Designer", command=self.open_website_designer)
         applications_menu.add_command(label="Games Suite", command=self.open_games_suite)
         applications_menu.add_separator()
         applications_menu.add_command(label="Settings", command=self.open_settings)
@@ -1506,9 +1725,24 @@ class DesktopGUI:
                  anchor=tk.NW, wraplength=310).pack(fill=tk.BOTH, expand=True, padx=8, pady=7)
         record = {"frame": frame, "kind": kind, "after": None}
         self.notification_toasts.append(record)
-        record["after"] = self.root.after(duration, lambda: self.dismiss_notification(frame))
+        if not self.preferences.get("accessibility_persistent_notifications", False):
+            record["after"] = self.root.after(duration, lambda: self.dismiss_notification(frame))
         self._position_notifications()
         frame.lift()
+        if self.preferences.get("accessibility_audible_alerts", False):
+            try:
+                self.root.bell()
+            except tk.TclError:
+                pass
+        if (self.preferences.get("accessibility_visual_alerts", False)
+                and not self.preferences.get("accessibility_reduced_motion", False)):
+            original = self.preferences.get("chrome_bg", "#000000")
+            try:
+                self.system_bar.configure(bg=self.preferences.get("chrome_fg", "#ffffff"))
+                self.root.after(250, lambda: self.system_bar.winfo_exists()
+                                and self.system_bar.configure(bg=original))
+            except tk.TclError:
+                pass
 
     def dismiss_notification(self, frame):
         for record in list(self.notification_toasts):
@@ -1582,6 +1816,207 @@ class DesktopGUI:
         if self._notifications_started:
             self._schedule_next_tip(initial=True)
 
+    def start_update_checks(self):
+        """Ask for an update channel when needed, then start periodic checks."""
+        if not self.root.winfo_exists():
+            return
+        channel = self.preferences.get("update_channel", "ask")
+        if channel == "ask":
+            choice = messagebox.askyesnocancel(
+                "Choose pyOS Update Channel",
+                "Which pyOS versions should be offered?\n\n"
+                "Yes — STABLE releases: tested versions intended for everyday use.\n\n"
+                "No — UNSTABLE commits: newest changes from the main branch; these may contain bugs.\n\n"
+                "Cancel — turn automatic update checks off.\n\n"
+                "pyOS will always ask again before downloading and installing an update.",
+                parent=self.root,
+            )
+            channel = "stable" if choice is True else "unstable" if choice is False else "off"
+            self.preferences["update_channel"] = channel
+            self.preferences["automatic_updates"] = channel != "off"
+            self.save_preferences()
+        if self.preferences.get("automatic_updates", True) and channel in {"stable", "unstable"}:
+            self.check_for_updates()
+
+    def check_for_updates(self, manual=False):
+        """Check the selected GitHub channel without blocking the desktop."""
+        channel = self.preferences.get("update_channel", "stable")
+        if channel not in {"stable", "unstable"}:
+            if manual:
+                messagebox.showinfo("pyOS Updates", "Choose Stable or Unstable in Settings first.", parent=self.root)
+            return
+        if self._update_check_running:
+            if manual:
+                messagebox.showinfo("pyOS Updates", "An update check is already running.", parent=self.root)
+            return
+        self._update_check_running = True
+
+        def worker():
+            try:
+                update = latest_update(channel)
+                error = None
+            except (OSError, ValueError, KeyError, TypeError, urllib.error.URLError,
+                    urllib.error.HTTPError, json.JSONDecodeError) as exc:
+                update, error = None, str(exc)
+
+            def finish():
+                self._update_check_running = False
+                if not self.root.winfo_exists():
+                    return
+                if error:
+                    if manual:
+                        messagebox.showerror("pyOS Updates", f"Could not check GitHub:\n{error}", parent=self.root)
+                else:
+                    self._handle_available_update(update, manual)
+                if self.preferences.get("automatic_updates", True):
+                    if self._update_after is not None:
+                        try:
+                            self.root.after_cancel(self._update_after)
+                        except tk.TclError:
+                            pass
+                    self._update_after = self.root.after(15 * 60 * 1000, self.check_for_updates)
+
+            self.root.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _handle_available_update(self, update, manual=False):
+        """Compare update metadata and request consent before any download."""
+        reference = update["ref"]
+        project_dir = Path(load_config().get("install_dir") or Path(__file__).resolve().parent)
+        if update["channel"] == "unstable" and current_git_ref(project_dir) == reference:
+            self.preferences["update_installed_ref"] = reference
+            self.save_preferences()
+            if manual:
+                messagebox.showinfo("pyOS Updates", "You already have the latest unstable commit.", parent=self.root)
+            return
+        if reference in {
+            self.preferences.get("update_installed_ref", ""),
+            self.preferences.get("update_skipped_ref", ""),
+        }:
+            if manual:
+                messagebox.showinfo("pyOS Updates", f"No new {update['channel']} update is available.", parent=self.root)
+            return
+        warning = (
+            "\n\nUNSTABLE BUILDS MAY CONTAIN BUGS OR BREAK FEATURES."
+            if update["channel"] == "unstable" else ""
+        )
+        notes = update["notes"].strip().splitlines()[0][:400]
+        accepted = messagebox.askyesno(
+            "pyOS Update Available",
+            f"Channel: {update['channel'].title()}\n"
+            f"Version: {update['name']}\n"
+            f"Published: {update['date'] or 'Unknown'}\n"
+            f"Summary: {notes}{warning}\n\n"
+            "Download, back up the current files, and install this update now?",
+            icon=messagebox.WARNING if update["channel"] == "unstable" else messagebox.INFO,
+            parent=self.root,
+        )
+        if not accepted:
+            self.preferences["update_skipped_ref"] = reference
+            self.save_preferences()
+            return
+        if getattr(sys, "frozen", False):
+            asset = executable_asset(update)
+            if not asset:
+                messagebox.showerror(
+                    "pyOS Update",
+                    "This GitHub version does not publish a pyOS.exe asset, so the running executable "
+                    "cannot be replaced safely. Install from the preserved source files or wait for a release "
+                    "that includes pyOS.exe.", parent=self.root,
+                )
+                return
+            self._install_executable_update(update, asset)
+            return
+        if git_has_local_changes(project_dir) and not messagebox.askyesno(
+            "Back Up Local Changes",
+            "This installation contains local source changes. The updater will back up every overwritten "
+            "file, but the update may replace those changes. Continue?",
+            icon=messagebox.WARNING, parent=self.root,
+        ):
+            return
+        self._install_confirmed_update(update, project_dir)
+
+    def _install_executable_update(self, update, asset):
+        """Stage an approved executable and replace this process after it exits."""
+        self.show_notification("pyOS Update", f"Downloading {update['name']}...", duration=12000)
+
+        def worker():
+            try:
+                staged = stage_executable_update(asset, get_data_dir())
+                error = None
+            except (OSError, ValueError, urllib.error.URLError, urllib.error.HTTPError) as exc:
+                staged, error = None, str(exc)
+
+            def finish():
+                if error:
+                    messagebox.showerror("pyOS Update", f"Executable update failed:\n{error}", parent=self.root)
+                    return
+                current = Path(sys.executable).resolve()
+                backup = get_data_dir() / "update_backups" / "executables" / "pyOS-previous.exe"
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                helper = get_data_dir() / "pending_updates" / "install-pyos-update.ps1"
+                helper.write_text(
+                    "param([int]$OldPid,[string]$Staged,[string]$Current,[string]$Backup)\n"
+                    "$ErrorActionPreference='Stop'\n"
+                    "Wait-Process -Id $OldPid -ErrorAction SilentlyContinue\n"
+                    "Copy-Item -LiteralPath $Current -Destination $Backup -Force\n"
+                    "Move-Item -LiteralPath $Staged -Destination $Current -Force\n"
+                    "Start-Process -FilePath $Current\n"
+                    "Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force\n",
+                    encoding="utf-8",
+                )
+                self.preferences["update_installed_ref"] = update["ref"]
+                self.preferences["update_skipped_ref"] = ""
+                self.save_preferences()
+                try:
+                    subprocess.Popen(
+                        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(helper),
+                         "-OldPid", str(os.getpid()), "-Staged", staged["path"],
+                         "-Current", str(current), "-Backup", str(backup)],
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                except OSError as exc:
+                    messagebox.showerror("pyOS Update", f"Could not start update helper:\n{exc}", parent=self.root)
+                    return
+                self.root.destroy()
+
+            self.root.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _install_confirmed_update(self, update, project_dir):
+        """Install an already-approved source update in a worker thread."""
+        self.show_notification("pyOS Update", f"Downloading {update['name']}...", duration=12000)
+
+        def worker():
+            try:
+                result = install_source_update(update, project_dir, get_data_dir())
+                error = None
+            except (OSError, ValueError, zipfile.BadZipFile, urllib.error.URLError,
+                    urllib.error.HTTPError) as exc:
+                result, error = None, str(exc)
+
+            def finish():
+                if error:
+                    messagebox.showerror("pyOS Update", f"Update installation failed:\n{error}", parent=self.root)
+                    return
+                self.preferences["update_installed_ref"] = update["ref"]
+                self.preferences["update_skipped_ref"] = ""
+                self.save_preferences()
+                restart = messagebox.askyesno(
+                    "pyOS Updated",
+                    f"Installed {result['files']} files.\nBackup: {result['backup']}\n\n"
+                    "Restart and run Setup now to apply dependency changes?",
+                    parent=self.root,
+                )
+                if restart:
+                    self.restart_and_setup()
+
+            self.root.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def resize_icon_layer(self, event):
         """Keep the draggable launcher area fitted to the desktop canvas."""
         width = max(1, event.width - 10)
@@ -1597,6 +2032,7 @@ class DesktopGUI:
     def load_preferences(self):
         """Load persisted desktop preferences, falling back to safe defaults."""
         defaults = {
+            "theme_name": "Classic",
             "desktop_inverted": False,
             "desktop_bg": "#ffffff",
             "background_mode": "solid",
@@ -1615,6 +2051,18 @@ class DesktopGUI:
             "icon_positions": {},
             "notifications_enabled": True,
             "tips_enabled": True,
+            "accessibility_large_text": False,
+            "accessibility_dyslexia_font": False,
+            "accessibility_large_controls": False,
+            "accessibility_enhanced_focus": False,
+            "accessibility_reduced_motion": False,
+            "accessibility_visual_alerts": False,
+            "accessibility_audible_alerts": False,
+            "accessibility_persistent_notifications": False,
+            "automatic_updates": True,
+            "update_channel": "ask",
+            "update_installed_ref": "",
+            "update_skipped_ref": "",
             "ai_chat_model": "llama3.2",
             "ai_chat_url": "http://localhost:11434",
         }
@@ -1630,6 +2078,8 @@ class DesktopGUI:
             defaults["font_size"] = 9
         if not isinstance(defaults.get("font_family"), str) or not defaults["font_family"].strip():
             defaults["font_family"] = "Courier New"
+        if defaults.get("theme_name") not in {*THEME_PRESETS, "Custom"}:
+            defaults["theme_name"] = "Custom"
         color_defaults = {
             "desktop_bg": "#ffffff",
             "surface_bg": "#ffffff",
@@ -1672,6 +2122,19 @@ class DesktopGUI:
         defaults["icon_positions"] = valid_positions
         defaults["notifications_enabled"] = bool(defaults["notifications_enabled"])
         defaults["tips_enabled"] = bool(defaults["tips_enabled"])
+        for key in (
+            "accessibility_large_text", "accessibility_dyslexia_font",
+            "accessibility_large_controls", "accessibility_enhanced_focus",
+            "accessibility_reduced_motion", "accessibility_visual_alerts",
+            "accessibility_audible_alerts", "accessibility_persistent_notifications",
+        ):
+            defaults[key] = bool(defaults[key])
+        defaults["automatic_updates"] = bool(defaults.get("automatic_updates", True))
+        if defaults.get("update_channel") not in {"ask", "stable", "unstable", "off"}:
+            defaults["update_channel"] = "ask"
+        for key in ("update_installed_ref", "update_skipped_ref"):
+            if not isinstance(defaults.get(key), str):
+                defaults[key] = ""
         if not isinstance(defaults.get("ai_chat_model"), str) or not defaults["ai_chat_model"].strip():
             defaults["ai_chat_model"] = "llama3.2"
         if not isinstance(defaults.get("ai_chat_url"), str) or not defaults["ai_chat_url"].startswith("http"):
@@ -1731,6 +2194,9 @@ class DesktopGUI:
                 button._system_menu.configure(
                     bg=surface_bg, fg=text_fg,
                     activebackground=chrome_bg, activeforeground=chrome_fg,
+                    selectcolor=chrome_bg,
+                    font=(self.preferences["font_family"], self.preferences["font_size"]),
+                    bd=1, activeborderwidth=0, relief=tk.SOLID,
                 )
             except tk.TclError:
                 pass
@@ -1784,18 +2250,68 @@ class DesktopGUI:
         self.root.option_add("*Menu.foreground", text_fg)
         self.root.option_add("*Menu.activeBackground", chrome_bg)
         self.root.option_add("*Menu.activeForeground", chrome_fg)
+        self.root.option_add("*Menu.disabledForeground", text_fg)
+        self.root.option_add("*Menu.selectColor", chrome_bg)
+        self.root.option_add("*Menu.font", (self.preferences["font_family"], self.preferences["font_size"]))
+        self.root.option_add("*Menu.borderWidth", 1)
+        self.root.option_add("*Menu.activeBorderWidth", 0)
+        self.root.option_add("*Menu.relief", "solid")
+        self.root.option_add("*TCombobox*Listbox.background", surface_bg)
+        self.root.option_add("*TCombobox*Listbox.foreground", text_fg)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", chrome_bg)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", chrome_fg)
 
         style = ttk.Style(self.root)
         style.configure(".", background=surface_bg, foreground=text_fg)
         style.configure("TScale", background=surface_bg, troughcolor=surface_bg, bordercolor=chrome_bg)
         style.configure("TScrollbar", background=surface_bg, troughcolor=surface_bg, bordercolor=chrome_bg)
+        style.configure(
+            "TCombobox", padding=(8, 5), arrowsize=16, foreground=text_fg,
+            fieldbackground=surface_bg, background=surface_bg, bordercolor=chrome_bg,
+        )
+        style.map(
+            "TCombobox", fieldbackground=[("readonly", surface_bg)],
+            foreground=[("readonly", text_fg)],
+            arrowcolor=[("active", chrome_fg), ("!disabled", text_fg)],
+            background=[("active", chrome_bg), ("pressed", chrome_bg)],
+        )
 
         family = self.preferences["font_family"]
         font = (family, self.preferences["font_size"])
         self.root.option_add("*Font", font)
         style.configure(".", font=font)
 
+        large_controls = self.preferences.get("accessibility_large_controls", False)
+        self.root.option_add("*Button.padX", 10 if large_controls else 3)
+        self.root.option_add("*Button.padY", 6 if large_controls else 1)
+        style.configure("TButton", padding=(12, 7) if large_controls else (5, 3))
+
         self._apply_widget_fonts(self.root)
+        self.apply_accessibility_preferences()
+
+    def apply_accessibility_preferences(self):
+        """Apply keyboard focus and target-size accessibility preferences."""
+        if not self._accessibility_focus_bound:
+            self.root.bind_all("<FocusIn>", self._show_accessible_focus, add="+")
+            self._accessibility_focus_bound = True
+        self.root.option_add("*takeFocus", True)
+
+    def _show_accessible_focus(self, event):
+        """Draw a strong, theme-aware outline around the keyboard focus target."""
+        if not self.preferences.get("accessibility_enhanced_focus", False):
+            return
+        widget = event.widget
+        try:
+            if widget.winfo_class() in {
+                "Button", "Entry", "Listbox", "Text", "Spinbox", "Checkbutton", "Radiobutton"
+            }:
+                widget.configure(
+                    highlightthickness=3,
+                    highlightbackground=self.preferences["chrome_bg"],
+                    highlightcolor=self.preferences["chrome_bg"],
+                )
+        except tk.TclError:
+            pass
 
     def apply_desktop_background(self):
         """Render the selected solid color or cover-scaled image background."""
@@ -2049,6 +2565,30 @@ class DesktopGUI:
             self.open_news,
             780, 84
         )
+
+        self.paint_icon = DesktopIcon(
+            self.icon_container,
+            "Paint",
+            "image_viewer",
+            self.open_paint,
+            1110, 84
+        )
+
+        self.network_icon = DesktopIcon(
+            self.icon_container,
+            "Network & Hosting",
+            "browser",
+            self.open_network_hosting,
+            890, 84
+        )
+
+        self.website_designer_icon = DesktopIcon(
+            self.icon_container,
+            "Website Designer",
+            "text_editor",
+            self.open_website_designer,
+            10, 158
+        )
         built_in_icons = (
             ("terminal", self.terminal_icon),
             ("files", self.file_manager_icon),
@@ -2069,17 +2609,12 @@ class DesktopGUI:
             ("virtual-drives", self.virtual_drives_icon),
             ("weather", self.weather_icon),
             ("news", self.news_icon),
+            ("paint", self.paint_icon),
+            ("network", self.network_icon),
+            ("website-designer", self.website_designer_icon),
         )
         for key, icon in built_in_icons:
             self._register_desktop_icon(icon, "builtin:" + key)
-
-        self.dispenser_icon = DesktopIcon(
-            self.icon_container,
-            "Dispenser",
-            "dispenser",
-            self.open_dispenser,
-            890, 84
-        )
 
         self.ai_chat_icon = DesktopIcon(
             self.icon_container,
@@ -2088,6 +2623,21 @@ class DesktopGUI:
             self.open_ai_chat,
             1000, 84
         )
+        self._register_desktop_icon(self.ai_chat_icon, "builtin:pyai")
+        enabled_apps = load_config().get("enabled_apps")
+        if isinstance(enabled_apps, list):
+            optional_icons = {
+                "pyai": (self.ai_chat_icon,), "browser": (self.browser_icon,),
+                "media": (self.media_player_icon,), "messenger": (self.messenger_icon,),
+                "games": (self.games_icon,), "weather": (self.weather_icon,),
+                "news": (self.news_icon,), "ide": (self.python_ide_icon,),
+                "modding": (self.modding_icon,),
+            }
+            enabled = set(enabled_apps)
+            for app_id, icons in optional_icons.items():
+                if app_id not in enabled:
+                    for icon in icons:
+                        icon.frame.place_forget()
         self.refresh_custom_app_icons()
 
     def _custom_app_name(self, path):
@@ -3029,6 +3579,7 @@ def build(app, window):
 
         toolbar = tk.Frame(window.content, bg="white", relief=tk.RAISED, bd=1)
         toolbar.pack(fill=tk.X)
+
         tk.Button(toolbar, text="Up", command=lambda: navigate(current_path["path"].parent)).pack(side=tk.LEFT, padx=4, pady=4)
         tk.Button(toolbar, text="Home", command=lambda: navigate(Path.home())).pack(side=tk.LEFT, padx=4, pady=4)
         tk.Button(toolbar, text="Drive A", command=lambda: navigate(self.get_drive_a_path())).pack(side=tk.LEFT, padx=4, pady=4)
@@ -3225,6 +3776,7 @@ def build(app, window):
             ("SNAKE", "Eat food, grow, and avoid the walls.", self.open_snake),
             ("SUDOKU", "Complete a generated 9 x 9 number puzzle.", self.open_sudoku),
             ("AUTOMATED CHESS", "Play White against a computer opponent.", self.open_chess),
+            ("8-BALL POOL", "Local two-player pool with mouse aiming.", self.open_eight_ball_pool),
         )
         for title, description, command in games:
             card = tk.Frame(window.content, bg=background, relief=tk.RAISED, bd=2)
@@ -3236,6 +3788,229 @@ def build(app, window):
             tk.Label(card, text=description, bg=background, fg=foreground, anchor=tk.W).pack(
                 side=tk.LEFT, fill=tk.X, expand=True, padx=5
             )
+
+    def open_eight_ball_pool(self):
+        """Open a local two-player 8-ball pool game."""
+        window = self.create_window("8-Ball Pool", width=850, height=610)
+        background = self.preferences.get("surface_bg", "#ffffff")
+        foreground = self.preferences.get("text_fg", "#000000")
+        status = tk.StringVar(value="Player 1: drag back from the cue ball and release to shoot.")
+        score = tk.StringVar(value="Player 1  |  Open table  |  Player 2")
+        tk.Label(window.content, textvariable=score, bg=background, fg=foreground,
+                 font=("Courier New", 12, "bold")).pack(pady=(7, 1))
+        tk.Label(window.content, textvariable=status, bg=background, fg=foreground).pack(pady=(0, 5))
+        canvas = tk.Canvas(window.content, width=800, height=450, bg="#4e2b18",
+                           highlightthickness=0, cursor="crosshair")
+        canvas.pack()
+
+        left, top, right, bottom = 45, 35, 755, 415
+        radius, pocket_radius = 11, 20
+        colors = {
+            0: "#ffffff", 1: "#f4d03f", 2: "#2874a6", 3: "#c0392b", 4: "#7d3c98",
+            5: "#d35400", 6: "#229954", 7: "#922b21", 8: "#111111",
+            9: "#f4d03f", 10: "#2874a6", 11: "#c0392b", 12: "#7d3c98",
+            13: "#d35400", 14: "#229954", 15: "#922b21",
+        }
+        pockets = [(left, top), ((left + right) / 2, top), (right, top),
+                   (left, bottom), ((left + right) / 2, bottom), (right, bottom)]
+        balls = []
+        state = {"player": 0, "groups": [None, None], "moving": False, "drag": None,
+                 "aim": None, "after": None, "potted": [], "game_over": False}
+
+        def new_game():
+            if state["after"] is not None:
+                self.root.after_cancel(state["after"])
+            balls.clear()
+            balls.append({"n": 0, "x": 225.0, "y": 225.0, "vx": 0.0, "vy": 0.0,
+                          "potted": False})
+            order = [1, 10, 3, 12, 8, 6, 15, 2, 11, 7, 14, 4, 9, 5, 13]
+            start_x, start_y, spacing = 555.0, 225.0, radius * 2.08
+            index = 0
+            for row in range(5):
+                x = start_x + row * spacing * .87
+                for column in range(row + 1):
+                    y = start_y + (column - row / 2) * spacing
+                    balls.append({"n": order[index], "x": x, "y": y,
+                                  "vx": 0.0, "vy": 0.0, "potted": False})
+                    index += 1
+            state.update(player=0, groups=[None, None], moving=False, drag=None, aim=None,
+                         after=None, potted=[], game_over=False)
+            status.set("Player 1: drag back from the cue ball and release to shoot.")
+            update_score()
+            draw()
+
+        def group_name(group):
+            return "Solids" if group == "solid" else "Stripes" if group == "stripe" else "Open"
+
+        def update_score():
+            score.set(f"Player 1: {group_name(state['groups'][0])}  |  "
+                      f"Player {state['player'] + 1}'s turn  |  "
+                      f"Player 2: {group_name(state['groups'][1])}")
+
+        def draw_ball(ball):
+            x, y, number = ball["x"], ball["y"], ball["n"]
+            canvas.create_oval(x-radius, y-radius, x+radius, y+radius,
+                               fill=colors[number], outline="#222222", width=1)
+            if number > 8:
+                canvas.create_rectangle(x-radius+1, y-5, x+radius-1, y+5,
+                                        fill=colors[number], outline="")
+                canvas.create_oval(x-6, y-6, x+6, y+6, fill="white", outline="")
+            if number:
+                canvas.create_text(x, y, text=str(number), font=("Arial", 7, "bold"),
+                                   fill="white" if number == 8 else "black")
+
+        def draw():
+            canvas.delete("all")
+            canvas.create_rectangle(20, 10, 780, 440, fill="#5b321d", outline="#32190d", width=3)
+            canvas.create_rectangle(left, top, right, bottom, fill="#167447", outline="#0c4e31", width=4)
+            for px, py in pockets:
+                canvas.create_oval(px-pocket_radius, py-pocket_radius, px+pocket_radius,
+                                   py+pocket_radius, fill="#090909", outline="#222222")
+            for ball in balls:
+                if not ball["potted"]:
+                    draw_ball(ball)
+            cue = balls[0] if balls else None
+            if state["drag"] and state["aim"] and cue and not cue["potted"]:
+                ax, ay = state["aim"]
+                dx, dy = cue["x"] - ax, cue["y"] - ay
+                length = math.hypot(dx, dy)
+                if length:
+                    scale = 1000 / length
+                    canvas.create_line(cue["x"], cue["y"], cue["x"] + dx*scale,
+                                       cue["y"] + dy*scale, fill="white", dash=(5, 4))
+                    canvas.create_line(cue["x"] - dx/length*18, cue["y"] - dy/length*18,
+                                       ax, ay, fill="#d7a86e", width=5)
+
+        def ball_group(number):
+            return "solid" if 1 <= number <= 7 else "stripe" if 9 <= number <= 15 else None
+
+        def remaining(group):
+            return any(not ball["potted"] and ball_group(ball["n"]) == group for ball in balls)
+
+        def finish_shot():
+            state["moving"] = False
+            potted = state["potted"]
+            cue_potted = 0 in potted
+            eight_potted = 8 in potted
+            own_group = state["groups"][state["player"]]
+            if state["groups"][0] is None:
+                first = next((ball_group(n) for n in potted if ball_group(n)), None)
+                if first:
+                    state["groups"][state["player"]] = first
+                    state["groups"][1-state["player"]] = "stripe" if first == "solid" else "solid"
+                    own_group = first
+            if eight_potted:
+                legal = own_group is not None and not remaining(own_group) and not cue_potted
+                winner = state["player"] if legal else 1 - state["player"]
+                state["game_over"] = True
+                status.set(f"Player {winner + 1} wins! Press New Game to play again.")
+                self.show_notification("8-Ball Pool", f"Player {winner + 1} wins!", kind="system")
+            else:
+                keeps_turn = any(ball_group(n) == own_group for n in potted) and not cue_potted
+                if cue_potted:
+                    cue = balls[0]
+                    cue.update(x=225.0, y=225.0, vx=0.0, vy=0.0, potted=False)
+                    status.set("Scratch! Cue ball respotted; turn passes.")
+                elif keeps_turn:
+                    status.set(f"Player {state['player'] + 1} continues.")
+                else:
+                    state["player"] = 1 - state["player"]
+                    status.set(f"Player {state['player'] + 1}'s turn.")
+            state["potted"] = []
+            update_score()
+            draw()
+
+        def tick():
+            state["after"] = None
+            if not window.frame.winfo_exists() or not state["moving"]:
+                return
+            active = [ball for ball in balls if not ball["potted"]]
+            for ball in active:
+                ball["x"] += ball["vx"]
+                ball["y"] += ball["vy"]
+                for px, py in pockets:
+                    if math.hypot(ball["x"]-px, ball["y"]-py) < pocket_radius:
+                        ball["potted"] = True
+                        ball["vx"] = ball["vy"] = 0.0
+                        state["potted"].append(ball["n"])
+                        break
+                if ball["potted"]:
+                    continue
+                if ball["x"]-radius < left or ball["x"]+radius > right:
+                    ball["x"] = min(right-radius, max(left+radius, ball["x"]))
+                    ball["vx"] *= -0.88
+                if ball["y"]-radius < top or ball["y"]+radius > bottom:
+                    ball["y"] = min(bottom-radius, max(top+radius, ball["y"]))
+                    ball["vy"] *= -0.88
+            active = [ball for ball in balls if not ball["potted"]]
+            for index, first in enumerate(active):
+                for second in active[index+1:]:
+                    dx, dy = second["x"]-first["x"], second["y"]-first["y"]
+                    distance = math.hypot(dx, dy)
+                    if 0 < distance < radius*2:
+                        nx, ny = dx/distance, dy/distance
+                        overlap = radius*2-distance
+                        first["x"] -= nx*overlap/2; first["y"] -= ny*overlap/2
+                        second["x"] += nx*overlap/2; second["y"] += ny*overlap/2
+                        relative = (first["vx"]-second["vx"])*nx + (first["vy"]-second["vy"])*ny
+                        if relative > 0:
+                            first["vx"] -= relative*nx; first["vy"] -= relative*ny
+                            second["vx"] += relative*nx; second["vy"] += relative*ny
+            moving = False
+            for ball in active:
+                ball["vx"] *= .985; ball["vy"] *= .985
+                if math.hypot(ball["vx"], ball["vy"]) < .035:
+                    ball["vx"] = ball["vy"] = 0.0
+                else:
+                    moving = True
+            draw()
+            if moving:
+                state["after"] = self.root.after(16, tick)
+            else:
+                finish_shot()
+
+        def press(event):
+            cue = balls[0]
+            if state["moving"] or state["game_over"] or cue["potted"]:
+                return
+            if math.hypot(event.x-cue["x"], event.y-cue["y"]) <= radius+8:
+                state["drag"] = (event.x, event.y)
+                state["aim"] = (event.x, event.y)
+
+        def drag(event):
+            if state["drag"]:
+                state["aim"] = (event.x, event.y)
+                draw()
+
+        def release(event):
+            if not state["drag"]:
+                return
+            cue = balls[0]
+            dx, dy = cue["x"]-event.x, cue["y"]-event.y
+            distance = min(140, math.hypot(dx, dy))
+            state["drag"] = state["aim"] = None
+            if distance < 5:
+                draw(); return
+            length = math.hypot(dx, dy)
+            power = distance / 12
+            cue["vx"], cue["vy"] = dx/length*power, dy/length*power
+            state["moving"] = True
+            status.set("Balls in motion...")
+            state["after"] = self.root.after(16, tick)
+
+        controls = tk.Frame(window.content, bg=background)
+        controls.pack(pady=7)
+        tk.Button(controls, text="New Game", command=new_game).pack(side=tk.LEFT, padx=5)
+        tk.Label(controls, text="Aim by dragging backward from the cue ball.",
+                 bg=background, fg=foreground).pack(side=tk.LEFT, padx=12)
+        canvas.bind("<ButtonPress-1>", press)
+        canvas.bind("<B1-Motion>", drag)
+        canvas.bind("<ButtonRelease-1>", release)
+        window.frame.bind("<Destroy>", lambda event: (
+            self.root.after_cancel(state["after"]) if event.widget is window.frame
+            and state["after"] is not None else None
+        ), add="+")
+        new_game()
 
     def open_snake(self):
         """Open a keyboard-controlled Snake game."""
@@ -3570,6 +4345,1082 @@ def build(app, window):
             and state["after"] is not None else None
         ), add="+")
         draw_board()
+
+    def open_website_designer(self, project_path=None):
+        """Open a folder-based HTML, CSS, and JavaScript website workspace."""
+        window = self.create_window("Website Designer", width=1050, height=680)
+        surface = self.preferences.get("surface_bg", "#ffffff")
+        foreground = self.preferences.get("text_fg", "#000000")
+        allowed_extensions = {
+            ".html", ".htm", ".css", ".js", ".json", ".svg", ".txt", ".md", ".xml",
+        }
+        state = {"project": None, "file": None, "dirty": False, "loading": False}
+        status = tk.StringVar(value="Choose or create a website project folder.")
+        project_label = tk.StringVar(value="No project open")
+
+        toolbar = tk.Frame(window.content, bg=surface, relief=tk.RAISED, bd=1)
+        toolbar.pack(fill=tk.X)
+        body = tk.PanedWindow(window.content, orient=tk.HORIZONTAL, sashwidth=5, bg=surface)
+        body.pack(fill=tk.BOTH, expand=True)
+        sidebar = tk.Frame(body, bg=surface, width=245)
+        editor_frame = tk.Frame(body, bg=surface)
+        body.add(sidebar, minsize=210)
+        body.add(editor_frame, minsize=500)
+        tk.Label(sidebar, textvariable=project_label, bg=surface, fg=foreground,
+                 font=("Courier New", 10, "bold"), anchor=tk.W, wraplength=220).pack(
+            fill=tk.X, padx=7, pady=(7, 3)
+        )
+        file_tree = ttk.Treeview(sidebar, show="tree", selectmode="browse")
+        tree_scroll = ttk.Scrollbar(sidebar, orient=tk.VERTICAL, command=file_tree.yview)
+        file_tree.configure(yscrollcommand=tree_scroll.set)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y, pady=(0, 7))
+        file_tree.pack(fill=tk.BOTH, expand=True, padx=(7, 0), pady=(0, 7))
+
+        file_title = tk.StringVar(value="No file selected")
+        tk.Label(editor_frame, textvariable=file_title, bg=surface, fg=foreground,
+                 anchor=tk.W, font=("Courier New", 10, "bold")).pack(fill=tk.X, padx=6, pady=4)
+        editor = scrolledtext.ScrolledText(
+            editor_frame, wrap=tk.NONE, undo=True, font=("Consolas", 11),
+            bg="#ffffff", fg="#111827", insertbackground="#111827",
+        )
+        editor.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0, 5))
+        tk.Label(window.content, textvariable=status, bg=surface, fg=foreground,
+                 anchor=tk.W).pack(fill=tk.X, padx=7, pady=3)
+
+        def safe_target(relative_name):
+            root = state["project"]
+            if root is None:
+                raise ValueError("Open a project first.")
+            target = (root / relative_name).resolve()
+            root = root.resolve()
+            if target != root and root not in target.parents:
+                raise ValueError("Files must stay inside the website project.")
+            return target
+
+        def page_template(title, stylesheet="styles.css", script="script.js"):
+            safe_title = html.escape(title)
+            return f'''<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="{safe_title}">
+  <title>{safe_title}</title>
+  <link rel="stylesheet" href="{stylesheet}">
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="index.html">My Website</a>
+    <nav aria-label="Main navigation"><a href="index.html">Home</a></nav>
+  </header>
+  <main>
+    <section class="hero">
+      <h1>{safe_title}</h1>
+      <p>Edit this page in pyOS Website Designer.</p>
+    </section>
+  </main>
+  <footer><p>&copy; <span id="year"></span> My Website</p></footer>
+  <script src="{script}" defer></script>
+</body>
+</html>
+'''
+
+        starter_css = ''':root { color-scheme: light; --accent: #2563eb; --ink: #172033; }
+* { box-sizing: border-box; }
+body { margin: 0; color: var(--ink); font: 16px/1.6 system-ui, sans-serif; }
+.site-header { display: flex; justify-content: space-between; align-items: center;
+  padding: 1rem max(5vw, 1rem); background: #f1f5f9; }
+.site-header a { color: inherit; text-decoration: none; margin-left: 1rem; }
+.brand { font-weight: 700; }
+main { min-height: 70vh; }
+.hero { padding: 6rem max(5vw, 1rem); text-align: center; }
+.button { display: inline-block; padding: .7rem 1rem; border-radius: .4rem;
+  background: var(--accent); color: white; text-decoration: none; border: 0; }
+footer { padding: 2rem; text-align: center; background: #f1f5f9; }
+img { max-width: 100%; height: auto; }
+@media (max-width: 600px) { .site-header { align-items: flex-start; flex-direction: column; } }
+'''
+        starter_js = '''document.querySelector("#year")?.replaceChildren(new Date().getFullYear());
+'''
+
+        def set_dirty(event=None):
+            if not state["loading"] and state["file"]:
+                state["dirty"] = True
+                file_title.set(f"{state['file'].name} *")
+
+        def save_file():
+            target = state["file"]
+            if target is None:
+                return False
+            try:
+                target.write_text(editor.get("1.0", "end-1c"), encoding="utf-8")
+                state["dirty"] = False
+                file_title.set(target.name)
+                status.set(f"Saved {target.relative_to(state['project'])}")
+                return True
+            except OSError as error:
+                messagebox.showerror("Website Designer", f"Could not save file:\n{error}", parent=self.root)
+                return False
+
+        def confirm_discard():
+            if not state["dirty"]:
+                return True
+            answer = messagebox.askyesnocancel(
+                "Unsaved Changes", "Save changes before continuing?", parent=self.root,
+            )
+            if answer is None:
+                return False
+            return save_file() if answer else True
+
+        def highlight_source():
+            for tag in ("tag", "attribute", "string", "comment", "keyword"):
+                editor.tag_remove(tag, "1.0", tk.END)
+            editor.tag_configure("tag", foreground="#1d4ed8")
+            editor.tag_configure("attribute", foreground="#7c3aed")
+            editor.tag_configure("string", foreground="#047857")
+            editor.tag_configure("comment", foreground="#6b7280")
+            editor.tag_configure("keyword", foreground="#be123c")
+            content = editor.get("1.0", "end-1c")
+            suffix = state["file"].suffix.casefold() if state["file"] else ""
+            patterns = []
+            if suffix in {".html", ".htm", ".xml", ".svg"}:
+                patterns = [(r"<!--.*?-->", "comment"), (r"</?[A-Za-z][^>]*>", "tag"),
+                            (r'''["'][^"']*["']''', "string")]
+            elif suffix == ".css":
+                patterns = [(r"/\*.*?\*/", "comment"), (r"#[0-9a-fA-F]{3,8}", "string"),
+                            (r"[A-Za-z-]+(?=\s*:)", "attribute")]
+            elif suffix == ".js":
+                patterns = [(r"//.*$", "comment"), (r'''["'`][^"'`]*["'`]''', "string"),
+                            (r"\b(const|let|var|function|if|else|return|async|await|class|new)\b", "keyword")]
+            for pattern, tag in patterns:
+                try:
+                    for match in re.finditer(pattern, content, re.MULTILINE | re.DOTALL):
+                        editor.tag_add(tag, f"1.0+{match.start()}c", f"1.0+{match.end()}c")
+                except re.error:
+                    pass
+
+        def load_file(target):
+            target = Path(target)
+            if target.suffix.casefold() not in allowed_extensions or not confirm_discard():
+                return
+            try:
+                content = target.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as error:
+                messagebox.showerror("Website Designer", f"Could not open file:\n{error}", parent=self.root)
+                return
+            state["loading"] = True
+            editor.delete("1.0", tk.END)
+            editor.insert("1.0", content)
+            state.update(file=target, dirty=False, loading=False)
+            file_title.set(target.name)
+            status.set(str(target.relative_to(state["project"])))
+            highlight_source()
+
+        def refresh_tree(select_path=None):
+            file_tree.delete(*file_tree.get_children())
+            root = state["project"]
+            if root is None:
+                return
+            nodes = {root: ""}
+            selected_id = None
+            for current, directories, files in os.walk(root):
+                directories[:] = sorted(d for d in directories if not d.startswith("."))
+                current_path = Path(current)
+                parent_id = nodes.get(current_path, "")
+                for directory in directories:
+                    path = current_path / directory
+                    node = file_tree.insert(parent_id, tk.END, text=directory, open=True, values=(str(path),))
+                    nodes[path] = node
+                for filename in sorted(files, key=str.casefold):
+                    path = current_path / filename
+                    if path.suffix.casefold() not in allowed_extensions:
+                        continue
+                    node = file_tree.insert(parent_id, tk.END, text=filename, values=(str(path),))
+                    if select_path and path.resolve() == Path(select_path).resolve():
+                        selected_id = node
+            if selected_id:
+                file_tree.selection_set(selected_id)
+                file_tree.see(selected_id)
+
+        def open_project(path=None, create=False):
+            if not confirm_discard():
+                return
+            chosen = str(path) if path else filedialog.askdirectory(
+                title="Choose website project folder", mustexist=not create
+            )
+            if not chosen:
+                return
+            root = Path(chosen).expanduser().resolve()
+            try:
+                root.mkdir(parents=True, exist_ok=True)
+                if create:
+                    (root / "assets").mkdir(exist_ok=True)
+                    starters = {
+                        root / "index.html": page_template("Welcome to My Website"),
+                        root / "styles.css": starter_css,
+                        root / "script.js": starter_js,
+                    }
+                    for target, content in starters.items():
+                        if not target.exists():
+                            target.write_text(content, encoding="utf-8")
+            except OSError as error:
+                messagebox.showerror("Website Designer", f"Could not create project:\n{error}", parent=self.root)
+                return
+            state.update(project=root, file=None, dirty=False)
+            project_label.set(root.name)
+            refresh_tree(root / "index.html")
+            if (root / "index.html").exists():
+                load_file(root / "index.html")
+            status.set(f"Project: {root}")
+
+        def new_file(kind="page"):
+            if state["project"] is None:
+                messagebox.showinfo("Website Designer", "Open a project first.", parent=self.root)
+                return
+            prompts = {"page": ("New Page", "Page filename:", "page.html"),
+                       "css": ("New Stylesheet", "Stylesheet filename:", "theme.css"),
+                       "js": ("New Script", "Script filename:", "feature.js")}
+            title, prompt, initial = prompts[kind]
+            name = simpledialog.askstring(title, prompt, initialvalue=initial, parent=self.root)
+            if not name:
+                return
+            name = name.strip().replace("\\", "/")
+            required = {"page": ".html", "css": ".css", "js": ".js"}[kind]
+            if not name.casefold().endswith(required):
+                name += required
+            try:
+                target = safe_target(name)
+                if target.exists():
+                    raise ValueError("That file already exists.")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                content = page_template(Path(name).stem.replace("-", " ").title()) if kind == "page" else ""
+                target.write_text(content, encoding="utf-8")
+            except (OSError, ValueError) as error:
+                messagebox.showerror("Website Designer", str(error), parent=self.root)
+                return
+            refresh_tree(target)
+            load_file(target)
+
+        def import_asset():
+            if state["project"] is None:
+                return
+            filename = filedialog.askopenfilename(title="Import image or other website asset")
+            if not filename:
+                return
+            assets = safe_target("assets")
+            assets.mkdir(exist_ok=True)
+            target = assets / Path(filename).name
+            try:
+                if target.exists() and not messagebox.askyesno(
+                    "Replace Asset", f"Replace assets/{target.name}?", parent=self.root
+                ):
+                    return
+                shutil.copy2(filename, target)
+                refresh_tree()
+                status.set(f"Imported assets/{target.name}")
+            except OSError as error:
+                messagebox.showerror("Website Designer", str(error), parent=self.root)
+
+        components = {
+            "Navigation bar": '''<nav class="site-nav" aria-label="Main navigation">
+  <a href="index.html">Home</a>
+  <a href="about.html">About</a>
+  <a href="contact.html">Contact</a>
+</nav>''',
+            "Hero section": '''<section class="hero">
+  <h1>Your headline</h1>
+  <p>Explain what makes your website useful.</p>
+  <a class="button" href="#learn-more">Learn more</a>
+</section>''',
+            "Responsive gallery": '''<section class="gallery" aria-label="Image gallery">
+  <img src="assets/image-1.jpg" alt="Describe image one">
+  <img src="assets/image-2.jpg" alt="Describe image two">
+  <img src="assets/image-3.jpg" alt="Describe image three">
+</section>''',
+            "Accessible contact form": '''<form class="contact-form">
+  <label for="name">Name</label><input id="name" name="name" autocomplete="name" required>
+  <label for="email">Email</label><input id="email" name="email" type="email" autocomplete="email" required>
+  <label for="message">Message</label><textarea id="message" name="message" required></textarea>
+  <button class="button" type="submit">Send</button>
+</form>''',
+            "Feature cards": '''<section class="feature-grid">
+  <article><h2>Feature one</h2><p>Describe your feature.</p></article>
+  <article><h2>Feature two</h2><p>Describe your feature.</p></article>
+  <article><h2>Feature three</h2><p>Describe your feature.</p></article>
+</section>''',
+        }
+
+        def add_component():
+            if not state["file"]:
+                return
+            name = simpledialog.askstring(
+                "Add Website Feature",
+                "Choose a feature:\n" + "\n".join(f"- {item}" for item in components) +
+                "\n\nOr enter Custom to write your own snippet.",
+                parent=self.root,
+            )
+            if not name:
+                return
+            match = next((key for key in components if key.casefold() == name.strip().casefold()), None)
+            if match:
+                snippet = components[match]
+            elif name.strip().casefold() == "custom":
+                snippet = simpledialog.askstring(
+                    "Custom Feature", "Enter HTML, CSS, or JavaScript to insert:", parent=self.root
+                )
+                if snippet is None:
+                    return
+            else:
+                messagebox.showinfo("Website Designer", "Feature name not recognised.", parent=self.root)
+                return
+            editor.insert(tk.INSERT, "\n" + snippet + "\n")
+            set_dirty()
+            highlight_source()
+
+        def preview():
+            if state["project"] is None:
+                return
+            save_file()
+            target = state["file"] if state["file"] and state["file"].suffix.casefold() in {".html", ".htm"} else state["project"] / "index.html"
+            if target.exists():
+                webbrowser.open(target.resolve().as_uri())
+                status.set(f"Previewing {target.name} in the default browser")
+            else:
+                messagebox.showinfo("Website Designer", "Create index.html or another page first.", parent=self.root)
+
+        def host_project():
+            if state["project"] is None:
+                messagebox.showinfo("Website Designer", "Open a project first.", parent=self.root)
+                return
+            save_file()
+            self.open_network_hosting(state["project"])
+
+        def tree_open(event=None):
+            selection = file_tree.selection()
+            if not selection:
+                return
+            values = file_tree.item(selection[0], "values")
+            if values and Path(values[0]).is_file():
+                load_file(values[0])
+
+        for label, command in (("New Project", lambda: open_project(create=True)),
+                               ("Open Project", open_project), ("New Page", lambda: new_file("page")),
+                               ("New CSS", lambda: new_file("css")), ("New JS", lambda: new_file("js")),
+                               ("Import Asset", import_asset), ("Save", save_file),
+                               ("Add Feature", add_component), ("Preview", preview),
+                               ("Host Project", host_project)):
+            tk.Button(toolbar, text=label, command=command).pack(side=tk.LEFT, padx=2, pady=4)
+        file_tree.bind("<Double-Button-1>", tree_open)
+        file_tree.bind("<<TreeviewSelect>>", tree_open)
+        editor.bind("<<Modified>>", lambda event: (editor.edit_modified(False), set_dirty()))
+        editor.bind("<Control-s>", lambda event: (save_file(), "break")[1])
+
+        original_close = window.close
+        def close_designer():
+            if confirm_discard():
+                original_close()
+        window.close_button.configure(command=close_designer)
+        if project_path:
+            open_project(project_path)
+
+    def open_network_hosting(self, folder=None):
+        """Open HTTP hosting controls and a network connection monitor."""
+        window = self.create_window("Network & Hosting", width=900, height=620)
+        surface = self.preferences.get("surface_bg", "#ffffff")
+        foreground = self.preferences.get("text_fg", "#000000")
+        notebook = ttk.Notebook(window.content)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        hosting = tk.Frame(notebook, bg=surface)
+        traffic = tk.Frame(notebook, bg=surface)
+        forwarding = tk.Frame(notebook, bg=surface)
+        notebook.add(hosting, text="Web Hosting")
+        notebook.add(traffic, text="Network Traffic")
+        notebook.add(forwarding, text="Port Forwards")
+
+        state = {"server": None, "thread": None, "refresh": None, "last_io": None,
+                 "last_time": None, "closing": False, "upnp": None, "public_port": None}
+        folder_var = tk.StringVar(value=str(Path(folder)) if folder else str(Path.home()))
+        port_var = tk.StringVar(value="8000")
+        lan_var = tk.BooleanVar(value=False)
+        public_var = tk.BooleanVar(value=False)
+        host_status = tk.StringVar(value="Stopped")
+        url_var = tk.StringVar(value="")
+        forwarding_status = tk.StringVar(value="Select Public mode or press Scan Router.")
+
+        forward_header = tk.Frame(forwarding, bg=surface)
+        forward_header.pack(fill=tk.X, padx=10, pady=(10, 5))
+        tk.Label(
+            forward_header, textvariable=forwarding_status, bg=surface, fg=foreground,
+            font=("Courier New", 10, "bold"), anchor=tk.W,
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        forward_columns = ("external", "protocol", "internal", "client", "enabled", "description")
+        forward_list = ttk.Treeview(forwarding, columns=forward_columns, show="headings", height=22)
+        forward_headings = {
+            "external": "External port", "protocol": "Protocol", "internal": "Internal port",
+            "client": "Internal device", "enabled": "Enabled", "description": "Description",
+        }
+        forward_widths = {
+            "external": 100, "protocol": 75, "internal": 100,
+            "client": 145, "enabled": 70, "description": 260,
+        }
+        for column in forward_columns:
+            forward_list.heading(column, text=forward_headings[column])
+            forward_list.column(column, width=forward_widths[column], anchor=tk.W)
+        forward_scroll = ttk.Scrollbar(forwarding, orient=tk.VERTICAL, command=forward_list.yview)
+        forward_list.configure(yscrollcommand=forward_scroll.set)
+        forward_scroll.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10), pady=(0, 10))
+        forward_list.pack(fill=tk.BOTH, expand=True, padx=(10, 0), pady=(0, 10))
+
+        tk.Label(hosting, text="STATIC WEB HOST", bg=surface, fg=foreground,
+                 font=("Courier New", 13, "bold"), anchor=tk.W).pack(
+            fill=tk.X, padx=12, pady=(12, 4)
+        )
+        tk.Label(
+            hosting,
+            text="Share a folder over HTTP. Localhost is private to this computer; LAN mode is visible "
+                 "to other devices on your network.",
+            bg=surface, fg=foreground, justify=tk.LEFT, anchor=tk.W, wraplength=820,
+        ).pack(fill=tk.X, padx=12, pady=(0, 9))
+        folder_row = tk.Frame(hosting, bg=surface)
+        folder_row.pack(fill=tk.X, padx=12, pady=3)
+        tk.Label(folder_row, text="Folder:", width=9, anchor=tk.W,
+                 bg=surface, fg=foreground).pack(side=tk.LEFT)
+        tk.Entry(folder_row, textvariable=folder_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        def choose_folder():
+            chosen = filedialog.askdirectory(title="Choose folder to host", initialdir=folder_var.get())
+            if chosen:
+                folder_var.set(chosen)
+
+        tk.Button(folder_row, text="Browse", command=choose_folder).pack(side=tk.LEFT, padx=(5, 0))
+        options = tk.Frame(hosting, bg=surface)
+        options.pack(fill=tk.X, padx=12, pady=5)
+        tk.Label(options, text="Port:", bg=surface, fg=foreground).pack(side=tk.LEFT)
+        tk.Entry(options, textvariable=port_var, width=7).pack(side=tk.LEFT, padx=(5, 15))
+        tk.Checkbutton(
+            options, text="Allow access from the local network", variable=lan_var,
+            bg=surface, fg=foreground, selectcolor=surface,
+        ).pack(side=tk.LEFT)
+        def select_public_mode():
+            if public_var.get():
+                lan_var.set(True)
+                scan_router_ports()
+        tk.Checkbutton(
+            options, text="Public internet (UPnP port forwarding)", variable=public_var,
+            command=select_public_mode, bg=surface, fg=foreground, selectcolor=surface,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+        controls = tk.Frame(hosting, bg=surface)
+        controls.pack(fill=tk.X, padx=12, pady=4)
+        start_button = tk.Button(controls, text="Start Hosting")
+        start_button.pack(side=tk.LEFT)
+        stop_button = tk.Button(controls, text="Stop", state=tk.DISABLED)
+        stop_button.pack(side=tk.LEFT, padx=5)
+        open_button = tk.Button(controls, text="Open Site", state=tk.DISABLED)
+        open_button.pack(side=tk.LEFT, padx=5)
+        copy_button = tk.Button(controls, text="Copy URL", state=tk.DISABLED)
+        copy_button.pack(side=tk.LEFT)
+        tk.Label(controls, textvariable=host_status, bg=surface, fg=foreground,
+                 anchor=tk.W).pack(side=tk.LEFT, padx=14)
+        tk.Label(hosting, textvariable=url_var, bg=surface, fg=foreground,
+                 font=("Courier New", 10, "bold"), anchor=tk.W).pack(fill=tk.X, padx=12, pady=4)
+        tk.Label(hosting, text="REQUEST LOG", bg=surface, fg=foreground,
+                 font=("Courier New", 10, "bold"), anchor=tk.W).pack(fill=tk.X, padx=12, pady=(8, 2))
+        request_log = scrolledtext.ScrolledText(hosting, height=15, state=tk.DISABLED,
+                                                font=("Courier New", 9))
+        request_log.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 10))
+
+        def log_request(message):
+            if state["closing"]:
+                return
+            request_log.configure(state=tk.NORMAL)
+            request_log.insert(tk.END, f"{datetime.now().strftime('%H:%M:%S')}  {message}\n")
+            request_log.see(tk.END)
+            request_log.configure(state=tk.DISABLED)
+
+        def local_ip():
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                probe.connect(("8.8.8.8", 80))
+                return probe.getsockname()[0]
+            except OSError:
+                return socket.gethostbyname(socket.gethostname())
+            finally:
+                probe.close()
+
+        def upnp_soap(mapping, action, arguments):
+            """Call a UPnP Internet Gateway Device SOAP action."""
+            service_type = mapping["service_type"]
+            values = "".join(
+                f"<New{name}>{html.escape(str(value))}</New{name}>" for name, value in arguments
+            )
+            envelope = (
+                '<?xml version="1.0"?>'
+                '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+                's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+                f'<s:Body><u:{action} xmlns:u="{service_type}">{values}</u:{action}></s:Body>'
+                '</s:Envelope>'
+            ).encode("utf-8")
+            request = urllib.request.Request(
+                mapping["control_url"], data=envelope, method="POST",
+                headers={
+                    "Content-Type": 'text/xml; charset="utf-8"',
+                    "SOAPAction": f'"{service_type}#{action}"',
+                    "User-Agent": "pyOS/1.0 UPnP/1.1",
+                },
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=8) as response:
+                    payload = response.read(256 * 1024)
+            except urllib.error.HTTPError as error:
+                payload = error.read(256 * 1024)
+                description = ""
+                try:
+                    root = ET.fromstring(payload)
+                    description = next(
+                        (node.text or "" for node in root.iter()
+                         if node.tag.rsplit("}", 1)[-1] == "errorDescription"), ""
+                    )
+                except ET.ParseError:
+                    pass
+                raise RuntimeError(description or f"Router rejected {action} (HTTP {error.code}).") from error
+            except (OSError, urllib.error.URLError) as error:
+                raise RuntimeError(f"Router did not respond to {action}: {error}") from error
+            try:
+                return ET.fromstring(payload)
+            except ET.ParseError as error:
+                raise RuntimeError(f"Router returned an invalid response to {action}.") from error
+
+        def discover_upnp_gateway():
+            """Discover a UPnP IGD directly, without Windows' legacy NATUPnP COM service."""
+            searches = (
+                "urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+                "urn:schemas-upnp-org:service:WANIPConnection:1",
+                "urn:schemas-upnp-org:service:WANPPPConnection:1",
+            )
+            locations = []
+            discovery = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            discovery.settimeout(1.25)
+            try:
+                for search_target in searches:
+                    packet = (
+                        "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+                        'MAN: "ssdp:discover"\r\nMX: 2\r\n'
+                        f"ST: {search_target}\r\n\r\n"
+                    ).encode("ascii")
+                    discovery.sendto(packet, ("239.255.255.250", 1900))
+                deadline = time.monotonic() + 4.0
+                while time.monotonic() < deadline:
+                    try:
+                        response = discovery.recvfrom(65535)[0].decode("iso-8859-1", "replace")
+                    except socket.timeout:
+                        break
+                    headers = {}
+                    for line in response.split("\r\n")[1:]:
+                        if ":" in line:
+                            key, value = line.split(":", 1)
+                            headers[key.strip().casefold()] = value.strip()
+                    location = headers.get("location")
+                    if location and location not in locations:
+                        locations.append(location)
+            except OSError as error:
+                raise RuntimeError(f"UPnP discovery could not use the network: {error}") from error
+            finally:
+                discovery.close()
+            if not locations:
+                raise RuntimeError(
+                    "No UPnP Internet Gateway was discovered. Enable UPnP on the router and allow "
+                    "network discovery for this Wi-Fi network."
+                )
+            for location in locations:
+                try:
+                    request = urllib.request.Request(location, headers={"User-Agent": "pyOS/1.0 UPnP/1.1"})
+                    with urllib.request.urlopen(request, timeout=5) as response:
+                        description = ET.fromstring(response.read(1024 * 1024))
+                    for service in description.iter():
+                        if service.tag.rsplit("}", 1)[-1] != "service":
+                            continue
+                        fields = {
+                            child.tag.rsplit("}", 1)[-1]: child.text or "" for child in service
+                        }
+                        service_type = fields.get("serviceType", "")
+                        if "WANIPConnection" in service_type or "WANPPPConnection" in service_type:
+                            return {
+                                "service_type": service_type,
+                                "control_url": urllib.parse.urljoin(location, fields["controlURL"]),
+                            }
+                except (OSError, KeyError, ET.ParseError, urllib.error.URLError):
+                    continue
+            raise RuntimeError("A router was found, but it did not advertise a port-mapping service.")
+
+        def default_gateway():
+            """Return the active IPv4 gateway used for NAT-PMP requests."""
+            if os.name == "nt":
+                script = (
+                    "Get-NetIPConfiguration | Where-Object {$_.IPv4DefaultGateway} | "
+                    "ForEach-Object {$_.IPv4DefaultGateway.NextHop} | Select-Object -First 1"
+                )
+                try:
+                    result = subprocess.run(
+                        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                        capture_output=True, text=True, timeout=6,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                    gateway = result.stdout.strip().splitlines()[0].strip()
+                    ipaddress.ip_address(gateway)
+                    return gateway
+                except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+                    pass
+            else:
+                try:
+                    result = subprocess.run(
+                        ["ip", "route", "show", "default"], capture_output=True, text=True, timeout=5
+                    )
+                    match = re.search(r"\bvia\s+(\d+(?:\.\d+){3})", result.stdout)
+                    if match:
+                        return match.group(1)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            raise RuntimeError("Could not determine the network's default gateway.")
+
+        def natpmp_exchange(gateway, request, expected_opcode):
+            """Exchange a NAT-PMP request with retry/backoff."""
+            errors = {
+                1: "Unsupported NAT-PMP version", 2: "Router refused the mapping",
+                3: "Network failure", 4: "Router is out of mapping resources",
+                5: "Unsupported NAT-PMP operation",
+            }
+            client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                for timeout in (.35, .7, 1.4, 2.0):
+                    client.settimeout(timeout)
+                    client.sendto(request, (gateway, 5351))
+                    try:
+                        response, source = client.recvfrom(64)
+                    except socket.timeout:
+                        continue
+                    if source[0] != gateway or len(response) < 8:
+                        continue
+                    version, opcode, result = struct.unpack("!BBH", response[:4])
+                    if version != 0 or opcode != expected_opcode:
+                        continue
+                    if result:
+                        raise RuntimeError(errors.get(result, f"NAT-PMP router error {result}"))
+                    return response
+            finally:
+                client.close()
+            raise RuntimeError(f"The gateway {gateway} did not respond to NAT-PMP on UDP port 5351.")
+
+        def create_natpmp_mapping(port):
+            """Create a TCP mapping through NAT-PMP when UPnP is unavailable."""
+            gateway = default_gateway()
+            public_response = natpmp_exchange(gateway, struct.pack("!BB", 0, 0), 128)
+            if len(public_response) < 12:
+                raise RuntimeError("The NAT-PMP public-address response was incomplete.")
+            external_address = socket.inet_ntoa(public_response[8:12])
+            request = struct.pack("!BBHHHI", 0, 2, 0, port, port, 7200)
+            mapping_response = natpmp_exchange(gateway, request, 130)
+            if len(mapping_response) < 16:
+                raise RuntimeError("The NAT-PMP mapping response was incomplete.")
+            _, _, _, _, internal_port, external_port, lifetime = struct.unpack(
+                "!BBHIHHI", mapping_response[:16]
+            )
+            if internal_port != port or not lifetime:
+                raise RuntimeError("The router did not retain the requested NAT-PMP mapping.")
+            mapping = {
+                "kind": "natpmp", "gateway": gateway, "internal_port": port,
+                "external_port": external_port,
+            }
+            state["upnp"], state["public_port"] = mapping, external_port
+            return external_address, external_port
+
+        def forwarded_ports(mapping):
+            """Enumerate the router's existing UPnP port-forward table."""
+            entries = []
+            for index in range(1024):
+                try:
+                    response = upnp_soap(mapping, "GetGenericPortMappingEntry", (("PortMappingIndex", index),))
+                except RuntimeError as error:
+                    message = str(error).casefold()
+                    if index == 0 and not any(word in message for word in ("index", "array", "specified")):
+                        raise
+                    break
+                values = {
+                    node.tag.rsplit("}", 1)[-1]: (node.text or "").strip()
+                    for node in response.iter()
+                }
+                try:
+                    entries.append({
+                        "external": int(values.get("NewExternalPort", "0")),
+                        "protocol": values.get("NewProtocol", "").upper(),
+                        "internal": int(values.get("NewInternalPort", "0")),
+                        "client": values.get("NewInternalClient", ""),
+                        "enabled": values.get("NewEnabled", "0") not in {"0", "false", "False"},
+                        "description": values.get("NewPortMappingDescription", ""),
+                    })
+                except ValueError:
+                    continue
+            return entries
+
+        def display_forwarded_ports(entries, message=None):
+            if state["closing"] or not window.frame.winfo_exists():
+                return
+            forward_list.delete(*forward_list.get_children())
+            for entry in sorted(entries, key=lambda item: (item["external"], item["protocol"])):
+                forward_list.insert("", tk.END, values=(
+                    entry["external"], entry["protocol"], entry["internal"], entry["client"],
+                    "Yes" if entry["enabled"] else "No", entry["description"],
+                ))
+            forwarding_status.set(message or f"Found {len(entries)} forwarded port(s).")
+
+        def scan_router_ports():
+            if state["closing"]:
+                return
+            forwarding_status.set("Discovering router and scanning forwarded ports...")
+            scan_button.configure(state=tk.DISABLED)
+
+            def worker():
+                try:
+                    mapping = discover_upnp_gateway()
+                    entries = forwarded_ports(mapping)
+                    error = None
+                except Exception as exc:
+                    entries, error = [], str(exc)
+
+                def finish():
+                    if state["closing"] or not window.frame.winfo_exists():
+                        return
+                    scan_button.configure(state=tk.NORMAL)
+                    if error:
+                        display_forwarded_ports([], f"Scan unavailable: {error}")
+                    else:
+                        display_forwarded_ports(entries)
+
+                self.root.after(0, finish)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        scan_button = tk.Button(forward_header, text="Scan Router", command=scan_router_ports)
+        scan_button.pack(side=tk.RIGHT, padx=(8, 0))
+
+        def remove_public_mapping():
+            upnp, mapped_port = state.get("upnp"), state.get("public_port")
+            state["upnp"] = state["public_port"] = None
+            if upnp and mapped_port:
+                try:
+                    if isinstance(upnp, dict) and upnp.get("kind") == "natpmp":
+                        request = struct.pack(
+                            "!BBHHHI", 0, 2, 0, upnp["internal_port"],
+                            upnp["external_port"], 0,
+                        )
+                        natpmp_exchange(upnp["gateway"], request, 130)
+                    elif isinstance(upnp, dict):
+                        upnp_soap(upnp, "DeletePortMapping", (
+                            ("RemoteHost", ""), ("ExternalPort", mapped_port), ("Protocol", "TCP"),
+                        ))
+                    else:
+                        upnp.deleteportmapping(mapped_port, "TCP")
+                    log_request(f"Removed public TCP port mapping {mapped_port}")
+                    if not state["closing"]:
+                        self.root.after(300, scan_router_ports)
+                except Exception as error:
+                    log_request(f"Could not remove router port mapping: {error}")
+
+        def create_public_mapping(port):
+            if os.name == "nt":
+                internal_address = local_ip()
+                try:
+                    mapping = discover_upnp_gateway()
+                except RuntimeError as upnp_error:
+                    try:
+                        return create_natpmp_mapping(port)
+                    except RuntimeError as natpmp_error:
+                        raise RuntimeError(
+                            f"UPnP discovery failed: {upnp_error}\n\nNAT-PMP fallback failed: {natpmp_error}"
+                        ) from natpmp_error
+                mapping_created = False
+                try:
+                    existing = forwarded_ports(mapping)
+                    conflict = next(
+                        (entry for entry in existing
+                         if entry["external"] == port and entry["protocol"] == "TCP"), None
+                    )
+                    if conflict:
+                        used_by = conflict["description"] or conflict["client"] or "another device"
+                        free_port = next(
+                            (candidate for candidate in range(port + 1, min(65536, port + 101))
+                             if not any(item["external"] == candidate and item["protocol"] == "TCP"
+                                        for item in existing)), None
+                        )
+                        suggestion = f" Try port {free_port}." if free_port else " Choose another port."
+                        raise RuntimeError(f"TCP port {port} is already forwarded for {used_by}.{suggestion}")
+                    upnp_soap(mapping, "AddPortMapping", (
+                        ("RemoteHost", ""), ("ExternalPort", port), ("Protocol", "TCP"),
+                        ("InternalPort", port), ("InternalClient", internal_address),
+                        ("Enabled", 1), ("PortMappingDescription", "pyOS Public Website"),
+                        ("LeaseDuration", 0),
+                    ))
+                    mapping_created = True
+                    response = upnp_soap(mapping, "GetExternalIPAddress", ())
+                    external_address = next(
+                        (node.text or "" for node in response.iter()
+                         if node.tag.rsplit("}", 1)[-1] == "NewExternalIPAddress"), ""
+                    ).strip()
+                    ipaddress.ip_address(external_address)
+                except Exception:
+                    if mapping_created:
+                        try:
+                            upnp_soap(mapping, "DeletePortMapping", (
+                                ("RemoteHost", ""), ("ExternalPort", port), ("Protocol", "TCP"),
+                            ))
+                        except Exception:
+                            pass
+                    raise
+                state["upnp"], state["public_port"] = mapping, port
+                self.root.after(0, scan_router_ports)
+                return external_address, port
+            try:
+                import miniupnpc
+            except ImportError as error:
+                raise RuntimeError(
+                    "Public hosting on this platform requires the optional miniupnpc package."
+                ) from error
+            upnp = miniupnpc.UPnP()
+            upnp.discoverdelay = 300
+            discovered = upnp.discover()
+            if not discovered:
+                raise RuntimeError("No UPnP-capable router was found on this network.")
+            try:
+                upnp.selectigd()
+                internal_address = upnp.lanaddr or local_ip()
+                created = upnp.addportmapping(
+                    port, "TCP", internal_address, port, "pyOS Public Website", "", 0
+                )
+                if not created:
+                    raise RuntimeError("The router refused the port-forwarding request.")
+                external_address = upnp.externalipaddress()
+            except Exception:
+                try:
+                    upnp.deleteportmapping(port, "TCP")
+                except Exception:
+                    pass
+                raise
+            if not external_address:
+                upnp.deleteportmapping(port, "TCP")
+                raise RuntimeError("The router did not provide a public IP address.")
+            state["upnp"], state["public_port"] = upnp, port
+            return external_address, port
+
+        def start_hosting():
+            folder = Path(folder_var.get()).expanduser()
+            if not folder.is_dir():
+                messagebox.showerror("Network & Hosting", "Choose an existing folder to host.", parent=self.root)
+                return
+            try:
+                port = int(port_var.get())
+                if not 1 <= port <= 65535:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Network & Hosting", "Port must be between 1 and 65535.", parent=self.root)
+                return
+            if public_var.get() and not messagebox.askyesno(
+                "Enable Public Internet Hosting",
+                "This creates a router port-forward and exposes every readable file in the selected folder "
+                "to the public internet over unencrypted HTTP. Search engines, bots, and unknown visitors may "
+                "access it. Do not host passwords, private data, or secrets.\n\nContinue?",
+                icon=messagebox.WARNING, parent=self.root,
+            ):
+                return
+            if lan_var.get() and not public_var.get() and not messagebox.askyesno(
+                "Enable LAN Hosting",
+                "Other devices on this network will be able to read files in the selected folder. Continue?",
+                parent=self.root,
+            ):
+                return
+            owner = self
+
+            class RequestHandler(http.server.SimpleHTTPRequestHandler):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, directory=str(folder), **kwargs)
+
+                def translate_path(self, path):
+                    translated = Path(super().translate_path(path)).resolve()
+                    hosted_root = folder.resolve()
+                    if translated != hosted_root and hosted_root not in translated.parents:
+                        return str(hosted_root / ".pyos-access-denied")
+                    return str(translated)
+
+                def log_message(self, fmt, *args):
+                    message = f"{self.client_address[0]}  {fmt % args}"
+                    owner.root.after(0, lambda value=message: log_request(value))
+
+                def end_headers(self):
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    super().end_headers()
+
+            bind_address = "0.0.0.0" if lan_var.get() else "127.0.0.1"
+            try:
+                server = http.server.ThreadingHTTPServer((bind_address, port), RequestHandler)
+                server.daemon_threads = True
+            except OSError as error:
+                messagebox.showerror("Network & Hosting", f"Could not start server:\n{error}", parent=self.root)
+                return
+            external_address = None
+            external_port = server.server_port
+            if public_var.get():
+                host_status.set("Requesting router port-forward...")
+                try:
+                    external_address, external_port = create_public_mapping(server.server_port)
+                except Exception as error:
+                    server.server_close()
+                    remove_public_mapping()
+                    host_status.set("Public hosting failed")
+                    messagebox.showerror(
+                        "Public Hosting Unavailable",
+                        f"Could not create a public port-forward:\n\n{error}\n\n"
+                        "Your router may have UPnP disabled, your ISP may use carrier-grade NAT, or a firewall "
+                        "may block incoming connections.", parent=self.root,
+                    )
+                    return
+            state["server"] = server
+            state["thread"] = threading.Thread(target=server.serve_forever, daemon=True)
+            state["thread"].start()
+            display_host = external_address or (local_ip() if lan_var.get() else "127.0.0.1")
+            url_var.set(f"http://{display_host}:{external_port}/")
+            host_status.set("PUBLIC - unencrypted HTTP" if public_var.get()
+                            else "Running on LAN" if lan_var.get() else "Running locally")
+            start_button.configure(state=tk.DISABLED)
+            stop_button.configure(state=tk.NORMAL)
+            open_button.configure(state=tk.NORMAL)
+            copy_button.configure(state=tk.NORMAL)
+            log_request(f"Server started for {folder}")
+            if external_address:
+                mapping_kind = "NAT-PMP" if isinstance(state.get("upnp"), dict) and state["upnp"].get("kind") == "natpmp" else "UPnP"
+                log_request(f"{mapping_kind} public TCP mapping created: {external_address}:{external_port}")
+                try:
+                    if not ipaddress.ip_address(external_address).is_global:
+                        log_request("Warning: router address is not globally routable; ISP carrier-grade NAT may block access")
+                except ValueError:
+                    pass
+
+        def stop_hosting():
+            server = state.get("server")
+            if not server:
+                return
+            state["server"] = None
+            remove_public_mapping()
+            threading.Thread(target=lambda: (server.shutdown(), server.server_close()), daemon=True).start()
+            host_status.set("Stopped")
+            start_button.configure(state=tk.NORMAL)
+            stop_button.configure(state=tk.DISABLED)
+            open_button.configure(state=tk.DISABLED)
+            copy_button.configure(state=tk.DISABLED)
+            log_request("Server stopped")
+
+        def copy_url():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(url_var.get())
+            host_status.set("URL copied")
+
+        start_button.configure(command=start_hosting)
+        stop_button.configure(command=stop_hosting)
+        open_button.configure(command=lambda: webbrowser.open(url_var.get()))
+        copy_button.configure(command=copy_url)
+
+        traffic_header = tk.Frame(traffic, bg=surface)
+        traffic_header.pack(fill=tk.X, padx=10, pady=(10, 4))
+        traffic_status = tk.StringVar(value="Loading network data...")
+        tk.Label(traffic_header, textvariable=traffic_status, bg=surface, fg=foreground,
+                 font=("Courier New", 10, "bold"), anchor=tk.W).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        auto_refresh = tk.BooleanVar(value=True)
+        tk.Checkbutton(traffic_header, text="Auto refresh", variable=auto_refresh,
+                       bg=surface, fg=foreground, selectcolor=surface).pack(side=tk.RIGHT)
+        columns = ("protocol", "local", "remote", "status", "pid")
+        connection_list = ttk.Treeview(traffic, columns=columns, show="headings", height=19)
+        headings = {"protocol": "Protocol", "local": "Local address", "remote": "Remote address",
+                    "status": "State", "pid": "PID"}
+        widths = {"protocol": 75, "local": 220, "remote": 220, "status": 110, "pid": 75}
+        for column in columns:
+            connection_list.heading(column, text=headings[column])
+            connection_list.column(column, width=widths[column], anchor=tk.W)
+        connection_scroll = ttk.Scrollbar(traffic, orient=tk.VERTICAL, command=connection_list.yview)
+        connection_list.configure(yscrollcommand=connection_scroll.set)
+        connection_scroll.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10), pady=(0, 8))
+        connection_list.pack(fill=tk.BOTH, expand=True, padx=(10, 0), pady=(0, 8))
+
+        def address_text(address):
+            if not address:
+                return ""
+            try:
+                return f"{address.ip}:{address.port}"
+            except AttributeError:
+                return str(address)
+
+        def refresh_traffic():
+            state["refresh"] = None
+            if state["closing"] or not window.frame.winfo_exists():
+                return
+            rows, summary = [], ""
+            try:
+                import psutil
+                counters = psutil.net_io_counters()
+                now = time.monotonic()
+                previous, previous_time = state["last_io"], state["last_time"]
+                state["last_io"], state["last_time"] = counters, now
+                if previous and previous_time:
+                    elapsed = max(.001, now - previous_time)
+                    down = (counters.bytes_recv - previous.bytes_recv) / elapsed / 1024
+                    up = (counters.bytes_sent - previous.bytes_sent) / elapsed / 1024
+                    summary = f"Download {down:,.1f} KB/s   Upload {up:,.1f} KB/s"
+                else:
+                    summary = f"Received {counters.bytes_recv/1048576:,.1f} MB   Sent {counters.bytes_sent/1048576:,.1f} MB"
+                for connection in psutil.net_connections(kind="inet"):
+                    protocol = "TCP" if connection.type == socket.SOCK_STREAM else "UDP"
+                    rows.append((protocol, address_text(connection.laddr), address_text(connection.raddr),
+                                 connection.status or "-", connection.pid or "-"))
+            except (ImportError, OSError, PermissionError) as error:
+                summary = f"Limited view: {error}"
+                try:
+                    output = subprocess.run(
+                        ["netstat", "-ano"], capture_output=True, text=True, timeout=4,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    ).stdout
+                    for line in output.splitlines():
+                        parts = line.split()
+                        if parts and parts[0].upper() in {"TCP", "UDP"} and len(parts) >= 4:
+                            if parts[0].upper() == "TCP" and len(parts) >= 5:
+                                rows.append((parts[0], parts[1], parts[2], parts[3], parts[4]))
+                            elif parts[0].upper() == "UDP":
+                                rows.append((parts[0], parts[1], parts[2], "-", parts[3]))
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            connection_list.delete(*connection_list.get_children())
+            for row in sorted(rows, key=lambda value: (value[0], value[1]))[:1000]:
+                connection_list.insert("", tk.END, values=row)
+            traffic_status.set(f"{summary}   |   {len(rows)} connections")
+            if auto_refresh.get():
+                state["refresh"] = self.root.after(2000, refresh_traffic)
+
+        refresh_button = tk.Button(traffic_header, text="Refresh Now", command=refresh_traffic)
+        refresh_button.pack(side=tk.RIGHT, padx=6)
+
+        def close_network_app(event=None):
+            if event is not None and event.widget is not window.frame:
+                return
+            state["closing"] = True
+            if state["refresh"] is not None:
+                try:
+                    self.root.after_cancel(state["refresh"])
+                except tk.TclError:
+                    pass
+            server = state.get("server")
+            if server:
+                state["server"] = None
+                remove_public_mapping()
+                threading.Thread(target=lambda: (server.shutdown(), server.server_close()), daemon=True).start()
+
+        window.frame.bind("<Destroy>", close_network_app, add="+")
+        refresh_traffic()
+        self.root.after(400, scan_router_ports)
 
     def open_messenger(self):
         """Open the LAN peer-to-peer text and image messenger."""
@@ -4273,6 +6124,233 @@ def build(app, window):
         add_expression("y = x^2 / 5")
         display.focus_set()
 
+    def open_paint(self, path=None):
+        """Open a compact bitmap paint program with common drawing tools."""
+        try:
+            from PIL import Image, ImageDraw, ImageTk
+        except ImportError:
+            messagebox.showerror(
+                "Paint", f"Paint requires Pillow. Install it with:\n{sys.executable} -m pip install Pillow",
+                parent=self.root,
+            )
+            return
+
+        window = self.create_window("Paint", width=900, height=650)
+        surface = self.preferences.get("surface_bg", "#ffffff")
+        foreground = self.preferences.get("text_fg", "#000000")
+        toolbar = tk.Frame(window.content, bg=surface, relief=tk.RAISED, bd=1)
+        toolbar.pack(fill=tk.X)
+        workspace = tk.Frame(window.content, bg="#777777")
+        workspace.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(workspace, width=800, height=520, bg="white", highlightthickness=1,
+                           highlightbackground="#333333", cursor="crosshair")
+        canvas.pack(expand=True, padx=12, pady=10)
+        status = tk.StringVar(value="Pencil selected")
+        tk.Label(window.content, textvariable=status, bg=surface, fg=foreground,
+                 anchor=tk.W).pack(fill=tk.X, padx=6, pady=3)
+
+        state = {
+            "image": Image.new("RGB", (800, 520), "white"), "photo": None,
+            "tool": "pencil", "color": "#000000", "size": 4, "start": None,
+            "last": None, "preview": None, "history": [], "path": None,
+        }
+        tool_buttons = {}
+
+        def render():
+            state["photo"] = ImageTk.PhotoImage(state["image"])
+            canvas.delete("bitmap")
+            canvas.create_image(0, 0, image=state["photo"], anchor=tk.NW, tags="bitmap")
+            canvas.tag_lower("bitmap")
+
+        def snapshot():
+            state["history"].append(state["image"].copy())
+            if len(state["history"]) > 30:
+                del state["history"][0]
+
+        def select_tool(tool):
+            state["tool"] = tool
+            for name, button in tool_buttons.items():
+                button.configure(relief=tk.SUNKEN if name == tool else tk.RAISED)
+            status.set(f"{tool.title()} selected")
+
+        def choose_color():
+            chosen = colorchooser.askcolor(state["color"], title="Paint colour", parent=self.root)[1]
+            if chosen:
+                state["color"] = chosen
+                color_swatch.configure(bg=chosen)
+
+        def undo():
+            if state["history"]:
+                state["image"] = state["history"].pop()
+                render()
+                status.set("Undid last action")
+
+        def clear_image():
+            if messagebox.askyesno("Paint", "Clear the entire canvas?", parent=self.root):
+                snapshot()
+                ImageDraw.Draw(state["image"]).rectangle(
+                    (0, 0, state["image"].width, state["image"].height), fill="white"
+                )
+                render()
+                status.set("Canvas cleared")
+
+        def new_image():
+            if messagebox.askyesno("Paint", "Start a new blank image?", parent=self.root):
+                snapshot()
+                state["image"] = Image.new("RGB", (800, 520), "white")
+                state["path"] = None
+                canvas.configure(width=800, height=520)
+                render()
+                status.set("New 800 x 520 image")
+
+        def open_image():
+            filename = filedialog.askopenfilename(
+                title="Open image", filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.gif"),
+                                                ("All files", "*.*")]
+            )
+            if not filename:
+                return
+            try:
+                image = Image.open(filename).convert("RGB")
+                image.thumbnail((800, 520), Image.Resampling.LANCZOS)
+                snapshot()
+                state["image"] = image
+                state["path"] = filename
+                canvas.configure(width=image.width, height=image.height)
+                render()
+                status.set(f"Opened {Path(filename).name} ({image.width} x {image.height})")
+            except (OSError, ValueError) as error:
+                messagebox.showerror("Paint", f"Could not open image:\n{error}", parent=self.root)
+
+        def save_image(save_as=False):
+            filename = state["path"]
+            if save_as or not filename:
+                filename = filedialog.asksaveasfilename(
+                    title="Save image", defaultextension=".png",
+                    filetypes=[("PNG image", "*.png"), ("JPEG image", "*.jpg"),
+                               ("Bitmap image", "*.bmp")]
+                )
+            if not filename:
+                return
+            try:
+                image = state["image"]
+                if Path(filename).suffix.casefold() in {".jpg", ".jpeg"}:
+                    image = image.convert("RGB")
+                image.save(filename)
+                state["path"] = filename
+                status.set(f"Saved {Path(filename).name}")
+            except (OSError, ValueError) as error:
+                messagebox.showerror("Paint", f"Could not save image:\n{error}", parent=self.root)
+
+        def point(event):
+            return (max(0, min(state["image"].width - 1, int(event.x))),
+                    max(0, min(state["image"].height - 1, int(event.y))))
+
+        def shape_coords(first, second):
+            return (min(first[0], second[0]), min(first[1], second[1]),
+                    max(first[0], second[0]), max(first[1], second[1]))
+
+        def update_size(event=None):
+            try:
+                state["size"] = max(1, min(30, int(size_box.get())))
+            except ValueError:
+                pass
+
+        def press(event):
+            position = point(event)
+            snapshot()
+            state["start"] = state["last"] = position
+            tool = state["tool"]
+            if tool == "fill":
+                try:
+                    ImageDraw.floodfill(state["image"], position, state["color"], thresh=8)
+                except (ValueError, IndexError):
+                    pass
+                render()
+                state["start"] = state["last"] = None
+            elif tool in {"pencil", "brush", "eraser"}:
+                draw = ImageDraw.Draw(state["image"])
+                color = "white" if tool == "eraser" else state["color"]
+                width = 1 if tool == "pencil" else state["size"] * (2 if tool == "eraser" else 1)
+                x, y = position
+                draw.ellipse((x-width/2, y-width/2, x+width/2, y+width/2), fill=color)
+                render()
+
+        def drag(event):
+            if state["start"] is None:
+                return
+            current = point(event)
+            tool = state["tool"]
+            if tool in {"pencil", "brush", "eraser"}:
+                color = "white" if tool == "eraser" else state["color"]
+                width = 1 if tool == "pencil" else state["size"] * (2 if tool == "eraser" else 1)
+                ImageDraw.Draw(state["image"]).line((*state["last"], *current), fill=color,
+                                                     width=width, joint="curve")
+                state["last"] = current
+                render()
+            else:
+                canvas.delete("preview")
+                coords = (*state["start"], *current) if tool == "line" else shape_coords(
+                    state["start"], current
+                )
+                creator = {"line": canvas.create_line, "rectangle": canvas.create_rectangle,
+                           "ellipse": canvas.create_oval}.get(tool)
+                if creator:
+                    creator(*coords, fill=state["color"] if tool == "line" else "",
+                            outline=state["color"], width=state["size"], tags="preview")
+
+        def release(event):
+            if state["start"] is None:
+                return
+            end, start, tool = point(event), state["start"], state["tool"]
+            canvas.delete("preview")
+            draw = ImageDraw.Draw(state["image"])
+            coords = (*start, *end) if tool == "line" else shape_coords(start, end)
+            if tool == "line":
+                draw.line(coords, fill=state["color"], width=state["size"])
+            elif tool == "rectangle":
+                draw.rectangle(coords, outline=state["color"], width=state["size"])
+            elif tool == "ellipse":
+                draw.ellipse(coords, outline=state["color"], width=state["size"])
+            state["start"] = state["last"] = None
+            render()
+
+        for label, command in (("New", new_image), ("Open", open_image), ("Save", save_image),
+                               ("Save As", lambda: save_image(True)), ("Undo", undo),
+                               ("Clear", clear_image)):
+            tk.Button(toolbar, text=label, command=command).pack(side=tk.LEFT, padx=2, pady=4)
+        tk.Frame(toolbar, width=2, bg="#888888").pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=3)
+        for tool, label in (("pencil", "Pencil"), ("brush", "Brush"), ("eraser", "Eraser"),
+                            ("line", "Line"), ("rectangle", "Rectangle"),
+                            ("ellipse", "Ellipse"), ("fill", "Fill")):
+            button = tk.Button(toolbar, text=label, command=lambda value=tool: select_tool(value))
+            button.pack(side=tk.LEFT, padx=1, pady=4)
+            tool_buttons[tool] = button
+        color_swatch = tk.Button(toolbar, text="Colour", bg=state["color"], fg="white",
+                                 command=choose_color)
+        color_swatch.pack(side=tk.LEFT, padx=5, pady=4)
+        tk.Label(toolbar, text="Size", bg=surface, fg=foreground).pack(side=tk.LEFT)
+        size_box = ttk.Spinbox(toolbar, from_=1, to=30, width=3,
+                               command=update_size)
+        size_box.set(state["size"])
+        size_box.pack(side=tk.LEFT, padx=3)
+        size_box.bind("<KeyRelease>", update_size)
+        canvas.bind("<ButtonPress-1>", press)
+        canvas.bind("<B1-Motion>", drag)
+        canvas.bind("<ButtonRelease-1>", release)
+        select_tool("pencil")
+        render()
+        if path:
+            state["path"] = str(path)
+            try:
+                image = Image.open(path).convert("RGB")
+                image.thumbnail((800, 520), Image.Resampling.LANCZOS)
+                state["image"] = image
+                canvas.configure(width=image.width, height=image.height)
+                render()
+            except (OSError, ValueError) as error:
+                status.set(f"Could not open image: {error}")
+
     def open_image_viewer(self, path=None):
         """Open an embedded image viewer for a file path."""
         try:
@@ -4761,119 +6839,6 @@ def build(app, window):
         run_check()
         return window
 
-    def open_dispenser(self):
-        """Open the Dispenser, a dot matrix printer that prints sausage pixel art."""
-        surface_bg = self.preferences["surface_bg"]
-        text_fg = self.preferences["text_fg"]
-        window = self.create_window("Dispenser", width=700, height=520)
-
-        scale = 10
-        art_width = len(DISPENSER_ARTWORK[0][0]) * scale
-        line_height = 20
-
-        scrollbar = tk.Scrollbar(window.content, orient=tk.VERTICAL)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 4), pady=8)
-        paper = tk.Canvas(
-            window.content,
-            bg=surface_bg,
-            highlightthickness=0,
-            yscrollcommand=scrollbar.set,
-        )
-        paper.pack(fill=tk.BOTH, expand=True, padx=(8, 0), pady=8)
-        scrollbar.configure(command=paper.yview)
-
-        prompt = tk.Frame(window.content, bg=surface_bg, relief=tk.RAISED, bd=1)
-        tk.Label(
-            prompt,
-            text="Sausage complete. Would you like another sausage?",
-            bg=surface_bg,
-            fg=text_fg,
-        ).pack(side=tk.LEFT, padx=10, pady=8)
-
-        state = {"cursor": 12, "photos": [], "last_rows": None}
-
-        def show_bottom(extent):
-            paper.configure(scrollregion=(0, 0, art_width, extent))
-            paper.yview_moveto(1.0)
-
-        def pick_rows():
-            """Serve a random artwork, never the same sausage twice in a row."""
-            choices = [rows for rows in DISPENSER_ARTWORK if rows is not state["last_rows"]]
-            state["last_rows"] = random.choice(choices)
-            return state["last_rows"]
-
-        def print_art(on_done):
-            rows = pick_rows()
-            photo = tk.PhotoImage(width=art_width, height=len(rows) * scale)
-            state["photos"].append(photo)
-            width = paper.winfo_width()
-            x = max(12, ((width if width > 1 else art_width + 24) - art_width) // 2)
-            top = state["cursor"]
-            paper.create_image(x, top, image=photo, anchor=tk.NW)
-            job = {"row": 0}
-
-            def tick():
-                if not window.frame.winfo_exists():
-                    return
-                if job["row"] >= len(rows):
-                    state["cursor"] = top + len(rows) * scale + line_height
-                    show_bottom(state["cursor"])
-                    on_done()
-                    return
-                colors = (DISPENSER_PALETTE[c] for c in rows[job["row"]])
-                data = "{" + " ".join(" ".join([color] * scale) for color in colors) + "}"
-                photo.put(data, to=(0, job["row"] * scale, art_width, (job["row"] + 1) * scale))
-                job["row"] += 1
-                show_bottom(top + job["row"] * scale + line_height)
-                self.root.after(45, tick)
-
-            tick()
-
-        def print_text(message, on_done):
-            item = paper.create_text(
-                12, state["cursor"], anchor=tk.NW, fill=text_fg,
-                font=("Courier New", 10), text="",
-            )
-            job = {"shown": 0}
-
-            def tick():
-                if not window.frame.winfo_exists():
-                    return
-                job["shown"] += 2
-                paper.itemconfigure(item, text=message[:job["shown"]])
-                show_bottom(state["cursor"] + line_height)
-                if job["shown"] >= len(message):
-                    state["cursor"] += line_height
-                    on_done()
-                else:
-                    self.root.after(25, tick)
-
-            tick()
-
-        def show_prompt():
-            prompt.pack(side=tk.BOTTOM, fill=tk.X, before=scrollbar)
-
-        def another_sausage():
-            prompt.pack_forget()
-            paper.delete("all")
-            state["photos"].clear()
-            state["cursor"] = 12
-            show_bottom(1)
-            print_art(show_prompt)
-
-        def refuse_sausage():
-            prompt.pack_forget()
-            print_text(
-                "You selected No, but everyone loves sausages, so here's another one.",
-                lambda: print_art(show_prompt),
-            )
-
-        tk.Button(prompt, text="No", width=6, command=refuse_sausage).pack(side=tk.RIGHT, padx=(4, 10), pady=6)
-        tk.Button(prompt, text="Yes", width=6, command=another_sausage).pack(side=tk.RIGHT, padx=4, pady=6)
-
-        print_art(show_prompt)
-        return window
-
     def open_text_editor(self, path=None):
         """Open an embedded text editor window."""
         file_path = Path(path) if path else Path.home() / "untitled.txt"
@@ -5047,7 +7012,11 @@ def build(app, window):
             return
 
         window = self.create_window("Media Player", width=840, height=560)
-        state = {"loaded": False, "seeking": False, "closed": False, "muted": False}
+        state = {
+            "loaded": False, "seeking": False, "closed": False, "muted": False,
+            "backend": "vlc", "midi_alias": None, "volume": 80,
+            "midi_source": None, "midi_channels": {}, "edited_midi": None,
+        }
         media_holder = {"media": None}
 
         video_surface = tk.Frame(window.content, bg="black")
@@ -5060,6 +7029,149 @@ def build(app, window):
             font=("Courier New", 13, "bold"),
         )
         placeholder.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+        midi_details = scrolledtext.ScrolledText(
+            video_surface, bg="#101010", fg="#f0f0f0", insertbackground="white",
+            font=("Consolas", 10), relief=tk.FLAT, state=tk.DISABLED, wrap=tk.NONE,
+        )
+
+        def show_midi_configuration(selected):
+            try:
+                channels = read_midi_channel_configuration(selected)
+                state["midi_channels"] = channels
+                lines = [f"MIDI CHANNEL CONFIGURATION — {Path(selected).name}", ""]
+                if not channels:
+                    lines.append("No channel events were found.")
+                for channel, info in sorted(channels.items()):
+                    velocities = info["velocities"]
+                    if channel == 9:
+                        instrument = "General MIDI percussion"
+                    else:
+                        program = info["program"]
+                        instrument = f"{GM_INSTRUMENTS[program]} (program {program + 1})"
+                    velocity = (
+                        f"{min(velocities)}–{max(velocities)}, avg {sum(velocities) / len(velocities):.1f}"
+                        if velocities else "No note-on events"
+                    )
+                    pan_label = "center" if info["pan"] == 64 else ("left" if info["pan"] < 64 else "right")
+                    lines.extend([
+                        f"Channel {channel + 1:>2}: {instrument}",
+                        f"  Bank: {info['bank_msb']}:{info['bank_lsb']}   Notes: {info['notes']}   Velocity: {velocity}",
+                        f"  Volume: {info['volume']}   Pan: {info['pan']} ({pan_label})   Expression: {info['expression']}",
+                        "",
+                    ])
+            except Exception as error:
+                lines = ["MIDI CHANNEL CONFIGURATION", "", f"Could not read MIDI metadata: {error}"]
+            midi_details.config(state=tk.NORMAL)
+            midi_details.delete("1.0", tk.END)
+            midi_details.insert("1.0", "\n".join(lines))
+            midi_details.config(state=tk.DISABLED)
+            midi_details.place(x=0, y=0, relwidth=1, relheight=1)
+
+        def edit_midi_channels():
+            channels = state["midi_channels"]
+            if not channels or not state["midi_source"]:
+                messagebox.showinfo("MIDI Channels", "Open a MIDI file with channel events first.")
+                return
+            editor = self.create_window("Edit MIDI Channels", width=570, height=390)
+            body = tk.Frame(editor.content, bg="white")
+            body.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
+            channel_var = tk.StringVar()
+            instrument_var = tk.StringVar()
+            velocity_var = tk.IntVar()
+            volume_edit_var = tk.IntVar()
+            pan_var = tk.IntVar()
+            expression_var = tk.IntVar()
+            pending = {}
+            active_channel = {"number": None}
+
+            tk.Label(body, text="Channel", bg="white").grid(row=0, column=0, sticky="w", pady=5)
+            channel_box = ttk.Combobox(
+                body, textvariable=channel_var, state="readonly",
+                values=[f"Channel {number + 1}" for number in sorted(channels)], width=25,
+            )
+            channel_box.grid(row=0, column=1, sticky="ew", pady=5)
+            tk.Label(body, text="Instrument", bg="white").grid(row=1, column=0, sticky="w", pady=5)
+            instrument_box = ttk.Combobox(
+                body, textvariable=instrument_var, state="readonly",
+                values=[f"{number + 1}: {name}" for number, name in enumerate(GM_INSTRUMENTS)], width=38,
+            )
+            instrument_box.grid(row=1, column=1, sticky="ew", pady=5)
+
+            def add_scale(row, label, variable, low, high):
+                tk.Label(body, text=label, bg="white").grid(row=row, column=0, sticky="w", pady=5)
+                frame = tk.Frame(body, bg="white")
+                frame.grid(row=row, column=1, sticky="ew", pady=5)
+                ttk.Scale(frame, from_=low, to=high, variable=variable).pack(side=tk.LEFT, fill=tk.X, expand=True)
+                tk.Spinbox(frame, from_=low, to=high, textvariable=variable, width=5).pack(side=tk.RIGHT, padx=(8, 0))
+
+            add_scale(2, "Note velocity", velocity_var, 1, 127)
+            add_scale(3, "Channel volume", volume_edit_var, 0, 127)
+            add_scale(4, "Pan (64 = centre)", pan_var, 0, 127)
+            add_scale(5, "Expression", expression_var, 0, 127)
+            body.columnconfigure(1, weight=1)
+
+            def selected_channel():
+                return sorted(channels)[channel_box.current()]
+
+            def remember_current():
+                channel = active_channel["number"]
+                if channel is None:
+                    return
+                pending[channel] = {
+                    "program": instrument_box.current(), "velocity": int(velocity_var.get()),
+                    "volume": int(volume_edit_var.get()), "pan": int(pan_var.get()),
+                    "expression": int(expression_var.get()),
+                }
+
+            def populate_channel(event=None):
+                if channel_box.current() < 0:
+                    return
+                remember_current()
+                channel = selected_channel()
+                info = pending.get(channel, channels[channel])
+                instrument_box.current(info["program"])
+                velocities = info.get("velocities", [])
+                velocity_var.set(info.get("velocity", round(sum(velocities) / len(velocities)) if velocities else 100))
+                volume_edit_var.set(info["volume"])
+                pan_var.set(info["pan"])
+                expression_var.set(info["expression"])
+                active_channel["number"] = channel
+
+            def apply_changes():
+                remember_current()
+                overrides = dict(pending)
+                try:
+                    changed = rewrite_midi_channels(state["midi_source"], overrides)
+                    handle, changed_path = tempfile.mkstemp(prefix="pyos_midi_", suffix=".mid")
+                    with os.fdopen(handle, "wb") as midi_file:
+                        midi_file.write(changed)
+                    old_edited = state["edited_midi"]
+                    state["edited_midi"] = Path(changed_path)
+                    load_media(changed_path, now_playing.get())
+                    if old_edited and old_edited != state["edited_midi"]:
+                        old_edited.unlink(missing_ok=True)
+                    editor.close()
+                except Exception as error:
+                    messagebox.showerror("MIDI Channels", f"Could not apply channel changes: {error}")
+
+            def save_changed_copy():
+                apply_changes()
+                if not state["edited_midi"]:
+                    return
+                destination = filedialog.asksaveasfilename(
+                    parent=self.root, title="Save Edited MIDI", defaultextension=".mid",
+                    filetypes=(("MIDI files", "*.mid *.midi"), ("All files", "*.*")),
+                )
+                if destination:
+                    shutil.copyfile(state["edited_midi"], destination)
+
+            channel_box.bind("<<ComboboxSelected>>", populate_channel)
+            channel_box.current(0)
+            populate_channel()
+            buttons = tk.Frame(body, bg="white")
+            buttons.grid(row=6, column=0, columnspan=2, sticky="e", pady=(14, 0))
+            tk.Button(buttons, text="Apply & Play", command=apply_changes).pack(side=tk.LEFT, padx=4)
+            tk.Button(buttons, text="Apply & Save As", command=save_changed_copy).pack(side=tk.LEFT, padx=4)
 
         now_playing = tk.StringVar(value="No media selected")
         tk.Label(
@@ -5092,23 +7204,86 @@ def build(app, window):
             else:
                 player.set_xwindow(window_id)
 
-        def load_media(selected):
+        def mci(command):
+            """Send a command to Windows' built-in MIDI sequencer."""
+            import ctypes
+
+            buffer = ctypes.create_unicode_buffer(255)
+            error_code = ctypes.windll.winmm.mciSendStringW(command, buffer, len(buffer), 0)
+            if error_code:
+                error_text = ctypes.create_unicode_buffer(255)
+                ctypes.windll.winmm.mciGetErrorStringW(error_code, error_text, len(error_text))
+                raise RuntimeError(error_text.value or f"MCI error {error_code}")
+            return buffer.value
+
+        def set_midi_volume(percent):
+            """Set the Windows MIDI mapper volume without using unsupported MCI commands."""
+            import ctypes
+
+            level = max(0, min(100, int(percent))) * 65535 // 100
+            stereo_volume = level | (level << 16)
+            midi_mapper = ctypes.c_void_p(-1)
+            # Some MIDI drivers do not expose volume control. Playback should
+            # still continue when that optional control is unavailable.
+            ctypes.windll.winmm.midiOutSetVolume(midi_mapper, stereo_volume)
+
+        def close_midi():
+            alias = state["midi_alias"]
+            if alias:
+                try:
+                    mci(f"close {alias}")
+                except Exception:
+                    pass
+                state["midi_alias"] = None
+
+        def stop_current_media():
+            if state["backend"] == "midi":
+                close_midi()
+            else:
+                player.stop()
+
+        def load_media(selected, display_name=None):
             selected = Path(selected)
             if selected.suffix.lower() not in MEDIA_EXTENSIONS:
                 messagebox.showwarning("Media Player", "Choose a supported audio or video file.")
                 return
             try:
-                media = instance.media_new(str(selected.resolve()))
-                player.set_media(media)
-                media_holder["media"] = media
-                set_video_output()
-                player.audio_set_volume(int(volume_var.get()))
+                stop_current_media()
+                is_midi = selected.suffix.lower() in {".mid", ".midi"}
+                is_native_midi = sys.platform == "win32" and is_midi
+                if is_native_midi:
+                    alias = f"pyos_midi_{uuid.uuid4().hex}"
+                    midi_path = str(selected.resolve()).replace('"', '""')
+                    mci(f'open "{midi_path}" type sequencer alias {alias}')
+                    state["midi_alias"] = alias
+                    state["backend"] = "midi"
+                    mci(f"set {alias} time format milliseconds")
+                    set_midi_volume(state["volume"])
+                    mci(f"play {alias}")
+                else:
+                    state["backend"] = "vlc"
+                    media = instance.media_new(str(selected.resolve()))
+                    player.set_media(media)
+                    media_holder["media"] = media
+                    set_video_output()
+                    player.audio_set_volume(int(volume_var.get()))
+                    player.play()
+                if is_midi:
+                    state["midi_source"] = selected
+                    show_midi_configuration(selected)
+                    edit_button.config(state=tk.NORMAL)
+                else:
+                    state["midi_source"] = None
+                    state["midi_channels"] = {}
+                    midi_details.place_forget()
+                    edit_button.config(state=tk.DISABLED)
                 state["loaded"] = True
                 placeholder.place_forget()
-                now_playing.set(selected.name)
-                player.play()
+                now_playing.set(display_name or selected.name)
                 play_button.config(text="Pause")
             except Exception as error:
+                close_midi()
+                state["loaded"] = False
                 messagebox.showerror("Media Player", f"Could not open media: {error}")
 
         def choose_media():
@@ -5118,6 +7293,14 @@ def build(app, window):
         def toggle_playback():
             if not state["loaded"]:
                 choose_media()
+            elif state["backend"] == "midi":
+                alias = state["midi_alias"]
+                if mci(f"status {alias} mode") == "playing":
+                    mci(f"pause {alias}")
+                    play_button.config(text="Play")
+                else:
+                    mci(f"resume {alias}")
+                    play_button.config(text="Pause")
             elif player.is_playing():
                 player.pause()
                 play_button.config(text="Play")
@@ -5127,54 +7310,90 @@ def build(app, window):
 
         def stop_playback():
             if state["loaded"]:
-                player.stop()
+                if state["backend"] == "midi":
+                    alias = state["midi_alias"]
+                    mci(f"stop {alias}")
+                    mci(f"seek {alias} to start")
+                else:
+                    player.stop()
                 seek_var.set(0)
                 play_button.config(text="Play")
 
         def finish_seek(event=None):
             if state["loaded"]:
-                player.set_position(float(seek_var.get()) / 1000.0)
+                if state["backend"] == "midi":
+                    alias = state["midi_alias"]
+                    duration = int(mci(f"status {alias} length"))
+                    position = int(duration * float(seek_var.get()) / 1000.0)
+                    was_playing = mci(f"status {alias} mode") == "playing"
+                    mci(f"seek {alias} to {position}")
+                    if was_playing:
+                        mci(f"play {alias}")
+                else:
+                    player.set_position(float(seek_var.get()) / 1000.0)
             state["seeking"] = False
 
         def set_volume(value):
-            player.audio_set_volume(int(float(value)))
+            state["volume"] = int(float(value))
+            if state["backend"] == "midi" and state["midi_alias"]:
+                set_midi_volume(state["volume"])
+            else:
+                player.audio_set_volume(state["volume"])
             if state["muted"]:
-                player.audio_set_mute(False)
+                if state["backend"] != "midi":
+                    player.audio_set_mute(False)
                 state["muted"] = False
                 mute_button.config(text="Mute")
 
         def toggle_mute():
             state["muted"] = not state["muted"]
-            player.audio_set_mute(state["muted"])
+            if state["backend"] == "midi" and state["midi_alias"]:
+                midi_volume = 0 if state["muted"] else state["volume"]
+                set_midi_volume(midi_volume)
+            else:
+                player.audio_set_mute(state["muted"])
             mute_button.config(text="Unmute" if state["muted"] else "Mute")
 
         def refresh_status():
             if state["closed"]:
                 return
             if state["loaded"]:
-                current = player.get_time()
-                duration = player.get_length()
+                if state["backend"] == "midi":
+                    alias = state["midi_alias"]
+                    current = int(mci(f"status {alias} position"))
+                    duration = int(mci(f"status {alias} length"))
+                    is_playing = mci(f"status {alias} mode") == "playing"
+                    position = current / duration if duration > 0 else 0
+                else:
+                    current = player.get_time()
+                    duration = player.get_length()
+                    is_playing = bool(player.is_playing())
+                    position = max(0, player.get_position())
                 time_var.set(f"{format_time(current)} / {format_time(duration)}")
                 if not state["seeking"] and duration > 0:
-                    seek_var.set(max(0, player.get_position()) * 1000)
-                if not player.is_playing() and current > 0 and duration > 0 and current >= duration - 500:
+                    seek_var.set(position * 1000)
+                if not is_playing and current > 0 and duration > 0 and current >= duration - 500:
                     play_button.config(text="Play")
             self.root.after(250, refresh_status)
 
         def close_player():
             state["closed"] = True
             try:
-                player.stop()
+                stop_current_media()
                 player.release()
                 if media_holder["media"] is not None:
                     media_holder["media"].release()
                 instance.release()
             finally:
+                if state["edited_midi"]:
+                    state["edited_midi"].unlink(missing_ok=True)
                 for handle in dll_handles:
                     handle.close()
                 window.close()
 
         tk.Button(controls, text="Open", command=choose_media).pack(side=tk.LEFT, padx=4, pady=5)
+        edit_button = tk.Button(controls, text="Edit MIDI", command=edit_midi_channels, state=tk.DISABLED)
+        edit_button.pack(side=tk.LEFT, padx=4, pady=5)
         play_button = tk.Button(controls, text="Play", width=8, command=toggle_playback)
         play_button.pack(side=tk.LEFT, padx=4, pady=5)
         tk.Button(controls, text="Stop", width=8, command=stop_playback).pack(side=tk.LEFT, padx=4, pady=5)
@@ -5417,6 +7636,13 @@ def build(app, window):
         url_entry = tk.Entry(toolbar, textvariable=url_var)
         url_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4, pady=5)
 
+        shortcuts_bar = tk.Frame(window.content, bg="#eeeeee", relief=tk.RAISED, bd=1)
+        shortcuts_bar.pack(fill=tk.X)
+        tk.Label(
+            shortcuts_bar, text="SHORTCUTS", bg="#eeeeee", fg="#333333",
+            font=("Courier New", 8, "bold"),
+        ).pack(side=tk.LEFT, padx=(6, 4), pady=3)
+
         status_var = tk.StringVar(value="Ready")
         javascript_enabled = tk.BooleanVar(value=False)
         status_label = tk.Label(window.content, textvariable=status_var, bg="white", fg="black", anchor=tk.W)
@@ -5538,6 +7764,10 @@ def build(app, window):
             except (OSError, ValueError) as e:
                 set_source_content(f"Network error:\n{e}")
                 update_network_status("Load failed")
+
+        def open_shortcut(target):
+            url_var.set(target)
+            load_url()
 
         def inspect_page():
             if page_cache["data"] is None:
@@ -5666,6 +7896,23 @@ def build(app, window):
             padx=4,
             pady=4,
         )
+        browser_shortcuts = (
+            ("Search", "https://www.bing.com"),
+            ("Wikipedia", "https://en.wikipedia.org"),
+            ("YouTube", "https://www.youtube.com"),
+            ("GitHub", "https://github.com"),
+            ("BBC News", "https://www.bbc.com/news"),
+            ("Archive", "https://archive.org"),
+            ("Maps", "https://www.openstreetmap.org"),
+        )
+        for label, target in browser_shortcuts:
+            tk.Button(
+                shortcuts_bar, text=label,
+                command=lambda url=target: open_shortcut(url),
+                bg="#eeeeee", fg="#111111", relief=tk.FLAT,
+                activebackground="#111111", activeforeground="#ffffff",
+                font=("Courier New", 8), padx=5, pady=1,
+            ).pack(side=tk.LEFT, padx=1, pady=2)
         url_entry.bind("<Return>", load_url)
         if renderer["html_frame"]:
             update_network_status("Ready | HTML/CSS renderer active | JavaScript off")
@@ -5719,6 +7966,7 @@ Features:
     def open_settings(self):
         """Open functional, persistent desktop settings."""
         window = self.create_window("Settings", width=620, height=500)
+        theme_name = tk.StringVar(value=self.preferences.get("theme_name", "Classic"))
         desktop_color = tk.StringVar(value=self.preferences["desktop_bg"])
         background_mode = tk.StringVar(value=self.preferences["background_mode"])
         background_image = tk.StringVar(value=self.preferences["background_image"])
@@ -5734,6 +7982,21 @@ Features:
         start_location = tk.StringVar(value=self.preferences["file_manager_start"])
         notifications_enabled = tk.BooleanVar(value=self.preferences["notifications_enabled"])
         tips_enabled = tk.BooleanVar(value=self.preferences["tips_enabled"])
+        large_text = tk.BooleanVar(value=self.preferences["accessibility_large_text"])
+        dyslexia_font = tk.BooleanVar(value=self.preferences["accessibility_dyslexia_font"])
+        large_controls = tk.BooleanVar(value=self.preferences["accessibility_large_controls"])
+        enhanced_focus = tk.BooleanVar(value=self.preferences["accessibility_enhanced_focus"])
+        reduced_motion = tk.BooleanVar(value=self.preferences["accessibility_reduced_motion"])
+        visual_alerts = tk.BooleanVar(value=self.preferences["accessibility_visual_alerts"])
+        audible_alerts = tk.BooleanVar(value=self.preferences["accessibility_audible_alerts"])
+        persistent_notifications = tk.BooleanVar(
+            value=self.preferences["accessibility_persistent_notifications"]
+        )
+        automatic_updates = tk.BooleanVar(value=self.preferences.get("automatic_updates", True))
+        update_channel = tk.StringVar(value=(
+            self.preferences.get("update_channel", "stable")
+            if self.preferences.get("update_channel") in {"stable", "unstable"} else "stable"
+        ))
         status = tk.StringVar()
 
         notebook = ttk.Notebook(window.content)
@@ -5743,14 +8006,33 @@ Features:
         files = tk.Frame(notebook, bg="white")
         security = tk.Frame(notebook, bg="white")
         notifications = tk.Frame(notebook, bg="white")
+        accessibility = tk.Frame(notebook, bg="white")
+        updates = tk.Frame(notebook, bg="white")
         notebook.add(appearance, text="Appearance")
         notebook.add(clock, text="Clock")
         notebook.add(files, text="Files")
         notebook.add(security, text="Security")
         notebook.add(notifications, text="Notifications")
+        notebook.add(accessibility, text="Accessibility")
+        notebook.add(updates, text="Updates")
+
+        tk.Label(appearance, text="THEME", font=("Courier New", 11, "bold"), anchor=tk.W).pack(
+            fill=tk.X, padx=16, pady=(10, 3)
+        )
+        theme_row = tk.Frame(appearance, bg="white")
+        theme_row.pack(fill=tk.X, padx=16, pady=(0, 2))
+        theme_picker = ttk.Combobox(
+            theme_row, textvariable=theme_name,
+            values=tuple(THEME_PRESETS) + ("Custom",), state="readonly", width=22,
+        )
+        theme_picker.pack(side=tk.LEFT)
+        theme_description = tk.StringVar()
+        tk.Label(
+            appearance, textvariable=theme_description, anchor=tk.W, justify=tk.LEFT,
+        ).pack(fill=tk.X, padx=16, pady=(0, 5))
 
         tk.Label(appearance, text="BACKGROUND", font=("Courier New", 11, "bold"), anchor=tk.W).pack(
-            fill=tk.X, padx=16, pady=(10, 3)
+            fill=tk.X, padx=16, pady=(4, 3)
         )
         mode_row = tk.Frame(appearance, bg="white")
         mode_row.pack(fill=tk.X, padx=16, pady=2)
@@ -5791,6 +8073,8 @@ Features:
             if selected:
                 variable.set(selected)
                 swatch.configure(bg=selected, activebackground=selected)
+                theme_name.set("Custom")
+                theme_description.set("Your own colour and font combination.")
 
         for label_text, variable in color_rows:
             row = tk.Frame(appearance, bg="white")
@@ -5802,18 +8086,51 @@ Features:
             color_swatches.append((variable, swatch))
             tk.Label(row, textvariable=variable, width=9, anchor=tk.W).pack(side=tk.LEFT)
 
+        def select_theme(event=None):
+            preset = THEME_PRESETS.get(theme_name.get())
+            if preset is None:
+                theme_description.set("Your own colour and font combination.")
+                return
+            desktop_color.set(preset["desktop_bg"])
+            surface_color.set(preset["surface_bg"])
+            text_color.set(preset["text_fg"])
+            chrome_color.set(preset["chrome_bg"])
+            chrome_text_color.set(preset["chrome_fg"])
+            font_family.set(preset["font_family"])
+            font_size.set(preset["font_size"])
+            background_mode.set("solid")
+            for variable, swatch in color_swatches:
+                swatch.configure(bg=variable.get(), activebackground=variable.get())
+            theme_description.set(preset["description"])
+
+        theme_picker.bind("<<ComboboxSelected>>", select_theme)
+        current_preset = THEME_PRESETS.get(theme_name.get())
+        theme_description.set(
+            current_preset["description"] if current_preset else "Your own colour and font combination."
+        )
+
         font_row = tk.Frame(appearance, bg="white")
         font_row.pack(fill=tk.X, padx=16, pady=(8, 4))
         tk.Label(font_row, text="Interface font size:").pack(side=tk.LEFT)
-        tk.Spinbox(font_row, from_=8, to=14, textvariable=font_size, width=5).pack(side=tk.LEFT, padx=10)
+        font_size_box = tk.Spinbox(font_row, from_=8, to=14, textvariable=font_size, width=5)
+        font_size_box.pack(side=tk.LEFT, padx=10)
         family_row = tk.Frame(appearance, bg="white")
         family_row.pack(fill=tk.X, padx=16, pady=(2, 6))
         tk.Label(family_row, text="Text font:").pack(side=tk.LEFT)
         available_fonts = sorted(set(tkfont.families(self.root)), key=str.casefold)
-        ttk.Combobox(
+        family_picker = ttk.Combobox(
             family_row, textvariable=font_family, values=available_fonts,
             state="readonly", width=28,
-        ).pack(side=tk.LEFT, padx=10)
+        )
+        family_picker.pack(side=tk.LEFT, padx=10)
+
+        def mark_theme_custom(event=None):
+            theme_name.set("Custom")
+            theme_description.set("Your own colour and font combination.")
+
+        family_picker.bind("<<ComboboxSelected>>", mark_theme_custom)
+        font_size_box.configure(command=mark_theme_custom)
+        font_size_box.bind("<KeyRelease>", mark_theme_custom)
 
         tk.Label(clock, text="TASKBAR CLOCK", font=("Courier New", 11, "bold"), anchor=tk.W).pack(
             fill=tk.X, padx=16, pady=(18, 8)
@@ -5862,6 +8179,88 @@ Features:
             text="Turning off system notifications also suppresses tips.\nChanges apply after pressing Apply.",
             justify=tk.LEFT, anchor=tk.W,
         ).pack(fill=tk.X, padx=16, pady=10)
+
+        tk.Label(
+            accessibility, text="ACCESSIBILITY", font=("Courier New", 11, "bold"), anchor=tk.W,
+        ).pack(fill=tk.X, padx=16, pady=(14, 3))
+        tk.Label(
+            accessibility,
+            text="Features support vision, motor, hearing, cognitive, and sensory access needs.",
+            anchor=tk.W, wraplength=550, justify=tk.LEFT,
+        ).pack(fill=tk.X, padx=16, pady=(0, 7))
+
+        def accessibility_group(title, options):
+            tk.Label(accessibility, text=title, font=("Courier New", 10, "bold"),
+                     anchor=tk.W).pack(fill=tk.X, padx=16, pady=(7, 1))
+            for label, variable in options:
+                tk.Checkbutton(accessibility, text=label, variable=variable, anchor=tk.W,
+                               takefocus=True).pack(fill=tk.X, padx=25, pady=1)
+
+        accessibility_group("VISION AND READING", (
+            ("Large interface text", large_text),
+            ("Use a simple dyslexia-friendly sans-serif font", dyslexia_font),
+            ("Enhanced keyboard focus outlines", enhanced_focus),
+        ))
+        high_contrast = tk.BooleanVar(value=theme_name.get() == "High Contrast")
+        tk.Checkbutton(
+            accessibility, text="Use the High Contrast theme", variable=high_contrast,
+            anchor=tk.W, takefocus=True,
+        ).pack(fill=tk.X, padx=25, pady=1)
+        accessibility_group("MOTOR AND SENSORY", (
+            ("Larger buttons and control targets", large_controls),
+            ("Reduce flashing and non-essential motion", reduced_motion),
+        ))
+        accessibility_group("NOTIFICATION ACCESS", (
+            ("Visual alert flash", visual_alerts),
+            ("Audible alert tone", audible_alerts),
+            ("Keep notifications visible until dismissed", persistent_notifications),
+        ))
+        tk.Label(
+            accessibility,
+            text="Tip: Tab and Shift+Tab move between controls; Space activates buttons and choices.",
+            anchor=tk.W, wraplength=550, justify=tk.LEFT,
+        ).pack(fill=tk.X, padx=16, pady=(8, 4))
+
+        tk.Label(updates, text="PYOS UPDATES", font=("Courier New", 11, "bold"),
+                 anchor=tk.W).pack(fill=tk.X, padx=16, pady=(18, 6))
+        tk.Label(
+            updates,
+            text="pyOS checks github.com/aardaqadis/pyOS. Updates are never downloaded or installed "
+                 "until you approve the version shown in the confirmation dialog.",
+            justify=tk.LEFT, anchor=tk.W, wraplength=550,
+        ).pack(fill=tk.X, padx=16, pady=(0, 10))
+        tk.Checkbutton(
+            updates, text="Automatically check for new versions", variable=automatic_updates,
+            anchor=tk.W,
+        ).pack(fill=tk.X, padx=16, pady=4)
+        tk.Label(updates, text="UPDATE CHANNEL", font=("Courier New", 10, "bold"),
+                 anchor=tk.W).pack(fill=tk.X, padx=16, pady=(12, 3))
+        tk.Radiobutton(
+            updates, text="Stable — tested GitHub releases", variable=update_channel,
+            value="stable", anchor=tk.W,
+        ).pack(fill=tk.X, padx=25, pady=3)
+        tk.Radiobutton(
+            updates, text="Unstable — every new commit on the main branch", variable=update_channel,
+            value="unstable", anchor=tk.W,
+        ).pack(fill=tk.X, padx=25, pady=3)
+        tk.Label(
+            updates,
+            text="Unstable versions arrive sooner but may contain incomplete or breaking changes. "
+                 "Overwritten source files are backed up in the pyOS data directory.",
+            justify=tk.LEFT, anchor=tk.W, wraplength=550,
+        ).pack(fill=tk.X, padx=16, pady=10)
+
+        def check_updates_now():
+            self.preferences["update_channel"] = update_channel.get()
+            self.preferences["automatic_updates"] = bool(automatic_updates.get())
+            self.preferences["update_skipped_ref"] = ""
+            self.save_preferences()
+            status.set("Checking GitHub for updates...")
+            self.check_for_updates(manual=True)
+
+        tk.Button(updates, text="Check Now", command=check_updates_now).pack(
+            anchor=tk.W, padx=16, pady=5
+        )
 
         account_name = tk.StringVar(value=get_username() or "Not configured")
         tk.Label(security, text="PYOS ACCOUNT", font=("Courier New", 11, "bold"), anchor=tk.W).pack(
@@ -5958,7 +8357,19 @@ Features:
                 if not Path(selected_background).is_file() or Path(selected_background).suffix.lower() not in IMAGE_EXTENSIONS:
                     messagebox.showerror("Settings", "Choose a supported image file for the desktop background.")
                     return
+            if high_contrast.get():
+                theme_name.set("High Contrast")
+                select_theme()
+                selected_size = int(font_size.get())
+            if large_text.get():
+                selected_size = max(selected_size, 12)
+                font_size.set(selected_size)
+            selected_family = font_family.get() or "Courier New"
+            if dyslexia_font.get():
+                selected_family = "Arial"
+                font_family.set(selected_family)
             self.preferences.update({
+                "theme_name": theme_name.get(),
                 "desktop_inverted": False,
                 "desktop_bg": desktop_color.get(),
                 "background_mode": background_mode.get(),
@@ -5968,13 +8379,23 @@ Features:
                 "chrome_bg": chrome_color.get(),
                 "chrome_fg": chrome_text_color.get(),
                 "font_size": selected_size,
-                "font_family": font_family.get() or "Courier New",
+                "font_family": selected_family,
                 "clock_24h": bool(clock_24h.get()),
                 "show_seconds": bool(seconds.get()),
                 "show_hidden_files": bool(hidden.get()),
                 "file_manager_start": start_location.get(),
                 "notifications_enabled": bool(notifications_enabled.get()),
                 "tips_enabled": bool(tips_enabled.get()),
+                "accessibility_large_text": bool(large_text.get()),
+                "accessibility_dyslexia_font": bool(dyslexia_font.get()),
+                "accessibility_large_controls": bool(large_controls.get()),
+                "accessibility_enhanced_focus": bool(enhanced_focus.get()),
+                "accessibility_reduced_motion": bool(reduced_motion.get()),
+                "accessibility_visual_alerts": bool(visual_alerts.get()),
+                "accessibility_audible_alerts": bool(audible_alerts.get()),
+                "accessibility_persistent_notifications": bool(persistent_notifications.get()),
+                "automatic_updates": bool(automatic_updates.get()),
+                "update_channel": update_channel.get(),
             })
             self.apply_preferences()
             self.apply_notification_preferences()
@@ -5982,23 +8403,26 @@ Features:
             status.set("Settings applied and saved.")
 
         def restore_defaults():
-            desktop_color.set("#ffffff")
-            background_mode.set("solid")
+            theme_name.set("Classic")
+            select_theme()
             background_image.set("")
-            surface_color.set("#ffffff")
-            text_color.set("#000000")
-            chrome_color.set("#000000")
-            chrome_text_color.set("#ffffff")
-            for variable, swatch in color_swatches:
-                swatch.configure(bg=variable.get(), activebackground=variable.get())
-            font_size.set(9)
-            font_family.set("Courier New")
             clock_24h.set(True)
             seconds.set(True)
             hidden.set(False)
             start_location.set("Home")
             notifications_enabled.set(True)
             tips_enabled.set(True)
+            large_text.set(False)
+            dyslexia_font.set(False)
+            large_controls.set(False)
+            enhanced_focus.set(False)
+            reduced_motion.set(False)
+            visual_alerts.set(False)
+            audible_alerts.set(False)
+            persistent_notifications.set(False)
+            high_contrast.set(False)
+            automatic_updates.set(True)
+            update_channel.set("stable")
             apply_settings()
 
         footer = tk.Frame(window.content, bg="white", relief=tk.RAISED, bd=1)
@@ -6133,556 +8557,24 @@ Features:
         messagebox.showinfo("Refresh", "Desktop refreshed!")
 
 
-# Dispenser artwork: 48x32 pixel-art sausage scenes, one char per pixel,
-# rendered through DISPENSER_PALETTE by open_dispenser.
-DISPENSER_PALETTE = {
-    ".": "#f2ecdc",
-    "w": "#ffffff",
-    "0": "#141317",
-    "K": "#33180d",
-    "B": "#5f2a12",
-    "b": "#7d3c18",
-    "r": "#9c4f1e",
-    "o": "#b96530",
-    "h": "#d98a4e",
-    "H": "#f0b476",
-    "R": "#c22321",
-    "Y": "#e0a512",
-    "y": "#f4cf47",
-    "n": "#c98f4b",
-    "N": "#e8bd7d",
-    "e": "#f7f1df",
-    "E": "#f2b21b",
-    "v": "#6f9c2c",
-    "G": "#26251f",
-    "g": "#4a4a48",
-    "m": "#8b8b8b",
-    "M": "#c9c9c4",
-    "S": "#dedbcd",
-    "F": "#e6541c",
-    "f": "#f7952b",
-    "W": "#ffe8a3",
-    "c": "#8fd3f0",
-    "C": "#4ba3d8",
-    "u": "#2a6fb0",
-    "p": "#f4a25b",
-    "P": "#e2643c",
-    "q": "#a03a56",
-    "Q": "#5c2a5e",
-    "D": "#221a3e",
-    "d": "#37306b",
-    "*": "#f7f3d0",
-    "s": "#ffd94a",
-    "t": "#3f7d3a",
-    "T": "#295c2d",
-    "a": "#2e6e8e",
-    "A": "#7fc4d8",
-    "k": "#6b4a2f",
-    "l": "#8a6a43",
-    "x": "#5a5566",
-    "X": "#38344a",
-    "z": "#c7b9a5",
-    "1": "#f0c29a",
-    "2": "#d99b6b",
-    "3": "#b06f44",
-    "4": "#8a5a33",
-    "5": "#5e3a20",
-    "L": "#d95f5f",
-    "i": "#f6ead2",
-}
-
-DISPENSER_ARTWORK = (
-    (
-        "................................................",
-        "................................................",
-        "................................................",
-        "................................................",
-        "................................................",
-        "................................................",
-        "................................................",
-        "........................S.......................",
-        ".......................S........................",
-        "................S......S........S...............",
-        "...............S........S......S................",
-        "...............S.........S.....S................",
-        "................S........S......S...............",
-        ".................S......S........S..............",
-        ".................S...............S..............",
-        "................S...............S...............",
-        "................................................",
-        "...........KKKKK................................",
-        ".........KKKKKKKKKKKKKKKKKKKKKKK................",
-        ".........KHhhrhhhhhrrhhhhhhKKKKKKKKKKK..........",
-        "kkkkkkkkkKHHHooHHHHHooHHHHorhhhhhrrhhKKkkkkkkkkk",
-        "llllllBKKKhhhhrrhhhhhooHHHHooHHHHHoHHHKwwlllllll",
-        "lllllllwwKooooobboooohrrhhhhrrhhhhhhhHKwKBllllll",
-        "llllllwwwKrrrrrobbooooobooooobboooooohKKwwwlllll",
-        "lllllMMwwKKbrrrrrBBrrrrrBrrrrrBBooooooKwwwMMllll",
-        "kkkkkkMMwwKKKvKKKKKKKbbbBBbbbrrBBrrrrrKwwMMkkkkk",
-        "lllllllMMMwwvvwwKKKKKKKKKKKKKKKKKKKvvKKMMMllllll",
-        "llllllllMMMMMMwwwwwwwwwwwwwwwwwwKKKKKMMMMlllllll",
-        "llllllllllMMMMMMMMMMMMMMwMMMMMMMMMMMMMMlllllllll",
-        "llllllllllllllMMMMMMMMMMMMMMMMMMMMMlllllllllllll",
-        "kkkkkkkkkkkkkkkkkkkkkkkkMkkkkkkkkkkkkkkkkkkkkkkk",
-        "llllllllllllllllllllllllllllllllllllllllllllllll",
-    ),
-    (
-        "................................................",
-        "...............S...............S................",
-        "..............S...............S.................",
-        "..............S...............S.................",
-        "...............S...............S................",
-        "................S...............S...............",
-        "................S...............S...............",
-        "...............S...............S................",
-        "................................................",
-        "................................................",
-        "................................................",
-        "................................................",
-        "........KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK........",
-        "......KKyhhhhhhhyhhhhhhhyhhhhhhhyhhhhhhhKK......",
-        "......KHYyHHHHHyYyHHHHHyYyHHHHHyYyHHHHHyHK......",
-        "......KHHYyHHHyYHYyHHHyYHYyHHHyYHYyHHHyYHK......",
-        "...BKKKhhhYyhyYhhhYyhyYhhhYyhyYhhhYyhyYhhKKKB...",
-        "......KooooYyYoooooYyYoooooYyYoooooYyYoooK......",
-        "......KrrrrrYrrrrrrrYrrrrrrrYrrrrrrrYrrrrK......",
-        "......KKbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbKK......",
-        "........KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKn.......",
-        "........nnNnnNnnNnnNnnNnnNnnNnnNnnNnnNnnn.......",
-        ".......nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn......",
-        ".......knnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnk......",
-        "........nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn.......",
-        ".........nknnnnnnnnnnnnnnnnnnnnnnnnnnnkn........",
-        "LLLLwwwwLLLkkknnnnnnnnnnnnnnnnnnnnnkkkwwLLLLwwww",
-        "LLLLwwwwLLLLwwkkkkkkkkkknkkkkkkkkkkLwwwwLLLLwwww",
-        "wwwwLLLLwwwwLLLLwwwwLLLLkwwwLLLLwwwwLLLLwwwwLLLL",
-        "wwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLL",
-        "wwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLL",
-        "wwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLLwwwwLLLL",
-    ),
-    (
-        "000000000000000000000000000000000000000000000000",
-        "000000000000000000000000000000000000000000000000",
-        "000000000000000000000000000000M00000000000000000",
-        "00000000000000M00000000000000M000000000000000000",
-        "0000000000000M000000000000000M000000000000000000",
-        "0000000000000M0000000000000000M00000000000000000",
-        "00000000000000M0000000000000000M0000000000000000",
-        "G0G0G0G0G0G0G0GMG0G0G0G0G0G0G0GMG0G0G0G0G0G0G0G0",
-        "GGGGGGGGGGGGGGGMGGGGGGGGGGGGGGMGGGGGGGGGGGGGGGGG",
-        "GGGGGGGGGGGGGGMGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG",
-        "GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG",
-        "0000000000000000000000000000000000KKKK0000000000",
-        "000g0000000g00KKKKKKKKKKKKKKKKKKKKKKKKK0000g0000",
-        "000g00000KKKKKKKKKKKhhhhhhhhhhhhhrrhhhhK000g0000",
-        "mmmgmmmmKKhhrrhhhhhroHHHHHHooHHHHHooHHHKmmmgmmmm",
-        "ggggggggKHHHHooHHHHHooHHHHHHrrhhhhhrhhhKKKBggggg",
-        "000g0BK0KhhhhhrrhhhhhrrhhhhhobbooooooooK000g0000",
-        "000g000KKoooooobbooooobbbooooobboorrrrrK000g0000",
-        "000g0000KooooorrBBrrrrrBBBrrrrrBBrrrrrKK000g0000",
-        "000g0000KrrrrrrrrBBbbbbbbBBbKKKKKKKKKKK0000g0000",
-        "mmmgmmmmmKKKKKKKKKKKKKKKKKKKKKKKKKmgmmmmmmmgmmmm",
-        "ggggggggggKKKKgggggggggggggggggggggggggggggggggg",
-        "00Wg0000WW0g000WW00g000W000g00W0000gW000000gW000",
-        "0WWW0000Wf00000WW00000Wf00000WfW0000fW00000fWW00",
-        "0fff0000ff00000ff00000ff0000Wfff0000ffW0000fff00",
-        "Wfff0000ffWW000ffW000WffW000ffff0000fff0000fff00",
-        "ffff000Wffff00Wfff000ffff00Wffff000Wfff00WWfffW0",
-        "fFFFW0WfFFff00fFFfW0WfFFfWWffFFFW00fFFfW0ffFFFf0",
-        "FFFFf0ffFFFF00fFFFf0fFFFFfffFFFFf0ffFFFf0ffFFFf0",
-        "FFFFFfFFFFFFffFFFFFfFFFFFFFFFFFFFffFFFFFfFFFFFFf",
-        "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
-        "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
-    ),
-    (
-        "QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ",
-        "QQQQQQQQQQQQQQQQQQQQQQQQyQQQQQQQQQQQQQQQQQQQQQQQ",
-        "QQQQQQQQQQQQQQQQQQQQQQQQyQQQQQQQQQQQQQQQQQQQQQQQ",
-        "QQQQQQQQQQQQQQQQQQyQQQQQQQQQQQyQQQQQQQQQQQQQQQQQ",
-        "QQQQQQQQQQQQQQQQQQQyQQQQsQQQQyQQQQQQQQQQQQQQQQQQ",
-        "qQqQqQqQqQqQqQqQqQqsssssssssssqQqQqQqQqQqQqQqQqQ",
-        "qqqqqqqqqqqqqqqqqqsssssssssssssqqqqqqqqqqqqqqqqq",
-        "qqqqqqqqqqqqqyqqssssssssWssssssssqqyqqqqqqqqqqqq",
-        "qqqqqqqqqqqqqqysssssWWWWWWWWWsssssyqqqqqqqqqqqqq",
-        "qqqqqqqqqqqqqqqssssWWWWWWWWWWWssssqqqqqqqqqqqqqq",
-        "qPqPqPqPqPqPqPssKKKKKKKKKKKKKKKKsssPqPqPqPqPqPqP",
-        "PPPPPPPPPPPPPPsKhhhrrhhhhhrrhhhhKssPPPPPPPPPPPPP",
-        "PPPPPPPPPPPPPPsKHHHHooHHHHHooHHHKssPPPPPPPPPPPPP",
-        "PPPPPPPPPPyyBKKKhhhhhrrhhhhhrrhhKKKBPyyPPPMPPPPP",
-        "PPPPPPPPPPPPPPsKoooooobbooooobooKssPPPPPPMMMPPPP",
-        "pPpPpPpMpPpPpPsKrrrrrrrBBrrrrrrrKssPpPpPMMMMMPpP",
-        "ppppppMMMpppppssKKKKKKKKKKKKKKKKsssppppXXXXXXXpp",
-        "pppppMMMMMpppppssssWWWWWWWWWWWsssspppXXXXXXXXXXX",
-        "pppXXXXXXXXXpppsssssWWWWWWWWWsssssppXXXXXXXXXXXX",
-        "ppXXXXXXXXXXXpppssssssssWssssssssppXXXXXXXXXXXXX",
-        "XXXXXXXXXXXXXXXspssssssssssssssspsXXXXXXXXXXXXXX",
-        "XXXXXXXXXXXXXXXXssssssssssssssssXXXXXXXXXXXXXXXX",
-        "XXXXXXXXXXXXXXXXXXsssssssssssssXXXXXXXXXXXXXXXXX",
-        "XXXXXXXXXXXXXXXXXXXsssssssssssXXXXXXXXXXXXXXXXXX",
-        "ttttttTttttttTttttttTttttttTttttttTttttttTtttttt",
-        "tTttttttTttttttTttttttTttttttTttttttTttttttTtttt",
-        "tttTttttttTttttttTttttttTttttttTttttttTttttttTtt",
-        "tttttTttttttTttttttTttttttTttttttTttttttTttttttT",
-        "TttttttTttttttTttttttTttttttTttttttTttttttTttttt",
-        "ttTttttttTttttttTttttttTttttttTttttttTttttttTttt",
-        "ttttTttttttTttttttTttttttTttttttTttttttTttttttTt",
-        "ttttttTttttttTttttttTttttttTttttttTttttttTtttttt",
-    ),
-    (
-        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD*DDDDDDDD*",
-        "DDDDDDDDDDDDDDDDDDD*DDDDDDDDDDDDDDDDDDDDDDDDDDDD",
-        "DDDDDD*DDD*DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
-        "DDDDDDDDMMDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
-        "DDDDDDMMDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD*D*D*DDD",
-        "DDDDwMDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
-        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
-        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
-        "DDDDDDDDDDDDDDD*DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
-        "DDDDDDDDDDDDDDKKKKKKKDDDD*DDDDDDDDDDDDDDDDDDDDDD",
-        "DDDDDDDDDDDDDKhhhhhKKKKKKKDDDDDDDDDDDDDDDDDDDDDD",
-        "DDDDDDDDDDBKDKHHHHHrrhhhhKKKKKKDDDDDDDDDDDDDDDDD",
-        "DDDDDDDDDDDDKKhhhHHHooHHHhrrhhKKKDDDDDDDDDDDDDDD",
-        "DDDDDDDDDDDDDKooohhhhroHHHHooHhhhKDDDDDDDDDDDDDD",
-        "DDDDDDDDDDDDDKrooboooorhhhhhoHHHHKD*DDDDDDDDDDDD",
-        "DDDDDDDDDDDDDKrrrBrrrooboooohrhhhKDDDDDDDDDDDDDD",
-        "DDDDDDDDDDDDD*KKKbBbrrrBBroooboooKKKBDDDDDDDDDDD",
-        "DDDDDDDDDDDDDDDDKKKKKKbbBBrrrrrroKDDDDDDDDDDDDDD",
-        "DDDDDDDDDDDDDDDDDDDDDKKKKKKKbbbrrKDDDDDDDDDDDDDD",
-        "DDDDDDDDDDDDDDDDDDDDDDDDDDKKKKKKKDDDDDDd*DDDDDDD",
-        "DD*DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDdddudddDDDDD",
-        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDddCuuuuuuddDDD",
-        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDMDDDDdCCCCCuuuuuddDD",
-        "DDDDDDDD*DDDDDDDDDDDDDDDDDDDDMMMMCCCCCCCuuuuudDD",
-        "DDDDDDDDDDDDDDDDDDDDDDDDDD*DDDDDDdCCCCCuuuuuudDD",
-        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDduuuCuuuuuuuuudD",
-        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDduuuuuuuuuuudMM",
-        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDduuuuuuuCuuudDD",
-        "DDDDDDDDDDDDDDDDDDDDDDDDD*DDDDDDDdduuuuuuuuuddDD",
-        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDdduuuuuuuddDDD",
-        "DDDDDDDDDDDD*DDDD*DDDDD*DDDDDDDDDD*DdddudddDDDDD",
-        "DDDDDDDD*DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDdDDDDDDDD",
-    ),
-    (
-        "DDD*DDDDD*D*DDDDDDDDXDDDDDDDDDDDD*DyWy***DDDXDDD",
-        "DDDDDDDDDDDD*DDXXXXXXXXXXXDDDDDDDDyWyDDXXXXXXXXX",
-        "DDDDDDXDDDDDDDXXXXXXXXXXXXXD**DDDyWyDDXXXXXXXXXX",
-        "DXXXXXXXXXXXDDDXXXXXXXXXXXDDDXXXXXXyWyXXXXXXXXXX",
-        "XXXXXXXXXXXXXDDDDDDDXDDDDDDDXXXXXXyWyXXXXDDDXDD*",
-        "*XXXXXXXXXXXDX*DDDDDDDDDDDDDXXXXyWyXXXXXDDDDDDDD",
-        "DQDQDQXQXXXXXXXXXXXQDQDXXXXXXXXyWyXQDQDQDQDQDQDQ",
-        "QQQQQQQXXXXXXXXXXXXXQQXX*XXXXXXXXyWyQQQQQQQQQQQQ",
-        "QQQQQQQQXXXXXXXXXXXQQQQXXXXXXXyWyXQQQQQQQQQQQQQQ",
-        "QQQQQQQQQQQQQXQQQQQ*QQQQQQQQyWyQQQQQQQQQQQQQQQQQ",
-        "QQQQQQQQQQQQQQQQQQQQQQQQKQQyW*QQQQQQQQQQQQQQQQQQ",
-        "QQQQQQQQQQQQQQQQQQQQQKKKKKKKQQQQQQQQQQQQQQQQQQQQ",
-        "QqQqQqQqQqQqQqQqQqQqQKHHhorKQqQqQqQqQqQqQqQqQqQq",
-        "qqqqqqqqqqqqqqqqqqqqKhHHhorbKqqqqqqqqqqqqqqqqqqq",
-        "qqqqqqqqqqqqqqqqqqqqKhHHhorbKqqqqqqqqqqqqqqqqqqq",
-        "qqqqqqqqqqqqqqqqqqqqKhHHhorbKqqqqqqqqqqqqqqqqqqq",
-        "xxxxxxxxxxxxxxxxxxxxKhHHhorbKxxxxxxxxxxxxxxxxxxx",
-        "xxxxxxxxxxxxxxxxxxxxKhHHhorbKxxxxxxxxxxxxxxxxxxx",
-        "XxxXxxXxxXxxXxxXxxXxKhHHhorbKxXxxXxxXxxXxxXxxXxx",
-        "xxxxxxxxxxxxxxxxxxxxKhHHhorbKxxxxxxxxxxxxxxxxxxx",
-        "xxxxxxxxxxxxxxxxxxxxKhHHhorbKxxxxxxxxxxxxxxxxxxx",
-        "xXxxXxxXxxXxxXxxXxxXKhHHhorbKxxXxxXxxXxxXxxXxxXx",
-        "xxxxxxxxxxxxxxxxxxxxKhHHhorbKxxxxxxxxxxxxxxxxxxx",
-        "xxxxxxxxxxxxxxxxXXXXKhHHhorbKXXXXxxxxxxxxxxxxxxx",
-        "xxXxxXxxXxxXxXXXzzzzzKHHhorKzzzzzXXXxxXxxXxxXxxX",
-        "xxxxxxxxxxxxXzzzzzzzzKKKKKKKzzzzzzzzXxxxxxxxxxxx",
-        "xxxxxxxxxxxXzzzzzzzzzXzzzzzXzzzzzzzzzXxxxxxxxxxx",
-        "XxxXxxXxxXXzzzzzzzzzzzzzXzzzzzxzzzzzzzXXxxXxxXxx",
-        "xxxxxxxxxxxXzzzzzzxzzzzzzzzzzzzzzzzzzXxxxxxxxxxx",
-        "xxxxxxxxxxxxXzzzzzzzzzzzzxzzzzzzzzzzXxxxxxxxxxxx",
-        "xXxxXxxXxxXxxXXXzzzzzzzzzzzzzzzzzXXXxXxxXxxXxxXx",
-        "xxxxxxxxxxxxxxxxXXXXXXXXzXXXXXXXXxxxxxxxxxxxxxxx",
-    ),
-    (
-        "LLLLLwwwwwLLLLLwMwwwLLLLLwwwwwMLLLLwwwwwLLLLLwww",
-        "LLLLLwwwwwLLLLLwwMwwLLLLLwwwwwLMLLLwwwwwLLLLLwww",
-        "LLLLLwwwwwLLLLLwwMwwLLLLLwwwwwLMLLLwwwwwLLLLLwww",
-        "LLLLLwwwwwLLLLLwMwwwLLLLLwwwwwMLLLLwwwwwLLLLLwww",
-        "LLLLLwwwwwLLLLLwwwwwLLLLLwwwwwLLLLLwwwwwLLLLLwww",
-        "wwwwwLLLLLwwwKwLLLLLwwwwwLLLLLwwwwwLLLLLwwwwwLLL",
-        "wwwwwLLLLLwKKKKKKKKKKKKKKKKKKKKKKKwLLLLLwwwwwLLL",
-        "wwwwwLLLLLKhhhhhhhhrhhhhhhhhKKKKKKKKKLLLwwwwwLLL",
-        "wwwwwLLLLLKHHHoHHHHHooHHHHoohhhhhrhhhKLLwwwwwLLL",
-        "wwwwwLLBKKKhhhrrhhhhHooHHHHooHHHHHHHHKLLwwwwwLLL",
-        "LLLLLwwwwwKoooobbooohhrrhhhhrrhhhhhhhKwKBLLLLwww",
-        "LLLLLwwwwwKrrroobbooooobooooobbooooooKKwLLLLLwww",
-        "LLLLLwwwwwKrrrrrrBBrrrrrBrrrrrBBrroooKwwLLLLLwww",
-        "LLLLLwwwwwLKKKKKKKKKbbbbBBbbbbrBBrrrrKwwLLLLLwww",
-        "LLLLLwwwwwLLLLKKKKKKKKKKKKKKKKKKKKKKKwwwLLLLLwww",
-        "wwwwwLLLLLwwwwwLLLLLwmwwmLLmLLwwwwKLLLLLwwwwwLLL",
-        "wwwwwLLLLLwwwwwLLLLLwmwwmLLmLLwwwwwLLLLLwwwwwLLL",
-        "wwwwwLLLLLwwwwwLLLLLwmwwmLLmLLwwwwwLLLLLwwwwwLLL",
-        "wwwwwLLLLLwwwwwLLLLLwmmmmmmmLLwwwwwLLLLLwwwwwLLL",
-        "wwwwwLLLLLwwwwwLLLLLwmmmmmmmLLwwwwwLLLLLwwwwwLLL",
-        "LLLLLwwwwwLLLLLwwwwwLLLmmmwwwwLLLLLwwwwwLLLLLwww",
-        "LLLLLwwwwwLLLLLwwwwwLLLmmmwwwwLLLLLwwwwwLLLLLwww",
-        "LLLLLwwwwwLLLLLwwwwwLLLMmwwwwwLLLLLwwwwwLLLLLwww",
-        "LLLLLwwwwwLLLLLwwwwwLLLMmwwwwwLLLLLwwwwwLLLLLwww",
-        "LLLLLwwwwwLLLLLwwwwwLLLMmwwwwwLLLLLwwwwwLLLLLwww",
-        "wwwwwLLLLLwwwwwLLLLLwwwMmLLLLLwwwwwLLLLLwwwwwLLL",
-        "wwwwwLLLLLwwwwwLLLLLwwwMmLLLLLwwwwwLLLLLwwwwwLLL",
-        "wwwwwLLLLLwwwwwLLLLLwwwMmLLLLLwwwwwLLLLLwwwwwLLL",
-        "wwwwwLLLLLwwwwwLLLLLwwwMmLLLLLwwwwwLLLLLwwwwwLLL",
-        "wwwwwLLLLLwwwwwLLLLLwwwMmLLLLLwwwwwLLLLLwwwwwLLL",
-        "LLLLLwwwwwLLLLLwwwwwLLLMmwwwwwLLLLLwwwwwLLLLLwww",
-        "LLLLLwwwwwLLLLLwwwwwLLLMmwwwwwLLLLLwwwwwLLLLLwww",
-    ),
-    (
-        "................................................",
-        "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-        "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-        "llllllllllllllllllllllllllllllllllllllllllllllll",
-        ".........m..............m..............m........",
-        ".........m..............m..............m........",
-        "........mm.............mm.............mm........",
-        ".........K..............K..............K........",
-        ".......KKBKK..........KKBKK..........KKBKK......",
-        "......KhHhorK........KhHhorK........KhHhorK.....",
-        "......KhHhorK........KhHhorK........KhHhorK.....",
-        "......KhHhorK........KhHhorK........KhHhorK.....",
-        "......KhHhorK........KhHhorK........KhHhorK.....",
-        "......KhHhorK........KhHhorK........KhHhorK.....",
-        "......KhHhorK........KhHhorK........KhHhorK.....",
-        "......KhHhorK........KhHhorK........KhHhorK.....",
-        "......KhHhorK........KhHhorK........KhHhorK.....",
-        "......KhHhorK........KhHhorK........KhHhorK.....",
-        "......KhHhorK........KhHhorK........KhHhorK.....",
-        "......KhHhorK........KhHhorK........KhHhorK.....",
-        "......KhHhorK........KhHhorK........KhHhorK.....",
-        "......KhHhorK........KhHhorK........KhHhorK.....",
-        ".......KKKKK..........KKKKK..........KKKKK......",
-        ".........K..............K..............K........",
-        ".......KKKKK..........KKKKK..........KKKKK......",
-        "......KhHBorK........KhHBorK........KhHBorK.....",
-        "......KhHhorK........KhHhorK........KhHhorK.....",
-        "......KhHhorK........KhHhorK........KhHhorK.....",
-        "......KhHhorK........KhHhorK........KhHhorK.....",
-        "llllllllllllllllllllllllllllllllllllllllllllllll",
-        "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-        "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    ),
-    (
-        "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-        "llllllllllllllllllllllllllllllllllllllllllllllll",
-        "llllllllllllllllllllllllllllllllllllllllllllllll",
-        "llllllllllllllllllllllllMlllllllllllllllllllllll",
-        "llllllllllllllllMMMMMMMMMMMMMMMMMlllllllllllllll",
-        "lllllllllllllMMMMMMMMMMMwMMMMMMMMMMMllllllllllll",
-        "kkkkkkkkkkkMMMMMMwwwwwwwwwwwwwwwMMMMMMkkkkkkkkkk",
-        "lllllllllMMMMMwwwwwwwwwwwwwwwwwwwwwMMMMMllllllll",
-        "llllllllMMMwwwwwwwwwwwwwwwwwwwwwwMwwwwMMMlllllll",
-        "lllllllMMMwwwwwwwwwwwwwwwwwwwMMMMeMMMMwMMMllllll",
-        "llllllMMMwwwwwwwwwwwwwwwwwwMMeeeeeeeeeMMMMMlllll",
-        "lllllMMMwwwwwwwwwvtwwwwwwwMeeeeeeeEeeeeeMMMMllll",
-        "kkkkkMMwwwwwwwvtwwwwwwwwwwMeeeeeEyEEEeeeMwMMkkkk",
-        "llllMMwwwwwwwwwwvtwwwwwwwMeeeeeEEEEEEEeeeMwMMlll",
-        "llllMMwwwwwwwvtwwwwwwwwwwwMeeeeeEEEYEeeeMwwMMlll",
-        "llllMMwwwwwwwwwvtwwwwwwwwwMeeeeeeeEeeeeeMwwMMlll",
-        "lllMMwwwwwwwwKwwwwwwwwwwwwwMMeeeeeeeeeMMwwwwMMll",
-        "llllMMwwwwwKKKKKKKKKKKKKKKKwwMMMMeMMMMwwwwwMMlll",
-        "kkkkMMwwwwwKHHoHhhhhrhhKKKKKKKwwwMwwwwwwwwwMMkkk",
-        "llllMMwwBKKKhhroHHHHooHHHHHHHKwwwwwwwwwwwwwMMlll",
-        "lllllMMwwwwKooobboohhrrhhhhhHKwKBwwwwwwwwwMMllll",
-        "lllllMMMwwwKrrrrBBrooobboooooKKwwwwwwwwwwMMMllll",
-        "llllllMMMwwKKKKKKKKKKKKKKKKKKKKKwwwwwwwwMMMlllll",
-        "lllllllMMMwwwKKKKhhhrhhhhhhrrhhKwwwwwwwMMMllllll",
-        "kkkkkkkkMMMwwKHHHHHHooHHHHHHoHHKwKBwwwMMMkkkkkkk",
-        "lllllllllMBKKKhhhhhhhrrrhhoooooKKwwMMMMMllllllll",
-        "lllllllllllMMKoobooooobbborrrrrKMMMMMMllllllllll",
-        "lllllllllllllKrrBBrrrrrrBBbbKKKKMMMMllllllllllll",
-        "lllllllllllllKKKKKKKKKKKKKKKKKKMMlllllllllllllll",
-        "llllllllllllllllllllllllMlllllllllllllllllllllll",
-        "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-        "llllllllllllllllllllllllllllllllllllllllllllllll",
-    ),
-    (
-        "pppppppppppppppppppppppppppppppppppppppppppppppp",
-        "ppppppppppppppppppppppppppppppppppppppsppppppppp",
-        "pppppppppppppppppppppppppppppppppppssssssspppppp",
-        "ppppppppppppppppppppppppppppppppppsssssssssppppp",
-        "pPpPpPpPpPpPpPpPpPpPpPpPpPpPpPpPpPsssssssssPpPpP",
-        "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPsssssssssssPPPP",
-        "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPsssssssssPPPPP",
-        "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPsssssssssPPPPP",
-        "PqPqPqPqPqPqPqPqPqPqPqPqPqPqPqPqPqPsssssssPqPqPq",
-        "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqwqqqqqsqqqqqqqqq",
-        "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqwqqqqqqqqqqqqqqqqq",
-        "wwwwwwwwwwaaaAaaaaaaaaaaaaaaaaaaaawaaaaaaaaaAaaa",
-        "AAAAAAAAAAwwwwaaaAaaaaaaaaawwaaaaaaawaaaaaaaaaaa",
-        "aaaaaaaaaaAAAAwwwaaaaAaaawwaawaaaaaaaaaaaaaaaaaa",
-        "aaaaaaaaaaaaaaAAAwwaaaawwAaaaaaaaaaaaaaaaaaaaaaa",
-        "aaaaaaaaaaaaaaaaaAAwwwwaaaaaaAaKKKKKKKKKaaaaaaaa",
-        "aaaaaaaaaaaaaaaaaaaAAAwwaaaaaKKKKhhhhHHKaaaaaaaa",
-        "aaaaaaaaaaaaaaaaaaaaaaAAwwaaaKHHHHHHHHhKKKBaaaaa",
-        "aaaaaaaaaaaaaaaaaaaaaaaaAABKaKhhhhhhoooKaAaaaaaa",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaAwKKoooooorrrKaaaaaAaa",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaAAKrrrrrbKKKKaaaaaaaa",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaKKKKKKKKKaaaaaaaaaa",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaawwwwwwwwwwwwwwaaaaaaa",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaMMMMMMMMMMMMaaaaaaaa",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaAaaaaaaaaaaaaa",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaAaaaaaaaaa",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaAaaaaa",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaAa",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaAaaaaaaaaaaaaaaaa",
-    ),
-    (
-        "*DDDDDDDDDDDDDDDDDDDDDD*DDDD*DDDDDDDDDDDDDDD*DDD",
-        "DDDDD*DDDDDDDDDDDDDDDDDDDDD*DDDDDDDDDDDDDDDDDDDD",
-        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD*DDDDDDDdDDDDDDD",
-        "DDDDDDDDDDDDDD*DDDDDDDDDDDDDDDDDDDDDDDddMddDDDDD",
-        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDdMMMMMdDDDD",
-        "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDdMMMMMMMdDDD",
-        "DDDDDDDDDD*DDDDDDDDDDDDDDDDDDDDDDDDDDdMMMMMd*DDD",
-        "D*DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDddMddDDDDD",
-        "DDDDDDDDDD*DDDDDDDDDD*DDDDDDDDDD*DDDDDDDdDDDDDDD",
-        "DDDDDDDDDDDDDDDDDDDDDDD*DD*DDDDDDDDDDDDDDDDDDDDD",
-        "DDDDDDD*DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
-        "DDDDDDDDD*DDDDDDDDDDDKKKKKKKKKKKDDDDDDDDDDDDDDDD",
-        "DDDDDDDDD*DDD*D*DDDDDKhhhhhhhhKKKDDDDDDDDDDDDDDD",
-        "DDDDDDDDDDDDDDDDDDBKDKHHHHHHHHHHKDDDDDDDDDDDDDDD",
-        "DDDDDDDDDDDDDDDDDDDDKKooohhhhhhhKKKBDDDDDDDDDDDD",
-        "DDDDDDDDDDDDDDDDDDDDDKrrroooooooKDDDDDDDDDDDDDDD",
-        "DDDDDDDDDDDDDDDDDDDDDKKKbbrrrrrrKDkkDDDDDDDDDDDD",
-        "DDDDDDDDDDDDDDDDDDDDDDKKKKKKKKKKKDDDkkkDDDDDDDDD",
-        "DDDDDDDDDDDDDDDDDDDDDDDfffDDDDDDDDDDDDDkkkDDDDDD",
-        "DDDDDDDDDDDDDDDDDDDDDfffffDDDDDDDDDDDDDDDDkkkDDD",
-        "DDDDDDDDDDDDDDDDDDDDfffffffDDDDDDDDDDDDDDDDDDkkk",
-        "DDDDDDDDDDDDDDDDDDDfffffffffDDDDDDDDDDDDDDDDDDDD",
-        "XxxxxxxxxxxXxxxxxxxffFFFFFffxxxxxXxxxxxxxxxxXxxx",
-        "xxxxxxxXxxxxxxxxxxXFFFFWWWFFxXxxxxxxxxxxXxxxxxxx",
-        "xxxXxxxxxxxxxxXxxffFFWWWWWFFfxxxxxxxXxxxxxxxxxxX",
-        "xxxxxxxxxxXxxxxxxFFFFWWWWWFFFFxxXxxxxxxxxxxXxxxx",
-        "xxxxxxXxxxxxxxxxFFFFFWWWWWFFFFxxxxxxxxxXxxxxxxxx",
-        "xxXxxxxxxxxxlkkkkkkkkkkkkkkkkkkkkkxXxxxxxxxxxxXx",
-        "xxxxxxxxxXxxxkkkkkkkkkkkkkkkkkkkkklxxxxxxxXxxxxx",
-        "xxxxxXxxxxxxxxxxXxxxxxxxxxxXxxxxxxxxxxXxxxxxxxxx",
-        "xXxxxxxxxxxxXxxxxxxxxxxXxxxxxxxxxxXxxxxxxxxxxXxx",
-        "xxxxxxxxXxxxxxxxxxxXxxxxxxxxxxXxxxxxxxxxxXxxxxxx",
-    ),
-    (
-        "pppppppppppppppppppppppppppppppppppppppppppppppp",
-        "ppppppppppgppppppppppppppppppppppppppppppppppppp",
-        "pppgggggggggggggggpppppppppppppppppppppppppppppp",
-        "pgggggggggggggggggggpppppppppppppppppppppppppppp",
-        "gggggggggggggggggggggppppppppppppppppppppppppppp",
-        "gggggggggggggggggggggg1ppppppppppppppppppppppppp",
-        "ggggggggggggggggggggggg1pppppppppppppppppppppppp",
-        "gggggggggggggggggggggg11pppppppppppppppppppppppp",
-        "gggggggggggggggggggggg111ppppppppppppppppppppppp",
-        "gggggggggggggggggggg111g11pppppppppppppppppppppp",
-        "ggggggggggggggggg333111111pPpPpPpPpPpPpPpPpPpPpP",
-        "ggggggggggg1111111111111111PPPPPPPPPPPPPPPPPPPPP",
-        "gggggggggg11111111111111111PPPPPPPPPPPPPPPPPPPPP",
-        "gggggggggg11111110110111111PPPPPPPPPPPPPPPPPPPPP",
-        "ggggggg2gg11111111001111111PPPPPPPPPPPPPPPPPPPPP",
-        "gggggg222111111111111111112PPPPPPPPPPPPPPPPPPPPP",
-        "Pggggg2221111111111111111113PPPPPPPPPPPPPPPPPPPP",
-        "P1ggg2232211111111111111112PPPPPPPPPPPPPPPPPPPPP",
-        "P111g122311111111111LL11151PPPPPPPPPPPPPPPPPPPPP",
-        "P111112221111111111111iiiiiiKKKKKKKKKKKKKKKKKPPP",
-        "P11111121111111111111555555KhhhhhrrhhhhhrrhhhKPP",
-        "PP1111111111111111111555555KHHHHHHooHHHHHooHHKPP",
-        "Pq1111111111111111115555BKKKhhhhhhhrrhhhhhrhhKKK",
-        "qqq111111111111111111555555KoobooooobboooooooKqq",
-        "qqqq11111111111111111551555KrrBBrrrrrBBrrrrrrKqq",
-        "qqqqq11111111111111111iiiii5KKKKKKKKKKKKKKKKKqqq",
-        "qqqqq11111111111111111111111qqqqqqqqqqqqqqqqqqqq",
-        "qqqqqq11111111111111111111111qbqqqqqqqqqqqqqqqqq",
-        "qqqqqqqq11111111111111111111qqqqqrqqqqqqqqqqqqqq",
-        "uuuuuuuuuuuuu111111q1111111qqbqqqqqqqqqqqqqqqqqq",
-        "uuuuuuuuuuuuuuuuuuuuuuq1qqqqqqqqqqqqqqqqqqqqqqqq",
-        "uuuuuuuuuuuuuuuuuuuuuuqqqqqqqqqqqqqqqqqqqqqqqqqq",
-    ),
-    (
-        "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu",
-        "uuuuuuuuuuuuuuuuuuuuuuuuwuuuuuuuuuuuuuuuuuuuuuuu",
-        "uuuuuuuuuuuuuuuuwuwwwwwwwwwwwwwuwuuuuuuuuuuuuuuu",
-        "uuuuuuuuuuuuuwwwwwwwwwwwwwwwwwwwwwwwuuuuuuuuuuuu",
-        "uuuuuuuuuuuuwwwwwwwwwwwwwwwwwwwwwwwwwuuuuuuuuuuu",
-        "uuuuuuuuuuuuwwwwwwwwwwwwwwwwwwwwwwwwwuuuuuuuuuuu",
-        "uuuuuuuuuuuwwwwwwwwwwwwwwwwwwwwwwwwwwwuuuKuuuuuu",
-        "uuuuuuuuuuuuwwwwwwwwwwwwwwwwwwwwwwwwwuuKKKKKuuuu",
-        "uuuuuuuuuuuuwwwwwwwwwwwwwwwwwwwwwwwwwuKhHhorKuuu",
-        "uuuuuuuuuuuuuwwwwwwwwwww3wwwwwwwwwwwuuKhHhorKuuu",
-        "uuuuuuuuuuuuuuuMMMMM333313333MMMMMuuuuKhHhorKuuu",
-        "uuuuuuuuuuuuuuuuuu3311111111133uuuuuuuKhHhorKuuu",
-        "uCuCuCuCuCuCuCuCu313331111133313uCuCuCKhHhorKCuC",
-        "CCCCCCCCCCCCCCCC31111111111111113CCCCCKhHhorKCCC",
-        "CCCCCCCCCCCCCCC3111101111111011113CCCCKhHhorKCCC",
-        "CCCCCCCCCCCCCCC3111111111111111113CCCCKhHhorKCCC",
-        "CCCCCCCCCCCCCCC3111111111111111113CCCCKhHhorKCCC",
-        "CCCCCCCCCCCCCC31L111111111111111L13CCCCKKKKKCCCC",
-        "CCCCCCCCCCCCCCC3111111111111111113CCCCCCCKCCCCCC",
-        "CCCCCCCCCCCCCCC31111gggg1gggg11113CCCCmCmCmCCCCC",
-        "CCCCCCCCCCCCCCC3111g111151111g1113CCCCmCmCmCCCCC",
-        "CCCCCCCCCCCCCCCC311111iiiii111113CCCCCmCmCmCCCCC",
-        "CcCcCcCcCcCcCcCcC311155555551113CcCcCcCcmcCcCcCc",
-        "cccccccccccccccccc331155L551133cccccccccmccccccc",
-        "cccccccccccccccccccc333353333cccccccccccmccccccc",
-        "cccccccccccccccccccccccc3cccccccccccccccmccccccc",
-        "ccccccccccccwwwwwwwwwwwMMMwwwwwwwwwwwcccmccccccc",
-        "ccccccccccccwwwwwwwwwwwMgMwwwwwwwwwwwcccmccccccc",
-        "ccccccccccccwwwwwwwwwwwMMMwwwwwwwwwwwcccmccccccc",
-        "ccccccccccccwwwwwwwwwwwMMMwwwwwwwwwwwcccmccccccc",
-        "ccccccccccccwwwwwwwwwwwMgMwwwwwwwwwwwcccmccccccc",
-        "ccccccccccccwwwwwwwwwwwMMMwwwwwwwwwwwcccmccccccc",
-    ),
-    (
-        "cccccccccccccccccccccccccccccccccccccccccccccccc",
-        "cccccccccccccccccccccccccccccccccccccccccccccccc",
-        "ccccccwccccccccc0ccccc0ccccc0ccccccccccccccccccc",
-        "cccwwwwwwwcccc00000c00000c00000ccccccccccccccccc",
-        "ccwwwwwwwwwcc0000000000000000000cccccccccccccccc",
-        "cccwwwwwwwc00000000000000000000000ccccccwccccccc",
-        "ccccccwcccc00000000000000000000000ccwwwwwwwwwccc",
-        "cccccccccc0000000000000000000000000wwwwwwwwwwwcc",
-        "ccccccccccc00000000000000000000000ccwwwwwwwwwccc",
-        "ccccccccccc00000200000200000200000ccccccwccccccc",
-        "ccccccccccccc0222220222220222220cccccccccccccccc",
-        "cccccccccccc442222222222222222244ccccccccccccccc",
-        "cccccccccccc422220222222220222224ccccccccccccccc",
-        "cccccccccccc422202022222202022224ccccccccccccccc",
-        "cccccccccccc422222222222222222224ccccccccccccccc",
-        "ccccccccccc42222222222222222222224cccccccccccccc",
-        "cccccccccccc422222222222222222224ccccccccccccccc",
-        "cccccccccccc422222222222222222224ccccccccccccccc",
-        "cccccccccccc422222222252222222224ccccccccccccccc",
-        "cccccccccccc442222iiiiiiiii222244ccccccccccccccc",
-        "cCcCcCcCcCcCc4222555555555552224cCcCcCcCcCcCcCcC",
-        "CCCCCCCCCCCCCC42R25555555552R24CCccKKKKKKKKKKKCC",
-        "CCCCCCCCCCCCCCC422222252222R24CCCccKohhhhhh3333C",
-        "CCCCCCCCCCCCCCCC4422222222244CCCCccKhHHHHHH2222C",
-        "CCCCCCCCCCCCCCCCCC444424444CCCCCCccKoohhhhh3333K",
-        "CCCCCCCCCCCCCCCCCCCCCC4CCCCCCCCCCccKroooooo2222C",
-        "CCCCCCCCCCCCTTTTTTTTTTTTTTTTTTTTTccKorrrrrr3333C",
-        "CCCCCCCCCCCCtttttttttttttttttttttccKKKKKKKKKKKCC",
-        "CCCCCCCCCCCCtttttttttttttttttttttCCCCCCCCCCCCCCC",
-        "CCCCCCCCCCCCtttttttttttttttttttttCCCCCCCCCCCCCCC",
-        "CCCCCCCCCCCCtttttttttttttttttttttCCCCCCCCCCCCCCC",
-        "CCCCCCCCCCCCtttttttttttttttttttttCCCCCCCCCCCCCCC",
-    ),
-)
-
-
 DESKTOP_APP_LAUNCHERS = {
     "files": "open_default_file_manager",
     "games": "open_games_suite",
     "snake": "open_snake",
     "sudoku": "open_sudoku",
     "chess": "open_chess",
+    "8-ball-pool": "open_eight_ball_pool",
+    "pool": "open_eight_ball_pool",
     "messenger": "open_messenger",
     "calculator": "open_calculator",
     "images": "open_image_viewer",
+    "paint": "open_paint",
+    "network": "open_network_hosting",
+    "hosting": "open_network_hosting",
+    "website-designer": "open_website_designer",
+    "web-designer": "open_website_designer",
     "notepad": "open_notepad",
     "editor": "open_text_editor",
-    "dispenser": "open_dispenser",
     "media": "open_media_player",
     "ide": "open_python_ide",
     "browser": "open_browser",
@@ -6704,7 +8596,7 @@ def main():
     root = tk.Tk()
     app = DesktopGUI(root)
     root.update_idletasks()
-    app.lock_desktop()
+    app.lock_desktop(allow_remembered=True)
     app.start_notifications()
     if len(sys.argv) >= 3 and sys.argv[1] == "--app":
         launcher = DESKTOP_APP_LAUNCHERS.get(sys.argv[2].casefold())

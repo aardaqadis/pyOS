@@ -18,13 +18,16 @@ def load_config():
         "data_dir": str(Path.home()),
         "downloads_dir": str(Path.home() / "Downloads"),
         "drive_b_dir": str(Path.home() / ".pyOS_Drive_B"),
+        "enabled_apps": None,
         "configured": False,
     }
     try:
         loaded = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         if isinstance(loaded, dict):
             for key in defaults:
-                if key in loaded and isinstance(loaded[key], (str, bool)):
+                if key == "enabled_apps" and isinstance(loaded.get(key), list):
+                    defaults[key] = [str(item) for item in loaded[key] if isinstance(item, str)]
+                elif key in loaded and isinstance(loaded[key], (str, bool)):
                     defaults[key] = loaded[key]
     except (OSError, ValueError, TypeError):
         pass
@@ -77,6 +80,9 @@ def get_cli_settings_path():
 
 def relaunch_in_configured_environment(script_path):
     """Re-execute a directly launched script with setup's isolated Python."""
+    if getattr(sys, "frozen", False):
+        # A PyInstaller executable already contains its selected runtime and dependencies.
+        return False
     config = load_config()
     if not config.get("configured"):
         return False

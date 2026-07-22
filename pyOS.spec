@@ -30,6 +30,7 @@ datas = [
     (project_file("setup.py"), "."),
     (project_file("README.md"), "."),
     (project_file("LICENSE.md"), "."),
+    (project_file("sounds"), "sounds"),
     (icon_path, "."),
 ]
 binaries = []

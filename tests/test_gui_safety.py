@@ -1,9 +1,10 @@
 import codecs
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pyOSgui
 
@@ -137,6 +138,38 @@ class TextDocumentTests(unittest.TestCase):
             self.assertEqual(list(target.parent.glob(f".{target.name}.*{target.suffix}")), [])
 
 
+class GuiSoundTests(unittest.TestCase):
+    def test_missing_or_unknown_sound_is_safely_ignored(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            player = pyOSgui.GuiSoundPlayer(temporary)
+            self.assertFalse(player.play("startup"))
+            self.assertFalse(player.play("unknown"))
+
+    def test_windows_sound_uses_nonblocking_bundled_wave(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sound_dir = Path(temporary) / "sounds"
+            sound_dir.mkdir()
+            sound = sound_dir / "Windows Startup.wav"
+            sound.write_bytes(b"RIFF")
+            winsound = SimpleNamespace(
+                SND_FILENAME=1, SND_ASYNC=2, SND_NODEFAULT=4, PlaySound=Mock(),
+            )
+            with (
+                patch("pyOSgui.os.name", "nt"),
+                patch.dict("sys.modules", {"winsound": winsound}),
+            ):
+                self.assertTrue(pyOSgui.GuiSoundPlayer(temporary).play("startup"))
+
+            winsound.PlaySound.assert_called_once_with(str(sound), 7)
+
+    def test_desktop_sound_preference_can_disable_playback(self):
+        app = object.__new__(pyOSgui.DesktopGUI)
+        app.preferences = {"sounds_enabled": False}
+        app.sound_player = Mock()
+        self.assertFalse(app.play_sound("notification"))
+        app.sound_player.play.assert_not_called()
+
+
 class CustomAppStorageTests(unittest.TestCase):
     def test_custom_apps_directory_is_registered_as_an_owned_tree(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -218,6 +251,17 @@ class UpdateAcknowledgementTests(unittest.TestCase):
             )
             recover.assert_called_once_with("install", "data")
 
+
+class StartupStatusFormattingTests(unittest.TestCase):
+    def test_status_lines_are_normalized_and_aligned(self):
+        self.assertEqual(
+            pyOSgui.format_startup_status("warn", "Disk space\n is low", "12:34:56"),
+            "[12:34:56] [WARN ] Disk space is low",
+        )
+
+    def test_unknown_status_levels_are_treated_as_debug(self):
+        line = pyOSgui.format_startup_status("trace", "checking", "01:02:03")
+        self.assertEqual(line, "[01:02:03] [DEBUG] checking")
 
 class SudokuSafetyTests(unittest.TestCase):
     UNIQUE_PUZZLE = [

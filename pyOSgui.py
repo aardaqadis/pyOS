@@ -653,6 +653,144 @@ THEME_PRESETS = {
     },
 }
 
+GUI_SOUND_FILES = {
+    "startup": ("Windows Startup.wav", "Windows Logon Sound.wav"),
+    "shutdown": ("Windows Shutdown.wav", "Windows Logoff Sound.wav"),
+    "lock": "Windows Logoff Sound.wav", "unlock": "Windows Logon Sound.wav",
+    "notification": "Windows Notify.wav", "info": "Windows Information Bar.wav",
+    "warning": "Windows Exclamation.wav", "error": "Windows Error.wav",
+    "critical": "Windows Critical Stop.wav", "navigation": "Windows Navigation Start.wav",
+    "success": "Windows Default.wav", "blocked": "Windows Pop-up Blocked.wav",
+    "authorization": "Windows User Account Control.wav",
+    "hardware_insert": "Windows Hardware Insert.wav", "hardware_remove": "Windows Hardware Remove.wav",
+    "hardware_error": "Windows Hardware Fail.wav", "battery_low": "Windows Battery Low.wav",
+    "battery_critical": "Windows Battery Critical.wav", "discovered": "Windows Feed Discovered.wav",
+    "complete": "Windows Print complete.wav", "ding": "Windows Ding.wav", "balloon": "Windows Balloon.wav",
+}
+
+class GuiSoundPlayer:
+    """Best-effort, non-blocking playback for bundled GUI event sounds."""
+
+    def __init__(self, resource_root=None):
+        root = Path(resource_root) if resource_root else Path(
+            getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)
+        )
+        self.sound_dir = root / "sounds"
+
+    def play(self, event):
+        filenames = GUI_SOUND_FILES.get(str(event).casefold())
+        if isinstance(filenames, str):
+            filenames = (filenames,)
+        path = next((self.sound_dir / filename for filename in (filenames or ())
+                     if (self.sound_dir / filename).is_file()), None)
+        if path is None:
+            return False
+        try:
+            if os.name == "nt":
+                import winsound
+                winsound.PlaySound(
+                    str(path),
+                    winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
+                )
+                return True
+            if sys.platform == "darwin":
+                command = ["afplay", str(path)]
+            else:
+                player = shutil.which("paplay") or shutil.which("aplay")
+                if not player:
+                    return False
+                command = [player, str(path)]
+            subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except (OSError, RuntimeError):
+            return False
+
+
+STARTUP_STATUS_DELAY_SECONDS = 0.28
+STARTUP_READY_DELAY_SECONDS = 0.65
+
+
+def format_startup_status(level, message, timestamp=None):
+    """Return one safe, consistently aligned startup status line."""
+    level = str(level).upper()
+    if level not in {"INFO", "DEBUG", "WARN", "ERROR", "READY"}:
+        level = "DEBUG"
+    clean_message = " ".join(str(message).split())[:500]
+    timestamp = timestamp or datetime.now().strftime("%H:%M:%S")
+    return f"[{timestamp}] [{level:<5}] {clean_message}"
+
+
+class StartupStatusScreen:
+    """Logo-based startup console that reports genuine initialization work."""
+
+    COLORS = {"INFO": "#005a9c", "DEBUG": "#2e6b16", "WARN": "#9a6700",
+              "ERROR": "#c62828", "READY": "#00796b"}
+
+    def __init__(self, root):
+        self.root = root
+        root.title("pyOS startup")
+        root.geometry("760x500")
+        root.minsize(600, 380)
+        root.configure(bg="white")
+        self.frame = tk.Frame(root, bg="white", padx=20, pady=18)
+        self.frame.pack(fill="both", expand=True)
+        logo_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "pyos2.0.png"
+        self.logo_photo = None
+        try:
+            from PIL import Image, ImageTk
+            with Image.open(logo_path) as image:
+                image.thumbnail((330, 175), Image.Resampling.LANCZOS)
+                self.logo_photo = ImageTk.PhotoImage(image.copy())
+        except (ImportError, OSError, ValueError):
+            try:
+                self.logo_photo = tk.PhotoImage(file=str(logo_path)).subsample(2, 2)
+            except tk.TclError:
+                self.logo_photo = None
+        if self.logo_photo:
+            tk.Label(self.frame, image=self.logo_photo, bg="white", bd=0).pack()
+        else:
+            tk.Label(self.frame, text="pyOS 2.0", bg="white", fg="black",
+                     font=("Arial", 28, "bold")).pack()
+        tk.Label(self.frame, text="BOOT DIAGNOSTICS", anchor="w", bg="white",
+                 fg="black", font=("Consolas", 11, "bold")).pack(fill="x", pady=(4, 10))
+        self.output = scrolledtext.ScrolledText(
+            self.frame, bg="#f5f5f5", fg="#111111", insertbackground="#111111",
+            relief="solid", borderwidth=1, font=("Consolas", 10), state="disabled",
+            wrap="word", padx=10, pady=10)
+        self.output.pack(fill="both", expand=True)
+        for level, color in self.COLORS.items():
+            self.output.tag_configure(level, foreground=color)
+        self.current_status = tk.StringVar(value="Starting pyOS...")
+        tk.Label(self.frame, textvariable=self.current_status, anchor="w", bg="white",
+                 fg="#444444", font=("Consolas", 9)).pack(fill="x", pady=(8, 0))
+        root.deiconify()
+        root.update_idletasks()
+
+    def write(self, level, message):
+        level = str(level).upper()
+        if level not in self.COLORS:
+            level = "DEBUG"
+        self.output.configure(state="normal")
+        self.output.insert("end", format_startup_status(level, message) + "\n", level)
+        self.output.see("end")
+        self.output.configure(state="disabled")
+        self.current_status.set("Ready" if level == "READY" else str(message))
+        try:
+            self.root.update()
+        except tk.TclError:
+            pass
+        # Keep the real diagnostic steps readable instead of flashing past.
+        # The short pause is deliberately bounded so failures remain responsive.
+        delay = STARTUP_READY_DELAY_SECONDS if level == "READY" else STARTUP_STATUS_DELAY_SECONDS
+        time.sleep(delay)
+
+    def info(self, message): self.write("INFO", message)
+    def debug(self, message): self.write("DEBUG", message)
+    def warn(self, message): self.write("WARN", message)
+    def error(self, message): self.write("ERROR", message)
+    def ready(self, message): self.write("READY", message)
+    def close(self): self.frame.destroy()
+
 GM_INSTRUMENTS = tuple(name.strip() for name in """
 Acoustic Grand Piano|Bright Acoustic Piano|Electric Grand Piano|Honky-tonk Piano|Electric Piano 1|Electric Piano 2|Harpsichord|Clavinet|
 Celesta|Glockenspiel|Music Box|Vibraphone|Marimba|Xylophone|Tubular Bells|Dulcimer|
@@ -1516,6 +1654,9 @@ class DesktopIcon:
     
     def double_click(self):
         """Execute command on double-click"""
+        desktop = getattr(self.parent, "_desktop_gui", None)
+        if desktop is not None:
+            desktop.play_sound("navigation")
         if callable(self.command):
             self.command()
         else:
@@ -2014,6 +2155,7 @@ class DesktopGUI:
         self.settings_path = get_gui_settings_path()
         self.virtual_drives_path = self.settings_path.with_name("virtual_drives.json")
         self.preferences = self.load_preferences()
+        self.sound_player = GuiSoundPlayer()
         self.windows = []
         self.custom_app_icons = []
         self.root.title("Python OS Desktop")
@@ -2057,6 +2199,7 @@ class DesktopGUI:
         
         # Create a fixed icon layer; placed children do not expand their parent.
         self.icon_container = tk.Frame(self.desktop_canvas, bg="white", width=1280, height=670)
+        self.icon_container._desktop_gui = self
         self.background_label = tk.Label(self.icon_container, bg="white", bd=0)
         self.background_label.place(x=0, y=0, relwidth=1, relheight=1)
         self.background_label.lower()
@@ -2139,6 +2282,7 @@ class DesktopGUI:
     def _ensure_app_enabled(self, app_id, label=None):
         if self._app_enabled(app_id):
             return True
+        self.play_sound("blocked")
         messagebox.showinfo(
             "Application Disabled",
             f"{label or app_id} was disabled during pyOS Setup. Run Setup as an administrator to enable it.",
@@ -2162,6 +2306,7 @@ class DesktopGUI:
                 parent=self.root,
             )
             return False
+        self.play_sound("authorization")
         username = simpledialog.askstring(
             "Administrator Authorization",
             f"Administrator approval is required to {action}.\n\nAdministrator username:",
@@ -2208,9 +2353,16 @@ class DesktopGUI:
         self._admin_authorized_at = time.monotonic()
         return True
 
+    def play_sound(self, event):
+        """Play a configured bundled event sound without blocking the Tk loop."""
+        if not self.preferences.get("sounds_enabled", True):
+            return False
+        return self.sound_player.play(event)
+
     def lock_desktop(self, allow_remembered=False):
         """Block all desktop interaction until valid credentials are supplied."""
         previous_username = self.username
+        self.play_sound("lock")
         self.username = None
         self.system_user_var.set("Locked")
         self._admin_authorized_at = 0.0
@@ -2258,6 +2410,7 @@ class DesktopGUI:
                 username = None
                 status.set(f"Account storage requires recovery. pyOS remains locked.\n{error}")
             if not username:
+                self.play_sound("error")
                 if not status.get().startswith("Account storage"):
                     status.set("Authentication did not complete. pyOS remains locked; retry to continue.")
                 overlay.lift()
@@ -2283,6 +2436,7 @@ class DesktopGUI:
                 self.root.destroy()
                 return username
             self.system_user_var.set(username)
+            self.play_sound("unlock")
             return username
 
         retry.configure(command=attempt_unlock)
@@ -2459,11 +2613,13 @@ class DesktopGUI:
         return True
 
     def shutdown_pyos(self):
+        self.play_sound("warning")
         if not messagebox.askyesno(
             "Shut Down pyOS", "Close pyOS and all open pyOS applications?",
             parent=self.root,
         ):
             return
+        self.play_sound("shutdown")
         if not self._stop_services():
             return
         self.root.destroy()
@@ -2601,6 +2757,7 @@ class DesktopGUI:
         self.root.destroy()
 
     def restart_pyos(self):
+        self.play_sound("warning")
         if not messagebox.askyesno(
             "Restart pyOS", "Close and restart pyOS now?", parent=self.root
         ):
@@ -2702,6 +2859,8 @@ class DesktopGUI:
             return
         if kind == "tip" and not self.preferences.get("tips_enabled", True):
             return
+        sound_event = "error" if kind == "error" or "error" in title.casefold() else "notification"
+        self.play_sound(sound_event)
         chrome = self.preferences.get("chrome_bg", "#000000")
         chrome_text = self.preferences.get("chrome_fg", "#ffffff")
         surface = self.preferences.get("surface_bg", "#ffffff")
@@ -3300,6 +3459,7 @@ class DesktopGUI:
             "taskbar_shortcuts": [],
             "icon_positions": {},
             "notifications_enabled": True,
+            "sounds_enabled": True,
             "tips_enabled": True,
             "accessibility_large_text": False,
             "accessibility_dyslexia_font": False,
@@ -3371,6 +3531,7 @@ class DesktopGUI:
             valid_positions[key[:260]] = {"x": x, "y": y}
         defaults["icon_positions"] = valid_positions
         defaults["notifications_enabled"] = bool(defaults["notifications_enabled"])
+        defaults["sounds_enabled"] = bool(defaults["sounds_enabled"])
         defaults["tips_enabled"] = bool(defaults["tips_enabled"])
         for key in (
             "accessibility_large_text", "accessibility_dyslexia_font",
@@ -10515,6 +10676,7 @@ Features:
         hidden = tk.BooleanVar(value=self.preferences["show_hidden_files"])
         start_location = tk.StringVar(value=self.preferences["file_manager_start"])
         notifications_enabled = tk.BooleanVar(value=self.preferences["notifications_enabled"])
+        sounds_enabled = tk.BooleanVar(value=self.preferences["sounds_enabled"])
         tips_enabled = tk.BooleanVar(value=self.preferences["tips_enabled"])
         large_text = tk.BooleanVar(value=self.preferences["accessibility_large_text"])
         dyslexia_font = tk.BooleanVar(value=self.preferences["accessibility_dyslexia_font"])
@@ -10707,6 +10869,9 @@ Features:
         ).pack(fill=tk.X, padx=16, pady=5)
         tk.Checkbutton(
             notifications, text="Show pyOS tips", variable=tips_enabled, anchor=tk.W,
+        ).pack(fill=tk.X, padx=16, pady=5)
+        tk.Checkbutton(
+            notifications, text="Enable GUI event sounds", variable=sounds_enabled, anchor=tk.W,
         ).pack(fill=tk.X, padx=16, pady=5)
         tk.Label(
             notifications,
@@ -10923,6 +11088,7 @@ Features:
                 "show_hidden_files": bool(hidden.get()),
                 "file_manager_start": start_location.get(),
                 "notifications_enabled": bool(notifications_enabled.get()),
+                "sounds_enabled": bool(sounds_enabled.get()),
                 "tips_enabled": bool(tips_enabled.get()),
                 "accessibility_large_text": bool(large_text.get()),
                 "accessibility_dyslexia_font": bool(dyslexia_font.get()),
@@ -11220,7 +11386,7 @@ def recover_startup_source_update(config, executable_handoff=False):
 
 
 def main():
-    """Main entry point"""
+    """Start pyOS while displaying live, actionable boot diagnostics."""
     if len(sys.argv) >= 3 and sys.argv[1] == "--custom-app":
         run_isolated_custom_app(sys.argv[2])
         return
@@ -11240,19 +11406,21 @@ def main():
         )
         failure_root.destroy()
         return
+
     root = tk.Tk()
-    root.withdraw()
+    startup = StartupStatusScreen(root)
+    startup.info("pyOS startup sequence initiated")
+    startup.debug(f"Runtime: Python {platform.python_version()} on {platform.system()}")
+    startup.info("Loading and validating configuration")
     try:
         startup_config = load_config()
-        # The executable handoff helper intentionally owns the global update
-        # lock until this replacement acknowledges a healthy startup.  Frozen
-        # builds never create source-overlay journals, so do not self-deadlock
-        # by trying to acquire that same lock during the one handoff launch.
-        # Every ordinary GUI/CLI startup still performs durable source recovery.
+        startup.debug(f"Data directory: {startup_config['data_dir']}")
+        startup.info("Checking for interrupted updates")
         recovered_update = recover_startup_source_update(
             startup_config, executable_handoff=bool(update_completion),
         )
     except (ConfigurationError, OSError, ValueError) as error:
+        startup.error(f"Update recovery failed: {error}")
         messagebox.showerror(
             "pyOS Update Recovery Required",
             f"pyOS could not safely recover an interrupted source update:\n\n{error}\n\n"
@@ -11262,52 +11430,74 @@ def main():
         root.destroy()
         return
     if recovered_update:
+        startup.warn("An interrupted source update was rolled back")
         messagebox.showinfo(
             "pyOS Update Recovered",
-            "An interrupted source update was rolled back before pyOS continued.",
-            parent=root,
+            "An interrupted source update was rolled back before pyOS continued.", parent=root,
         )
+    else:
+        startup.debug("No interrupted update requires recovery")
+
+    startup.info("Validating account storage")
     try:
-        # Validate account storage without waiting for interactive credentials.  A healthy
-        # replacement can then acknowledge promptly even when the user is away.
-        has_account()
+        account_exists = has_account()
     except (CredentialStoreError, ConfigurationError) as error:
+        startup.error(f"Account validation failed: {error}")
         messagebox.showerror(
             "pyOS Account Recovery Required",
-            f"pyOS detected invalid account state and failed closed. No replacement administrator was created.\n\n"
-            f"{error}\n\nRestore the validated credentials.json.bak file or repair the credential store, "
-            "then restart pyOS.", parent=root,
+            "pyOS detected invalid account state and failed closed. No replacement administrator was created.\n\n"
+            f"{error}\n\nRestore the validated credentials.json.bak file or repair the credential store, then restart pyOS.",
+            parent=root,
         )
         root.destroy()
         return
+    if account_exists:
+        startup.debug("Account storage passed validation")
+    else:
+        startup.warn("No account exists; first-run account setup is required")
+
     if update_completion:
+        startup.info("Acknowledging successful update startup")
         reference, acknowledgement = update_completion
         try:
             acknowledge_update_startup(reference, acknowledgement)
         except (OSError, ValueError) as error:
+            startup.error(f"Update acknowledgement failed: {error}")
             messagebox.showerror(
                 "pyOS Update", f"The new build could not acknowledge startup:\n{error}", parent=root,
             )
             root.destroy()
             return
+
+    startup.info("Waiting for authentication")
     try:
         username = authenticate(root, cancellable=False, allow_remembered=True)
     except (CredentialStoreError, ConfigurationError) as error:
+        startup.error(f"Authentication failed: {error}")
         messagebox.showerror(
             "pyOS Account Recovery Required",
-            f"pyOS detected invalid account state and failed closed. No replacement administrator was created.\n\n"
-            f"{error}\n\nRestore the validated credentials.json.bak file or repair the credential store, "
-            "then restart pyOS.", parent=root,
+            "pyOS detected invalid account state and failed closed. No replacement administrator was created.\n\n"
+            f"{error}\n\nRestore the validated credentials.json.bak file or repair the credential store, then restart pyOS.",
+            parent=root,
         )
         root.destroy()
         return
     if not username:
-        # authenticate() reports fail-closed storage recovery errors itself.
-        # Never turn an indeterminate authentication result into a desktop
-        # session, even when a dialog callback had to close early.
+        startup.warn("Authentication did not create a desktop session")
         root.destroy()
         return
-    app = DesktopGUI(root)
+
+    startup.ready(f"Authenticated as {username}; opening desktop")
+    startup.close()
+    root.withdraw()
+    try:
+        app = DesktopGUI(root)
+    except Exception as error:
+        failure = StartupStatusScreen(root)
+        failure.error(f"Desktop initialization failed: {error}")
+        messagebox.showerror("pyOS Startup Error", f"The desktop could not start:\n\n{error}", parent=root)
+        root.destroy()
+        return
     app.username = username
     app.system_user_var.set(username)
     if update_completion:
@@ -11317,6 +11507,7 @@ def main():
         app.save_preferences()
     root.update_idletasks()
     root.deiconify()
+    app.play_sound("startup")
     app.start_notifications()
     if len(sys.argv) >= 3 and sys.argv[1] == "--app":
         launcher = DESKTOP_APP_LAUNCHERS.get(sys.argv[2].casefold())
@@ -11331,7 +11522,6 @@ def main():
         else:
             messagebox.showerror("pyOS", f"Unknown desktop application: {sys.argv[2]}")
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()

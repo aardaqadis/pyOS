@@ -201,6 +201,8 @@ isolation is required.
 
 The default appearance is monochrome. Open **Settings > Appearance** to change system colors, select an installed text font and size, or use a solid/image desktop background. Animated GIF backgrounds are supported.
 
+Bundled sounds play for startup, notifications, locking, unlocking, and shutdown. Turn them on or off under **Settings > Notifications > Enable GUI event sounds**. Missing audio tools or sound files never prevent the desktop from starting.
+
 ## System Bar
 
 The persistent top bar provides pyOS-wide controls:

@@ -25,8 +25,9 @@ from pyos_config import (
 SOURCE_DIR = Path(__file__).resolve().parent
 APPLICATION_FILES = (
     "pyOSgui.py", "pyOScli.py", "pyos_config.py", "pyos_auth.py", "pyos_updater.py",
-    "setup.py", "README.md"
+    "setup.py", "README.md", "pyos2.0.png"
 )
+APPLICATION_TREES = ("sounds",)
 PYTHON_PACKAGES = (
     "chess>=1.11,<2.0",
     "fido2>=2.2,<3.0",
@@ -489,6 +490,8 @@ class InstallerCore:
         } | {"pyOS GUI.cmd", "pyOS CLI.cmd"}
         for relative in sorted(planned_files):
             self._assert_install_destination(relative, OWNED_FILE)
+        for relative in APPLICATION_TREES:
+            self._assert_install_destination(relative, OWNED_TREE)
         self._assert_install_destination(".venv", OWNED_TREE)
 
         if self.create_shortcuts and os.name == "nt":
@@ -670,6 +673,17 @@ class InstallerCore:
             if not self.dry_run and source.resolve() != destination.resolve():
                 self._assert_install_destination(name, OWNED_FILE)
                 shutil.copy2(source, destination)
+
+        for name in APPLICATION_TREES:
+            source = SOURCE_DIR / name
+            if not source.is_dir():
+                continue
+            destination = self.install_dir / name
+            self.log(f"  {name}/")
+            self._claim_owned_tree(name)
+            if not self.dry_run and source.resolve() != destination.resolve():
+                self._assert_install_destination(name, OWNED_TREE)
+                shutil.copytree(source, destination, dirs_exist_ok=True)
 
     def create_environment(self):
         self.log(f"Creating isolated Python environment: {self.venv_dir}")

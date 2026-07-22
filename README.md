@@ -40,6 +40,8 @@ python -m pytest
 python -m ruff check .
 ```
 
+GitHub Actions runs these unit checks on Windows, macOS, and Ubuntu. The audio tests exercise both the Windows `winsound` and Linux `paplay` backends without requiring speakers or a desktop session.
+
 Pytest discovers the maintained suite under `tests/`. Generated caches, local environments, and build outputs are
 excluded from both test and lint discovery.
 

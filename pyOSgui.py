@@ -39,6 +39,10 @@ import zipfile
 from collections import deque
 from pathlib import Path
 
+# Keep filesystem path semantics tied to the host that imported this module.
+# Tests may mock os.name to exercise another platform's playback backend.
+NATIVE_PATH_TYPE = type(Path())
+
 import pyos_config as pyos_storage
 from pyos_config import (
     CONFIG_FILE,
@@ -672,9 +676,12 @@ class GuiSoundPlayer:
     """Best-effort, non-blocking playback for bundled GUI event sounds."""
 
     def __init__(self, resource_root=None):
-        root = Path(resource_root) if resource_root else Path(
-            getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)
-        )
+        if resource_root is not None:
+            root = NATIVE_PATH_TYPE(resource_root)
+        else:
+            root = NATIVE_PATH_TYPE(
+                getattr(sys, "_MEIPASS", NATIVE_PATH_TYPE(__file__).resolve().parent)
+            )
         self.sound_dir = root / "sounds"
 
     def play(self, event):

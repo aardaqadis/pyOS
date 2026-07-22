@@ -162,6 +162,26 @@ class GuiSoundTests(unittest.TestCase):
 
             winsound.PlaySound.assert_called_once_with(str(sound), 7)
 
+    def test_linux_sound_uses_nonblocking_available_player(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sound_dir = Path(temporary) / "sounds"
+            sound_dir.mkdir()
+            sound = sound_dir / "Windows Notify.wav"
+            sound.write_bytes(b"RIFF")
+            popen = Mock()
+            with (
+                patch("pyOSgui.os.name", "posix"),
+                patch("pyOSgui.sys.platform", "linux"),
+                patch("pyOSgui.shutil.which", side_effect=lambda name: "/usr/bin/paplay" if name == "paplay" else None),
+                patch("pyOSgui.subprocess.Popen", popen),
+            ):
+                self.assertTrue(pyOSgui.GuiSoundPlayer(temporary).play("notification"))
+
+            popen.assert_called_once_with(
+                ["/usr/bin/paplay", str(sound)],
+                stdout=pyOSgui.subprocess.DEVNULL,
+                stderr=pyOSgui.subprocess.DEVNULL,
+            )
     def test_desktop_sound_preference_can_disable_playback(self):
         app = object.__new__(pyOSgui.DesktopGUI)
         app.preferences = {"sounds_enabled": False}

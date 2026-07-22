@@ -551,9 +551,13 @@ def _validated_config(raw):
     # Defaults describe the genuinely missing, standalone first-run state.  An
     # on-disk configuration is different: once a config file exists, omitted
     # fields must not silently redirect storage to newly inferred locations.
+    # "enabled_apps" is intentionally not required: it was added after the first
+    # installer version, and a config written before it (installer_version 1)
+    # must stay valid.  A missing value means "all apps enabled" everywhere it is
+    # read (see DesktopGUI._app_enabled), so its absence is safe.
     required = {
         "install_dir", "data_dir", "downloads_dir", "drive_b_dir",
-        "enabled_apps", "configured",
+        "configured",
     }
     if not required.issubset(raw):
         return None

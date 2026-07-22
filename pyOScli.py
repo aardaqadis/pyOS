@@ -207,11 +207,14 @@ class VirtualDrive:
             return False
 
 class PythonOS:
+    VERSION = "3.0"
     COMMAND_QUEUE_LIMIT = 8
     AUXILIARY_QUEUE_LIMIT = 8
     AUXILIARY_WORKERS = 2
     UI_QUEUE_LIMIT = 1024
     SHUTDOWN_WAIT_SECONDS = 3.0
+    SHELL_TIMEOUT_SECONDS = 60
+    SHELL_OUTPUT_LIMIT = 1_000_000
     # Central policy keeps optional-app and mutation decisions out of the
     # legacy conditional dispatcher.  Unknown commands are external shell
     # commands and therefore conservatively treated as mutations.
@@ -239,6 +242,8 @@ class PythonOS:
         "extract": {"mutates": True}, "download": {"mutates": True},
         "monochrome": {"mutates": True}, "color": {"mutates": True},
         "font": {"mutates": True}, "fontsize": {"mutates": True},
+        "powershell": {"mutates": True}, "ps": {"mutates": True},
+        "wsl": {"mutates": True},
     }
     BUILTIN_COMMANDS = {
         "cd", "drives", "driveinfo", "drive_info", "open", "start", "explorer", "files",
@@ -254,6 +259,7 @@ class PythonOS:
         "netstat", "ping", "network", "download", "sysinfo", "diskspace", "tasklist", "ps",
         "search", "find", "theme", "settings", "color", "font", "fontsize", "theme_info",
         "deskgui", "help", "commands", "weather", "news", "pyai", "modding",
+        "powershell", "ps", "wsl", "stop",
     }
 
     def __init__(self, root):
@@ -280,7 +286,7 @@ class PythonOS:
         self._auth_generation = 0
         self._lock_overlay = None
         self._ui_after = None
-        self.root.title("Python OS - Monochrome Command Center")
+        self.root.title(f"pyOS {self.VERSION} - Command Center")
         self.root.geometry("1200x800")
         
         # Load theme settings
@@ -404,6 +410,19 @@ class PythonOS:
         menubar.add_cascade(label="Network", menu=network_menu)
         network_menu.add_command(label="Network Status", command=self.show_network_status)
         network_menu.add_command(label="IP Configuration", command=self.show_ipconfig)
+
+        shell_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Shell", menu=shell_menu)
+        shell_menu.add_command(
+            label="Windows PowerShell Command...",
+            command=lambda: self.prompt_host_shell("powershell"),
+        )
+        shell_menu.add_command(
+            label="WSL Command...",
+            command=lambda: self.prompt_host_shell("wsl"),
+        )
+        shell_menu.add_separator()
+        shell_menu.add_command(label="Stop Active Command", command=self.stop_active_command)
         
         settings_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Settings", menu=settings_menu)
@@ -494,10 +513,11 @@ class PythonOS:
         self.command_input.bind('<Down>', self.history_down)
         
         ttk.Button(input_frame, text="Execute", command=self.execute_command).pack(side=tk.LEFT, padx=5)
+        ttk.Button(input_frame, text="Stop", command=self.stop_active_command).pack(side=tk.LEFT, padx=5)
         
         self.refresh_files()
         self.log_message("Type 'help' for commands\n")
-        self.log_message("pyOS - v1.0.1a\n\n")
+        self.log_message(f"pyOS Command Center {self.VERSION}\n\n")
         self.command_input.focus()
 
     def _on_ui_thread(self):
@@ -683,6 +703,88 @@ class PythonOS:
         self._cancel_auxiliary_work()
         self._terminate_children()
 
+    def stop_active_command(self):
+        """Cancel active command and auxiliary work without closing the CLI."""
+        if self._closing:
+            return
+        with self._active_command_lock:
+            active = self._active_command_task is not None
+        self._cancel_active_work()
+        self.log_message(
+            "Cancellation requested.\n" if active else "No command is currently running.\n"
+        )
+
+    def prompt_host_shell(self, shell_name):
+        """Prompt for a one-shot host-shell command whose output stays in the CLI."""
+        if self._locked or self._closing or not self.ensure_authenticated():
+            return
+        label = "Windows PowerShell" if shell_name == "powershell" else "WSL"
+        command = simpledialog.askstring(
+            f"Run {label}",
+            f"Enter a {label} command:",
+            parent=self.root,
+        )
+        if command and command.strip():
+            self.input_var.set(f"{shell_name} {command.strip()}")
+            self.execute_command()
+
+    @staticmethod
+    def _host_shell_arguments(shell_name, command, working_directory):
+        """Return a shell executable and arguments without invoking an implicit host shell."""
+        name = str(shell_name).casefold()
+        if os.name != "nt":
+            raise OSError("Windows PowerShell and WSL integration is available only on Windows.")
+        if not command.strip():
+            raise ValueError(f"Usage: {name} <command>")
+        if name in {"powershell", "ps"}:
+            executable = shutil.which("powershell.exe") or shutil.which("powershell")
+            if not executable:
+                raise OSError("Windows PowerShell was not found.")
+            return [
+                executable, "-NoLogo", "-NoProfile", "-NonInteractive",
+                "-ExecutionPolicy", "Bypass", "-Command", command,
+            ]
+        if name == "wsl":
+            executable = shutil.which("wsl.exe") or shutil.which("wsl")
+            if not executable:
+                raise OSError(
+                    "WSL was not found. Install it from an elevated PowerShell prompt with: wsl --install"
+                )
+            return [executable, "--cd", os.path.abspath(working_directory), "--exec", "sh", "-lc", command]
+        raise ValueError(f"Unsupported host shell: {shell_name}")
+
+    @classmethod
+    def _bounded_shell_output(cls, output):
+        output = output or ""
+        if len(output) <= cls.SHELL_OUTPUT_LIMIT:
+            return output
+        omitted = len(output) - cls.SHELL_OUTPUT_LIMIT
+        return output[:cls.SHELL_OUTPUT_LIMIT] + f"\n[Output truncated; {omitted:,} characters omitted.]\n"
+
+    def _run_host_shell(self, shell_name, command):
+        try:
+            args = self._host_shell_arguments(shell_name, command, self._working_directory())
+            returncode, stdout, stderr = self._run_tracked_capture(
+                args,
+                cwd=self._working_directory(),
+                timeout=self.SHELL_TIMEOUT_SECONDS,
+            )
+            output = self._bounded_shell_output(stdout)
+            errors = self._bounded_shell_output(stderr)
+            if output:
+                self.log_message(output + ("" if output.endswith("\n") else "\n"))
+            if errors:
+                self.log_message(errors + ("" if errors.endswith("\n") else "\n"))
+            if returncode and not errors:
+                self.log_message(f"{shell_name} exited with status {returncode}.\n")
+            elif not output and not errors:
+                self.log_message(f"{shell_name} completed successfully.\n")
+        except subprocess.TimeoutExpired:
+            self.log_message(
+                f"{shell_name} timed out after {self.SHELL_TIMEOUT_SECONDS} seconds and was stopped.\n"
+            )
+        except (OSError, ValueError) as error:
+            self.log_message(f"Could not run {shell_name}: {error}\n")
     def _cancel_auxiliary_work(self):
         with self._active_auxiliary_lock:
             for active in self._active_auxiliary_tasks.values():
@@ -1452,6 +1554,10 @@ class PythonOS:
         command = self.input_var.get().strip()
         if not command:
             return
+        if command.casefold() == "stop":
+            self.input_var.set("")
+            self.stop_active_command()
+            return
         if not self.ensure_authenticated():
             return
         task = CommandTask(
@@ -1631,6 +1737,10 @@ class PythonOS:
 
             elif command_name == "time":
                 self.log_message(datetime.now().strftime("%H:%M:%S\n"))
+
+            elif command_name in {"powershell", "ps", "wsl"}:
+                shell_command = command.partition(" ")[2].strip()
+                self._run_host_shell(command_name, shell_command)
 
             elif command_name == "whoami":
                 self.log_message(f"{os.getenv('USERNAME') or os.getenv('USER') or 'unknown'}\n")
@@ -3089,6 +3199,11 @@ APPLICATIONS
   deskgui                   Launch the pyOS desktop GUI
   gui_settings              Display saved pyOS GUI preferences
 
+HOST SHELLS (WINDOWS)
+  powershell | ps <command>  Run Windows PowerShell inside the pyOS console
+  wsl <command>              Run a WSL command inside the pyOS console
+  stop                       Cancel the active command
+
 NETWORK AND SYSTEM
   ipconfig | ifconfig       Show network configuration
   ping <host>               Ping a host
@@ -3112,32 +3227,22 @@ CONSOLE
         self.log_message(commands + "\n")
 
     def show_about(self):
-        """Show about information"""
-        about = """Python OS v3.0
-Advanced Terminal with Virtual Drives, Customization & File Operations
+        """Show current Command Center capabilities."""
+        about = f"""pyOS Command Center {self.VERSION}
 
-Features:
-• GUI-based terminal with file browser
-• Virtual drives (A: temp, B: permanent, C: home)
-• Network diagnostics and monitoring
-• System information and process management
-• 📄 ADVANCED FILE OPERATIONS (20+ commands):
-  - Create, edit, append, rename files
-  - Search text in files, count lines
-  - Show head/tail/hexdump of files
-  - Archive/extract zip files
-  - Filter files and directories
-• 🎨 CUSTOMIZABLE COLORS - Change console/list colors
-• 🔤 CUSTOMIZABLE FONTS - Choose your font family
-• 📏 CUSTOMIZABLE FONT SIZE - Adjust text size (8-24)
-• ⚙️ PERSISTENT SETTINGS - Preferences saved
-• Command history and autocomplete
-• Cross-platform support
++ Authenticated command and file workspace
++ Temporary and persistent virtual drives
++ Bounded background command queues
++ Tracked Windows PowerShell and WSL commands
++ Safe cancellation, lock, and coordinated shutdown
++ Network, system, archive, hashing, and search tools
++ Configurable console and file-list appearance
++ Enabled pyOS desktop application launchers
 
-Built with Python & Tkinter
+PowerShell and WSL integration is available on Windows. Host-shell commands run
+with the permissions of the signed-in operating-system user.
 """
-        messagebox.showinfo("About Python OS", about)
-
+        messagebox.showinfo("About pyOS Command Center", about)
 
 def main():
     try:

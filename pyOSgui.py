@@ -4598,7 +4598,7 @@ class DesktopGUI:
     def _custom_apps_directory(self):
         path = self.settings_path.parent / "apps"
         path.mkdir(parents=True, exist_ok=True)
-        register_owned_path(path)
+        register_owned_path(path, kind=pyos_storage.OWNED_TREE)
         return path
 
     def run_custom_app(self, path):

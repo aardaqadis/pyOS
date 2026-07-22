@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pyOSgui
+
 from pyOSgui import (
     RequestGate,
     TkTaskManager,
@@ -133,6 +135,18 @@ class TextDocumentTests(unittest.TestCase):
             self.assertEqual(image.format, "JPEG")
             self.assertEqual(target.read_bytes(), b"complete image")
             self.assertEqual(list(target.parent.glob(f".{target.name}.*{target.suffix}")), [])
+
+
+class CustomAppStorageTests(unittest.TestCase):
+    def test_custom_apps_directory_is_registered_as_an_owned_tree(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            app = object.__new__(pyOSgui.DesktopGUI)
+            app.settings_path = Path(temporary) / "profile" / "gui_settings.json"
+            with patch("pyOSgui.register_owned_path") as register:
+                path = app._custom_apps_directory()
+
+            self.assertTrue(path.is_dir())
+            register.assert_called_once_with(path, kind=pyOSgui.pyos_storage.OWNED_TREE)
 
 
 class AsyncSafetyTests(unittest.TestCase):

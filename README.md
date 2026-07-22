@@ -530,6 +530,20 @@ The shared setup configuration is stored in:
 
 Run `help` in pyOS CLI for the complete command reference.
 
+On Windows, the Command Center can run one-shot Windows PowerShell and WSL commands while keeping their output
+inside the pyOS console:
+
+```text
+powershell Get-ChildItem -Force
+ps Get-Process | Sort-Object CPU -Descending
+wsl uname -a
+wsl ls -la
+```
+
+Commands run from the Command Center's current directory through tracked child processes. Use the **Stop** button,
+the **Shell > Stop Active Command** menu item, or enter `stop` to cancel active work. Shell commands time out after
+60 seconds, and displayed output is bounded. WSL commands require Windows Subsystem for Linux to be installed.
+
 ### Navigation and Files
 
 ```text

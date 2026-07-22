@@ -42,6 +42,48 @@ def _bare_cli(current_directory):
 
 
 class CommandSafetyTests(unittest.TestCase):
+    def test_windows_powershell_uses_explicit_noninteractive_arguments(self):
+        with (
+            mock.patch("pyOScli.os.name", "nt"),
+            mock.patch(
+                "pyOScli.shutil.which",
+                side_effect=lambda name: "powershell.exe" if name == "powershell.exe" else None,
+            ),
+        ):
+            args = pyOScli.PythonOS._host_shell_arguments(
+                "powershell", "Get-ChildItem -Force", r"C:\work",
+            )
+
+        self.assertEqual(args[0], "powershell.exe")
+        self.assertIn("-NonInteractive", args)
+        self.assertEqual(args[-2:], ["-Command", "Get-ChildItem -Force"])
+
+    def test_wsl_runs_from_the_cli_working_directory(self):
+        with (
+            mock.patch("pyOScli.os.name", "nt"),
+            mock.patch(
+                "pyOScli.shutil.which",
+                side_effect=lambda name: "wsl.exe" if name == "wsl.exe" else None,
+            ),
+            mock.patch("pyOScli.os.path.abspath", return_value=r"C:\work"),
+        ):
+            args = pyOScli.PythonOS._host_shell_arguments("wsl", "ls -la", r"C:\work")
+
+        self.assertEqual(
+            args,
+            ["wsl.exe", "--cd", r"C:\work", "--exec", "sh", "-lc", "ls -la"],
+        )
+
+    def test_host_shell_is_windows_only(self):
+        with mock.patch("pyOScli.os.name", "posix"):
+            with self.assertRaisesRegex(OSError, "only on Windows"):
+                pyOScli.PythonOS._host_shell_arguments("wsl", "pwd", "/tmp")
+
+    def test_shell_output_is_bounded(self):
+        output = "x" * (pyOScli.PythonOS.SHELL_OUTPUT_LIMIT + 12)
+        bounded = pyOScli.PythonOS._bounded_shell_output(output)
+        self.assertIn("12 characters omitted", bounded)
+        self.assertLess(len(bounded), len(output) + 100)
     def test_enqueued_command_keeps_working_directory_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary:
             first = Path(temporary) / "first"

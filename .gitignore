@@ -10,10 +10,10 @@ __pycache__/
 .pytest_cache/
 .coverage
 
-# Reproducible build output; keep only the public release executable
+# Reproducible build output; publish release executables as CI artifacts rather
+# than committing generated binaries to source control.
 build/
-dist/*
-!dist/pyOS.exe
+dist/
 
 # Temporary files and logs
 *.log

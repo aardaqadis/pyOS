@@ -5,6 +5,8 @@ from tkinter import colorchooser, filedialog, messagebox, scrolledtext, simpledi
 import subprocess
 import os
 import json
+import codecs
+import locale
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -34,24 +36,37 @@ import platform
 import tempfile
 import http.server
 import zipfile
+from collections import deque
 from pathlib import Path
 
+import pyos_config as pyos_storage
 from pyos_config import (
     CONFIG_FILE,
-    get_cli_settings_path,
+    ConfigurationError,
+    JSONPersistenceError,
+    OWNER_FILENAME,
+    StorageOwnershipError,
+    atomic_write_json,
+    ensure_storage_owner,
     get_data_dir,
     get_downloads_dir,
     get_drive_b_dir,
     get_gui_settings_path,
     get_profile_dir,
+    get_standalone_root,
     load_config,
+    remove_owned_storage_paths,
+    register_owned_path,
     relaunch_in_configured_environment,
+    verify_storage_owner,
 )
 from pyos_auth import (
+    CredentialStoreError,
     authenticate,
     change_credentials_dialog,
-    credentials_path,
+    clear_remembered_session,
     get_username,
+    has_account,
     has_passkey,
     is_admin,
     manage_accounts_dialog,
@@ -62,7 +77,7 @@ from pyos_auth import (
 )
 from pyos_updater import (
     current_git_ref, executable_asset, git_has_local_changes,
-    install_source_update, latest_update, stage_executable_update,
+    install_source_update, latest_update, recover_source_update, stage_executable_update,
 )
 
 AUDIO_EXTENSIONS = {
@@ -75,6 +90,535 @@ MEDIA_EXTENSIONS = AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
 IMAGE_EXTENSIONS = {
     ".apng", ".bmp", ".gif", ".ico", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp",
 }
+
+OPTIONAL_APP_METHODS = {
+    "pyai": {"open_ai_chat"},
+    "browser": {"open_browser"},
+    "media": {"open_media_player"},
+    "messenger": {"open_messenger"},
+    "games": {"open_games_suite", "open_eight_ball_pool", "open_snake", "open_sudoku", "open_chess"},
+    "weather": {"open_weather"},
+    "news": {"open_news"},
+    "ide": {"open_python_ide", "open_app_maker"},
+    "modding": {"open_modding_environment"},
+}
+METHOD_OPTIONAL_APP = {
+    method: app_id for app_id, methods in OPTIONAL_APP_METHODS.items() for method in methods
+}
+
+MAX_MESSENGER_HISTORY = 500
+MAX_MESSENGER_IMAGES = 100
+MAX_MESSENGER_HISTORY_BYTES = 16 * 1024 * 1024
+MAX_MESSENGER_HISTORY_IMAGE_BYTES = 15 * 1024 * 1024
+MAX_AI_MESSAGES = 100
+MAX_TEXT_WIDGET_CHARS = 1_000_000
+
+
+class TkTaskManager:
+    """Run bounded work and dispatch every Tk callback on Tk's thread.
+
+    Completion/control callbacks use a small-volume, lossless priority lane.
+    Noisy progress and display events use a separate bounded lane where callers
+    may coalesce repeated updates under one stable key.
+    """
+
+    def __init__(self, root, max_workers=6, max_pending=48, max_callbacks=2048):
+        self.root = root
+        self._callbacks = queue.SimpleQueue()
+        self._events = {}
+        self._events_lock = threading.Lock()
+        self._max_events = max_callbacks
+        self._work = queue.Queue(maxsize=max_pending)
+        self._closed = threading.Event()
+        self._workers = []
+        for index in range(max_workers):
+            worker = threading.Thread(
+                target=self._work_loop, name=f"pyos-task-{index + 1}", daemon=True,
+            )
+            worker.start()
+            self._workers.append(worker)
+        self._after = self.root.after(20, self._drain)
+
+    def post(self, callback, *args, **kwargs):
+        """Post a lossless, high-priority completion/control callback."""
+        if self._closed.is_set():
+            return False
+        self._callbacks.put((callback, args, kwargs))
+        return True
+
+    def post_event(self, callback, *args, coalesce_key=None, **kwargs):
+        """Post bounded ordinary UI work, replacing an older matching event."""
+        if self._closed.is_set():
+            return False
+        event_key = (
+            ("coalesced", coalesce_key)
+            if coalesce_key is not None else ("event", object())
+        )
+        with self._events_lock:
+            if self._closed.is_set():
+                return False
+            if event_key not in self._events and len(self._events) >= self._max_events:
+                return False
+            self._events[event_key] = (callback, args, kwargs)
+        return True
+
+    def submit(self, callback, *args, **kwargs):
+        if self._closed.is_set():
+            return None
+        try:
+            self._work.put_nowait((callback, args, kwargs))
+        except queue.Full as error:
+            raise RuntimeError("Too many pyOS tasks are already running.") from error
+        return True
+
+    def _work_loop(self):
+        while not self._closed.is_set():
+            try:
+                item = self._work.get(timeout=.25)
+            except queue.Empty:
+                continue
+            if item is None:
+                self._work.task_done()
+                return
+            callback, args, kwargs = item
+            try:
+                callback(*args, **kwargs)
+            except Exception as error:
+                self.post(self.root.report_callback_exception, type(error), error, error.__traceback__)
+            finally:
+                self._work.task_done()
+
+    def _drain(self):
+        self._after = None
+        if self._closed.is_set():
+            return
+        for _index in range(200):
+            try:
+                callback, args, kwargs = self._callbacks.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback(*args, **kwargs)
+            except Exception as error:
+                if not self._closed.is_set():
+                    try:
+                        self.root.report_callback_exception(type(error), error, error.__traceback__)
+                    except tk.TclError:
+                        pass
+        for _index in range(200):
+            with self._events_lock:
+                if not self._events:
+                    break
+                event_key = next(iter(self._events))
+                callback, args, kwargs = self._events.pop(event_key)
+            try:
+                callback(*args, **kwargs)
+            except Exception as error:
+                if not self._closed.is_set():
+                    try:
+                        self.root.report_callback_exception(type(error), error, error.__traceback__)
+                    except tk.TclError:
+                        pass
+        if not self._closed.is_set():
+            self._after = self.root.after(20, self._drain)
+
+    def shutdown(self, wait_timeout=1.5):
+        """Stop accepting work and report whether every worker has exited.
+
+        Active callbacks cannot be killed safely.  The return value lets the
+        desktop retain session-temporary files until no worker can still be
+        using them.
+        """
+        if not self._closed.is_set():
+            self._closed.set()
+            if self._after is not None:
+                try:
+                    self.root.after_cancel(self._after)
+                except tk.TclError:
+                    pass
+                self._after = None
+            while True:
+                try:
+                    self._work.get_nowait()
+                    self._work.task_done()
+                except queue.Empty:
+                    break
+            while True:
+                try:
+                    self._callbacks.get_nowait()
+                except queue.Empty:
+                    break
+            with self._events_lock:
+                self._events.clear()
+        deadline = time.monotonic() + max(0.0, float(wait_timeout))
+        for worker in self._workers:
+            if worker is threading.current_thread():
+                continue
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        return not any(worker.is_alive() for worker in self._workers)
+
+
+class UiTextBatcher:
+    """Coalesce producer text behind at most one lossless UI callback."""
+
+    def __init__(self, post_callback, consume, max_pending_chars=256 * 1024):
+        self._post_callback = post_callback
+        self._consume = consume
+        self._max_pending_chars = max_pending_chars
+        self._chunks = deque()
+        self._characters = 0
+        self._scheduled = False
+        self._closed = False
+        self._truncated = False
+        self._lock = threading.Lock()
+
+    def append(self, text):
+        if not text:
+            return True
+        text = str(text)
+        schedule = False
+        with self._lock:
+            if self._closed:
+                return False
+            self._chunks.append(text)
+            self._characters += len(text)
+            while self._characters > self._max_pending_chars and self._chunks:
+                excess = self._characters - self._max_pending_chars
+                oldest = self._chunks[0]
+                if len(oldest) <= excess:
+                    self._chunks.popleft()
+                    self._characters -= len(oldest)
+                else:
+                    self._chunks[0] = oldest[excess:]
+                    self._characters -= excess
+                self._truncated = True
+            if not self._scheduled:
+                self._scheduled = True
+                schedule = True
+        if schedule and not self._post_callback(self._drain):
+            with self._lock:
+                self._scheduled = False
+                self._chunks.clear()
+                self._characters = 0
+                self._truncated = False
+            return False
+        return True
+
+    def _drain(self):
+        with self._lock:
+            if self._closed:
+                self._scheduled = False
+                self._chunks.clear()
+                self._characters = 0
+                self._truncated = False
+                return
+            text = "".join(self._chunks)
+            truncated = self._truncated
+            self._chunks.clear()
+            self._characters = 0
+            self._truncated = False
+            self._scheduled = False
+        if truncated:
+            text = "[... pending output truncated ...]\n" + text
+        if text:
+            self._consume(text)
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            self._chunks.clear()
+            self._characters = 0
+            self._truncated = False
+
+
+class RequestGate:
+    """Reject stale asynchronous results after a newer request or window close."""
+
+    def __init__(self):
+        self._generation = 0
+        self._closed = False
+
+    def next(self):
+        self._generation += 1
+        return self._generation
+
+    def valid(self, generation):
+        return not self._closed and generation == self._generation
+
+    def close(self):
+        self._closed = True
+        self._generation += 1
+
+
+def _detect_newline(text):
+    counts = {"\r\n": text.count("\r\n"), "\r": text.count("\r") - text.count("\r\n"),
+              "\n": text.count("\n") - text.count("\r\n")}
+    return max(counts, key=counts.get) if any(counts.values()) else os.linesep
+
+
+def _newline_layout(text):
+    separators = tuple(re.findall(r"\r\n|\r|\n", text))
+    default = _detect_newline(text)
+    if len(set(separators)) <= 1:
+        return separators[0] if separators else default
+    return {"default": default, "separators": separators}
+
+
+def _reject_likely_binary_text(text):
+    if "\x00" in text:
+        raise UnicodeError("The file contains NUL bytes and does not appear to be text.")
+    forbidden_controls = [
+        character for character in text
+        if ((ord(character) < 32 and character not in "\t\n\r\f")
+            or 0x7F <= ord(character) <= 0x9F)
+    ]
+    if forbidden_controls:
+        raise UnicodeError("The file contains binary control bytes and was not opened as text.")
+
+
+def decode_text_document(data):
+    """Decode text strictly while retaining its encoding, BOM, and exact line endings."""
+    bom = b""
+    if data.startswith(codecs.BOM_UTF8):
+        encoding, bom, payload = "utf-8", codecs.BOM_UTF8, data[len(codecs.BOM_UTF8):]
+    elif data.startswith(codecs.BOM_UTF32_LE):
+        encoding, bom, payload = "utf-32-le", codecs.BOM_UTF32_LE, data[len(codecs.BOM_UTF32_LE):]
+    elif data.startswith(codecs.BOM_UTF32_BE):
+        encoding, bom, payload = "utf-32-be", codecs.BOM_UTF32_BE, data[len(codecs.BOM_UTF32_BE):]
+    elif data.startswith(codecs.BOM_UTF16_LE):
+        encoding, bom, payload = "utf-16-le", codecs.BOM_UTF16_LE, data[len(codecs.BOM_UTF16_LE):]
+    elif data.startswith(codecs.BOM_UTF16_BE):
+        encoding, bom, payload = "utf-16-be", codecs.BOM_UTF16_BE, data[len(codecs.BOM_UTF16_BE):]
+    else:
+        bom, payload = b"", data
+        candidates = ["utf-8", locale.getpreferredencoding(False), "latin-1"]
+        encoding = None
+        for candidate in dict.fromkeys(candidates):
+            try:
+                text = payload.decode(candidate, errors="strict")
+                encoding = candidate
+                break
+            except (LookupError, UnicodeDecodeError):
+                continue
+        if encoding is None:
+            raise UnicodeError("The file encoding could not be identified safely.")
+    if bom:
+        text = payload.decode(encoding, errors="strict")
+    _reject_likely_binary_text(text)
+    newline = _newline_layout(text)
+    return text.replace("\r\n", "\n").replace("\r", "\n"), encoding, bom, newline
+
+
+def encode_text_document(text, encoding="utf-8", bom=b"", newline="\n"):
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if isinstance(newline, dict):
+        default = newline.get("default", os.linesep)
+        separators = tuple(newline.get("separators", ()))
+        if default not in {"\r\n", "\r", "\n"}:
+            default = os.linesep
+        pieces = normalized.split("\n")
+        rebuilt = [pieces[0]]
+        for index, piece in enumerate(pieces[1:]):
+            separator = separators[index] if index < len(separators) else default
+            if separator not in {"\r\n", "\r", "\n"}:
+                separator = default
+            rebuilt.extend((separator, piece))
+        normalized = "".join(rebuilt)
+    elif newline != "\n":
+        normalized = normalized.replace("\n", newline)
+    return bom + normalized.encode(encoding, errors="strict")
+
+
+def atomic_write_bytes(path, data):
+    """Replace one file atomically without a shared fixed temporary filename."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        if path.exists():
+            try:
+                shutil.copymode(path, temporary)
+            except OSError:
+                pass
+        os.replace(temporary, path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _atomic_save_ssh_host_keys(paramiko_module, host_keys, path):
+    """Durably replace one Paramiko known-hosts file from a same-directory temp."""
+    path = Path(path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    temporary = Path(temporary_name)
+    os.close(descriptor)
+    try:
+        try:
+            os.chmod(temporary, 0o600)
+        except OSError:
+            pass
+        host_keys.save(str(temporary))
+
+        # Refuse to replace a good file with output Paramiko cannot read back.
+        validated = paramiko_module.HostKeys()
+        validated.load(str(temporary))
+        with temporary.open("r+b") as stream:
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.chmod(temporary, 0o600)
+        except OSError:
+            pass
+        os.replace(temporary, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        if os.name != "nt":
+            try:
+                directory = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            except OSError:
+                pass
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def load_ssh_host_keys_locked(paramiko_module, client, path):
+    """Load pyOS SSH host keys without racing a concurrent accepted-key update."""
+    path = Path(path).expanduser()
+    try:
+        with pyos_storage._path_lock(path):
+            if path.exists():
+                client.load_host_keys(str(path))
+    except Exception as error:
+        raise paramiko_module.SSHException(
+            f"Stored SSH host keys could not be read safely: {path}"
+        ) from error
+
+
+def persist_ssh_host_key(paramiko_module, path, hostname, key):
+    """Merge and atomically persist an accepted key without losing peer updates."""
+    path = Path(path).expanduser()
+    try:
+        with pyos_storage._path_lock(path):
+            latest = paramiko_module.HostKeys()
+            if path.exists():
+                latest.load(str(path))
+            latest.add(hostname, key.get_name(), key)
+            _atomic_save_ssh_host_keys(paramiko_module, latest, path)
+    except Exception as error:
+        if isinstance(error, paramiko_module.SSHException):
+            raise
+        raise paramiko_module.SSHException(
+            f"The accepted SSH host key could not be saved safely: {path}"
+        ) from error
+
+
+def atomic_save_image(image, path):
+    """Encode an image beside its destination and replace only after a durable write."""
+    path = Path(path)
+    image_format = {
+        ".bmp": "BMP",
+        ".gif": "GIF",
+        ".jpeg": "JPEG",
+        ".jpg": "JPEG",
+        ".png": "PNG",
+        ".tif": "TIFF",
+        ".tiff": "TIFF",
+        ".webp": "WEBP",
+    }.get(path.suffix.casefold())
+    if image_format is None:
+        raise ValueError(f"Unsupported image format: {path.suffix or '(no extension)'}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=path.suffix, dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w+b") as output:
+            image.save(output, format=image_format)
+            output.flush()
+            os.fsync(output.fileno())
+        if path.exists():
+            try:
+                shutil.copymode(path, temporary)
+            except OSError:
+                pass
+        os.replace(temporary, path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def document_needs_save_as(current_path, target_path):
+    """Require a file chooser for first save or an edited destination path."""
+    return current_path is None or Path(target_path).expanduser() != Path(current_path).expanduser()
+
+
+def count_sudoku_solutions(board, limit=2):
+    """Count Sudoku solutions up to *limit* using minimum-candidate search."""
+    grid = [list(row) for row in board]
+    if len(grid) != 9 or any(len(row) != 9 for row in grid):
+        raise ValueError("A Sudoku board must contain 9 rows of 9 cells.")
+    if any(not isinstance(value, int) or not 0 <= value <= 9 for row in grid for value in row):
+        raise ValueError("Sudoku cells must be integers from 0 through 9.")
+    units = [list(row) for row in grid]
+    units.extend([[grid[row][column] for row in range(9)] for column in range(9)])
+    units.extend([
+        [grid[row][column] for row in range(box_row, box_row + 3)
+         for column in range(box_column, box_column + 3)]
+        for box_row in range(0, 9, 3) for box_column in range(0, 9, 3)
+    ])
+    if any(len([value for value in unit if value]) != len({value for value in unit if value})
+           for unit in units):
+        return 0
+
+    def candidates(row, column):
+        used = set(grid[row])
+        used.update(grid[index][column] for index in range(9))
+        box_row, box_column = row - row % 3, column - column % 3
+        used.update(grid[r][c] for r in range(box_row, box_row + 3)
+                    for c in range(box_column, box_column + 3))
+        return [value for value in range(1, 10) if value not in used]
+
+    def solve():
+        best = None
+        for row in range(9):
+            for column in range(9):
+                if grid[row][column] == 0:
+                    choices = candidates(row, column)
+                    if not choices:
+                        return 0
+                    if best is None or len(choices) < len(best[2]):
+                        best = (row, column, choices)
+        if best is None:
+            return 1
+        row, column, choices = best
+        total = 0
+        for value in choices:
+            grid[row][column] = value
+            total += solve()
+            grid[row][column] = 0
+            if total >= limit:
+                return total
+        return total
+
+    return solve()
 
 THEME_PRESETS = {
     "Classic": {
@@ -333,7 +877,10 @@ class PeerMessenger:
         self.instance_id = uuid.uuid4().hex
         self.peers = {}
         self.history = []
+        self._history_bytes = 0
+        self._history_image_bytes = 0
         self._lock = threading.Lock()
+        self._connection_slots = threading.BoundedSemaphore(16)
         self._stopping = threading.Event()
         self._udp = None
         self._tcp = None
@@ -432,11 +979,84 @@ class PeerMessenger:
             try:
                 connection, address = self._tcp.accept()
                 connection.settimeout(5)
+                if not self._connection_slots.acquire(blocking=False):
+                    connection.close()
+                    continue
                 threading.Thread(
-                    target=self._receive_connection, args=(connection, address), daemon=True
+                    target=self._receive_limited_connection, args=(connection, address), daemon=True
                 ).start()
             except OSError:
                 continue
+
+    def _receive_limited_connection(self, connection, address):
+        try:
+            self._receive_connection(connection, address)
+        finally:
+            self._connection_slots.release()
+
+    @staticmethod
+    def _history_message_size(message):
+        """Conservatively count the retained one-level message allocation."""
+        return sys.getsizeof(message) + sum(
+            sys.getsizeof(key) + sys.getsizeof(value)
+            for key, value in message.items()
+        )
+
+    @staticmethod
+    def _history_image_size(message):
+        data = message.get("data") if message.get("kind") == "image" else None
+        return len(data) if isinstance(data, (bytes, bytearray, memoryview)) else 0
+
+    def _remove_history_message(self, index):
+        message = self.history.pop(index)
+        self._history_bytes -= self._history_message_size(message)
+        self._history_image_bytes -= self._history_image_size(message)
+
+    def _strip_oldest_history_image(self):
+        for message in self.history:
+            raw_size = self._history_image_size(message)
+            if raw_size:
+                old_size = self._history_message_size(message)
+                del message["data"]
+                message["data_evicted"] = True
+                self._history_image_bytes -= raw_size
+                self._history_bytes += self._history_message_size(message) - old_size
+                return True
+        return False
+
+    def _remember(self, message):
+        # The event consumer may keep the original (for example, Save Last
+        # Image).  Retain a separate mapping so history eviction never mutates
+        # the live UI message.
+        retained = dict(message)
+        if isinstance(retained.get("data"), (bytearray, memoryview)):
+            retained["data"] = bytes(retained["data"])
+        with self._lock:
+            self.history.append(retained)
+            self._history_bytes += self._history_message_size(retained)
+            self._history_image_bytes += self._history_image_size(retained)
+            while len(self.history) > MAX_MESSENGER_HISTORY:
+                self._remove_history_message(0)
+            while (
+                self._history_image_bytes > MAX_MESSENGER_HISTORY_IMAGE_BYTES
+                or self._history_bytes > MAX_MESSENGER_HISTORY_BYTES
+            ):
+                if not self._strip_oldest_history_image():
+                    self._remove_history_message(0)
+
+    def history_snapshot(self):
+        """Return an independently mutable view of bounded retained history."""
+        with self._lock:
+            return [dict(message) for message in self.history]
+
+    def history_usage(self):
+        """Report the exact counters used to enforce retained payload limits."""
+        with self._lock:
+            return {
+                "messages": len(self.history),
+                "bytes": self._history_bytes,
+                "image_bytes": self._history_image_bytes,
+            }
 
     @staticmethod
     def _receive_exact(connection, size):
@@ -457,8 +1077,7 @@ class PeerMessenger:
                 message = json.loads(self._receive_exact(connection, size).decode("utf-8"))
             message = self._validate_message(message)
             message.update(direction="incoming", host=address[0], timestamp=time.time())
-            with self._lock:
-                self.history.append(message)
+            self._remember(message)
             self._emit("message", message)
         except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError, ConnectionError) as error:
             self._emit("error", f"Rejected incoming message: {error}")
@@ -510,8 +1129,7 @@ class PeerMessenger:
             connection.sendall(struct.pack("!I", len(encoded)) + encoded)
         local = self._validate_message(message)
         local.update(direction="outgoing", recipient=peer["username"], timestamp=time.time())
-        with self._lock:
-            self.history.append(local)
+        self._remember(local)
         self._emit("message", local)
         return local
 
@@ -614,6 +1232,7 @@ class FlatButton(tk.Label):
         self._active_bg = kwargs.pop("activebackground", None)
         self._active_fg = kwargs.pop("activeforeground", None)
         kwargs.setdefault("cursor", "hand2")
+        kwargs.setdefault("takefocus", True)
         super().__init__(master, **kwargs)
         self._hovered = False
         self._normal_bg = self.cget("bg")
@@ -621,6 +1240,10 @@ class FlatButton(tk.Label):
         self.bind("<Enter>", self._on_enter)
         self.bind("<Leave>", self._on_leave)
         self.bind("<Button-1>", lambda event: self.invoke())
+        self.bind("<Return>", lambda event: self.invoke())
+        self.bind("<space>", lambda event: self.invoke())
+        self.bind("<FocusIn>", self._on_focus)
+        self.bind("<FocusOut>", self._on_blur)
 
     def _on_enter(self, _event):
         self._hovered = True
@@ -635,6 +1258,12 @@ class FlatButton(tk.Label):
         if self._hovered:
             self._hovered = False
             super().configure(bg=self._normal_bg, fg=self._normal_fg)
+
+    def _on_focus(self, _event):
+        super().configure(highlightthickness=2, highlightbackground=self._active_bg or self._normal_fg)
+
+    def _on_blur(self, _event):
+        super().configure(highlightthickness=0)
 
     def invoke(self):
         if self._command is not None:
@@ -677,7 +1306,7 @@ class DesktopIcon:
         self._drag_origin = None
         self._dragged = False
         self.position_changed = None
-        self.frame = tk.Frame(parent, bg="white", relief=tk.RAISED, bd=2)
+        self.frame = tk.Frame(parent, bg="white", relief=tk.RAISED, bd=2, takefocus=True)
         self.frame._desktop_icon = self
         self.frame.place(x=x, y=y, width=width, height=height)
 
@@ -706,9 +1335,15 @@ class DesktopIcon:
             widget.bind("<ButtonPress-1>", self.start_drag)
             widget.bind("<B1-Motion>", self.drag)
             widget.bind("<ButtonRelease-1>", self.finish_drag)
+        self.frame.bind("<Return>", lambda event: self.double_click())
+        self.frame.bind("<space>", lambda event: self.double_click())
+        self.frame.bind("<FocusIn>", lambda event: self.frame.configure(relief=tk.SOLID, bd=3))
+        self.frame.bind("<FocusOut>", lambda event: self.frame.configure(relief=tk.RAISED, bd=2))
 
     def set_colors(self, background, foreground):
-        self.frame.configure(bg=background)
+        self.frame.configure(
+            bg=background, highlightbackground=background, highlightcolor=foreground,
+        )
         self.icon.configure(bg=background)
         self.name_label.configure(bg=background, fg=foreground)
         self._draw_pixel_icon(background, foreground)
@@ -892,7 +1527,11 @@ class TaskbarItem:
     def __init__(self, parent, label, icon_type, command, colors, remove_command=None):
         self.command = command
         self.remove_command = remove_command
-        self.frame = tk.Frame(parent, bg=colors["bg"], width=68, height=58, cursor="hand2")
+        self.frame = tk.Frame(
+            parent, bg=colors["bg"], width=68, height=58, cursor="hand2",
+            takefocus=True, highlightthickness=1,
+            highlightbackground=colors["bg"], highlightcolor=colors["fg"],
+        )
         self.frame.pack(side=tk.LEFT, padx=2, pady=1)
         self.frame.pack_propagate(False)
         self.icon = tk.Canvas(
@@ -915,9 +1554,19 @@ class TaskbarItem:
             widget.bind("<Button-1>", lambda event: self.command())
             if remove_command:
                 widget.bind("<Button-3>", self.show_remove_menu)
+        self.frame.bind("<Return>", lambda event: self.command())
+        self.frame.bind("<space>", lambda event: self.command())
+        self.frame.bind(
+            "<FocusIn>", lambda event: self.frame.configure(highlightthickness=3)
+        )
+        self.frame.bind(
+            "<FocusOut>", lambda event: self.frame.configure(highlightthickness=1)
+        )
 
     def set_colors(self, background, foreground):
-        self.frame.configure(bg=background)
+        self.frame.configure(
+            bg=background, highlightbackground=background, highlightcolor=foreground,
+        )
         self.icon.configure(bg=background)
         self.label.configure(bg=background, fg=foreground)
         self.icon.delete("all")
@@ -964,11 +1613,22 @@ class Taskbar:
         self.windows_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(5, 0))
 
         # Time display on right
-        self.time_label = tk.Label(self.taskbar, text="", font=("Courier New", 11, "bold"),
-                                   bg="black", fg="white", cursor="hand2")
+        self.time_label = tk.Label(
+            self.taskbar, text="", font=("Courier New", 11, "bold"),
+            bg="black", fg="white", cursor="hand2", takefocus=True,
+            highlightthickness=1, highlightbackground="black", highlightcolor="white",
+        )
         self.time_label._keep_font = True
         self.time_label.pack(side=tk.RIGHT, padx=15, fill=tk.Y)
         self.time_label.bind("<Button-1>", lambda event: self.desktop.open_clock_calendar())
+        self.time_label.bind("<Return>", lambda event: self.desktop.open_clock_calendar())
+        self.time_label.bind("<space>", lambda event: self.desktop.open_clock_calendar())
+        self.time_label.bind(
+            "<FocusIn>", lambda event: self.time_label.configure(highlightthickness=3)
+        )
+        self.time_label.bind(
+            "<FocusOut>", lambda event: self.time_label.configure(highlightthickness=1)
+        )
         self.update_time()
 
     def add_shortcut(self, shortcut):
@@ -1018,7 +1678,10 @@ class Taskbar:
         self.taskbar.configure(bg=background)
         self.shortcuts_frame.configure(bg=background)
         self.windows_frame.configure(bg=background)
-        self.time_label.configure(bg=background, fg=foreground)
+        self.time_label.configure(
+            bg=background, fg=foreground,
+            highlightbackground=background, highlightcolor=foreground,
+        )
         for path, item in self.items:
             item.set_colors(background, foreground)
         for button in self.window_buttons.values():
@@ -1042,6 +1705,8 @@ class DesktopWindow:
         self.canvas = desktop.desktop_canvas
         self.title = title
         self.minimized = False
+        self.closed = False
+        self._dispose_callbacks = []
         self.min_width = 320
         self.min_height = 220
         canvas_width, canvas_height = self._canvas_size()
@@ -1184,11 +1849,28 @@ class DesktopWindow:
         self.canvas.itemconfigure(self.window_id, width=new_width, height=new_height)
 
     def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        for callback in reversed(self._dispose_callbacks):
+            try:
+                callback()
+            except Exception:
+                pass
+        self._dispose_callbacks.clear()
         self.desktop.taskbar.remove_minimized_window(self)
         self.canvas.delete(self.window_id)
         self.frame.destroy()
         if self in self.desktop.windows:
             self.desktop.windows.remove(self)
+
+    def add_dispose_callback(self, callback):
+        """Register idempotent resource cleanup for this application window."""
+        if self.closed:
+            callback()
+            return callback
+        self._dispose_callbacks.append(callback)
+        return callback
 
     def minimize(self):
         if self.minimized:
@@ -1300,10 +1982,19 @@ class DesktopGUI:
     """Windows-like desktop GUI"""
     def __init__(self, root):
         self.root = root
+        self._ui_thread_id = threading.get_ident()
+        self._closing = False
+        self._services_stopped = False
+        self._tasks = TkTaskManager(root)
+        self._admin_authorized_at = 0.0
+        self._admin_authorized_username = None
+        self._child_processes = set()
+        self._child_process_pollers = {}
+        self._drive_a_path = Path(tempfile.mkdtemp(prefix="pyos-drive-a-"))
         self.username = None
         self.messenger_service = None
         self.messenger_window = None
-        self.messenger_events = queue.Queue()
+        self.messenger_events = queue.Queue(maxsize=1000)
         self.messenger_ui_handler = None
         self.notification_toasts = []
         self.tip_after = None
@@ -1311,7 +2002,15 @@ class DesktopGUI:
         self._notifications_started = False
         self._accessibility_focus_bound = False
         self._update_check_running = False
+        self._update_install_running = False
         self._update_after = None
+        self._messenger_poll_after = None
+        self.config = load_config()
+        configured_apps = self.config.get("enabled_apps")
+        self.enabled_apps = (
+            frozenset(str(item).casefold() for item in configured_apps)
+            if isinstance(configured_apps, list) else None
+        )
         self.settings_path = get_gui_settings_path()
         self.virtual_drives_path = self.settings_path.with_name("virtual_drives.json")
         self.preferences = self.load_preferences()
@@ -1394,27 +2093,200 @@ class DesktopGUI:
         self.background_label.bind("<Button-1>", self.show_desktop_menu)
 
         self.apply_preferences()
-        self.root.after(3500, self.start_update_checks)
-        self.root.bind("<Destroy>", self._shutdown_messenger, add="+")
-        self.root.after(200, self._poll_messenger_events)
+        self._startup_update_after = self.root.after(3500, self.start_update_checks)
+        self.root.protocol("WM_DELETE_WINDOW", self.shutdown_pyos)
+        self.root.bind("<Destroy>", self._root_destroyed, add="+")
+        self._messenger_poll_after = self.root.after(200, self._poll_messenger_events)
+
+    def post_ui(self, callback, *args, **kwargs):
+        """Queue lossless completion/control work for Tk's thread."""
+        return self._tasks.post(callback, *args, **kwargs)
+
+    def post_ui_event(self, callback, *args, coalesce_key=None, **kwargs):
+        """Queue bounded, optionally coalesced display/progress work."""
+        return self._tasks.post_event(
+            callback, *args, coalesce_key=coalesce_key, **kwargs
+        )
+
+    def run_background(self, callback, *args, **kwargs):
+        try:
+            return self._tasks.submit(callback, *args, **kwargs)
+        except RuntimeError as error:
+            if threading.get_ident() == self._ui_thread_id:
+                self.show_notification("pyOS", str(error), duration=5000)
+            else:
+                self.post_ui(
+                    self.show_notification, "pyOS", str(error), duration=5000
+                )
+            return None
+
+    def _queue_messenger_event(self, event, payload):
+        try:
+            self.messenger_events.put_nowait((event, payload))
+        except queue.Full:
+            try:
+                self.messenger_events.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.messenger_events.put_nowait((event, payload))
+            except queue.Full:
+                pass
+
+    def _app_enabled(self, app_id):
+        return self.enabled_apps is None or app_id.casefold() in self.enabled_apps
+
+    def _ensure_app_enabled(self, app_id, label=None):
+        if self._app_enabled(app_id):
+            return True
+        messagebox.showinfo(
+            "Application Disabled",
+            f"{label or app_id} was disabled during pyOS Setup. Run Setup as an administrator to enable it.",
+            parent=self.root,
+        )
+        return False
+
+    def _require_recent_admin(self, action, force=False):
+        """Require fresh administrator credentials before a global mutation."""
+        now = time.monotonic()
+        try:
+            if (not force and self._admin_authorized_username
+                    and now - self._admin_authorized_at <= 300
+                    and is_admin(self._admin_authorized_username)):
+                return True
+            default_username = get_username() or ""
+        except (CredentialStoreError, ConfigurationError, StorageOwnershipError, OSError) as error:
+            messagebox.showerror(
+                "Administrator Authorization",
+                f"pyOS could not safely verify administrator state and denied the action:\n\n{error}",
+                parent=self.root,
+            )
+            return False
+        username = simpledialog.askstring(
+            "Administrator Authorization",
+            f"Administrator approval is required to {action}.\n\nAdministrator username:",
+            initialvalue=default_username,
+            parent=self.root,
+        )
+        if username is None:
+            return False
+        username = username.strip()
+        try:
+            administrator = is_admin(username)
+        except (CredentialStoreError, ConfigurationError, StorageOwnershipError, OSError) as error:
+            messagebox.showerror(
+                "Administrator Authorization",
+                f"pyOS could not safely verify administrator state and denied the action:\n\n{error}",
+                parent=self.root,
+            )
+            return False
+        if not administrator:
+            messagebox.showerror(
+                "Administrator Authorization", "That account is not a pyOS administrator.", parent=self.root,
+            )
+            return False
+        password = simpledialog.askstring(
+            "Administrator Authorization", f"Password for {username}:", show="*", parent=self.root,
+        )
+        if password is None:
+            return False
+        try:
+            verified = verify_credentials(username, password)
+        except (CredentialStoreError, ConfigurationError, StorageOwnershipError, OSError) as error:
+            messagebox.showerror(
+                "Administrator Authorization",
+                f"pyOS could not safely verify administrator credentials and denied the action:\n\n{error}",
+                parent=self.root,
+            )
+            return False
+        if not verified:
+            messagebox.showerror(
+                "Administrator Authorization", "The administrator credentials are incorrect.", parent=self.root,
+            )
+            return False
+        self._admin_authorized_username = username
+        self._admin_authorized_at = time.monotonic()
+        return True
 
     def lock_desktop(self, allow_remembered=False):
         """Block all desktop interaction until valid credentials are supplied."""
         previous_username = self.username
+        self.username = None
         self.system_user_var.set("Locked")
-        self.username = authenticate(
-            self.root, cancellable=False, allow_remembered=allow_remembered,
-        )
-        if (previous_username and self.username
-                and previous_username.casefold() != self.username.casefold()):
-            messagebox.showinfo(
-                "Switching User", "pyOS will restart to load the selected user's profile.",
-                parent=self.root,
-            )
-            subprocess.Popen([sys.executable, str(Path(__file__).resolve())])
-            self.root.destroy()
-            return self.username
-        self.system_user_var.set(self.username or "Locked")
+        self._admin_authorized_at = 0.0
+        self._admin_authorized_username = None
+        remembered_error = None
+        if not allow_remembered:
+            try:
+                clear_remembered_session()
+            except (CredentialStoreError, ConfigurationError, StorageOwnershipError, OSError) as error:
+                # The in-memory lock must remain effective even if persistent
+                # remembered-session state needs manual recovery.
+                remembered_error = error
+        overlay = tk.Frame(self.root, bg=self.preferences.get("chrome_bg", "#000000"), takefocus=True)
+        overlay.place(x=0, y=0, relwidth=1, relheight=1)
+        tk.Label(
+            overlay, text="pyOS is locked", font=(self.preferences["font_family"], 22, "bold"),
+            bg=self.preferences.get("chrome_bg", "#000000"),
+            fg=self.preferences.get("chrome_fg", "#ffffff"),
+        ).place(relx=.5, rely=.45, anchor=tk.CENTER)
+        status = tk.StringVar(value=(
+            "Remembered sign-in state could not be cleared. Fresh credentials are still required."
+            if remembered_error else "Fresh authentication is required to continue."
+        ))
+        tk.Label(
+            overlay, textvariable=status,
+            bg=self.preferences.get("chrome_bg", "#000000"),
+            fg=self.preferences.get("chrome_fg", "#ffffff"),
+            wraplength=560, justify=tk.CENTER,
+        ).place(relx=.5, rely=.52, anchor=tk.CENTER)
+        overlay.lift()
+        overlay.focus_set()
+        retry = tk.Button(overlay, text="Retry Authentication")
+        retry.place(relx=.5, rely=.59, anchor=tk.CENTER)
+
+        def attempt_unlock():
+            try:
+                overlay.grab_release()
+            except tk.TclError:
+                pass
+            try:
+                username = authenticate(
+                    self.root, cancellable=False, allow_remembered=allow_remembered,
+                )
+            except (CredentialStoreError, ConfigurationError, StorageOwnershipError, OSError) as error:
+                username = None
+                status.set(f"Account storage requires recovery. pyOS remains locked.\n{error}")
+            if not username:
+                if not status.get().startswith("Account storage"):
+                    status.set("Authentication did not complete. pyOS remains locked; retry to continue.")
+                overlay.lift()
+                overlay.focus_set()
+                try:
+                    overlay.grab_set()
+                except tk.TclError:
+                    pass
+                return None
+            self.username = username
+            try:
+                overlay.grab_release()
+            except tk.TclError:
+                pass
+            overlay.destroy()
+            if (previous_username
+                    and previous_username.casefold() != username.casefold()):
+                messagebox.showinfo(
+                    "Switching User", "pyOS will restart to load the selected user's profile.",
+                    parent=self.root,
+                )
+                subprocess.Popen([sys.executable, str(Path(__file__).resolve())])
+                self.root.destroy()
+                return username
+            self.system_user_var.set(username)
+            return username
+
+        retry.configure(command=attempt_unlock)
+        attempt_unlock()
         return self.username
 
     def create_system_bar(self):
@@ -1454,16 +2326,20 @@ class DesktopGUI:
         system_menu.add_command(label="Shut Down pyOS...", command=self.shutdown_pyos)
 
         applications_menu = add_menu("Applications")
-        applications_menu.add_command(label="File Manager", command=self.open_default_file_manager)
-        applications_menu.add_command(label="Text Editor", command=self.open_text_editor)
-        applications_menu.add_command(label="Internet Browser", command=self.open_browser)
-        applications_menu.add_command(label="Messenger", command=self.open_messenger)
-        applications_menu.add_command(label="Calculator", command=self.open_calculator)
-        applications_menu.add_command(label="Paint", command=self.open_paint)
-        applications_menu.add_command(label="Network & Hosting", command=self.open_network_hosting)
-        applications_menu.add_command(label="SSH Client", command=self.open_ssh_client)
-        applications_menu.add_command(label="Website Designer", command=self.open_website_designer)
-        applications_menu.add_command(label="Games Suite", command=self.open_games_suite)
+        def add_application(label, command, app_id=None):
+            if app_id is None or self._app_enabled(app_id):
+                applications_menu.add_command(label=label, command=command)
+
+        add_application("File Manager", self.open_default_file_manager)
+        add_application("Text Editor", self.open_text_editor)
+        add_application("Internet Browser", self.open_browser, "browser")
+        add_application("Messenger", self.open_messenger, "messenger")
+        add_application("Calculator", self.open_calculator)
+        add_application("Paint", self.open_paint)
+        add_application("Network & Hosting", self.open_network_hosting)
+        add_application("SSH Client", self.open_ssh_client)
+        add_application("Website Designer", self.open_website_designer)
+        add_application("Games Suite", self.open_games_suite, "games")
         applications_menu.add_separator()
         applications_menu.add_command(label="Settings", command=self.open_settings)
 
@@ -1508,9 +2384,79 @@ class DesktopGUI:
         )
         self.show_notification("pyOS Tip", random.choice(tips), kind="system", duration=8000)
 
-    def _stop_services(self):
+    def _close_application_windows(self):
+        for window in list(reversed(self.windows)):
+            try:
+                if window.frame.winfo_exists():
+                    window.close_button.invoke()
+            except tk.TclError:
+                pass
+        return not self.windows
+
+    def _stop_services(self, close_windows=True, force=False):
+        """Dispose every app resource once before the Tk interpreter is destroyed."""
+        if self._services_stopped:
+            return True
+        if self._update_install_running and not force:
+            messagebox.showwarning(
+                "pyOS Update",
+                "An update transaction is still running. Wait for it to finish before closing pyOS.",
+                parent=self.root,
+            )
+            return False
+        if close_windows and not self._close_application_windows():
+            # A window with unsaved work can cancel its own close operation.
+            return False
+        self._closing = True
+        for attribute in (
+            "_startup_update_after", "_update_after", "tip_after", "_background_after",
+            "_messenger_poll_after",
+        ):
+            after_id = getattr(self, attribute, None)
+            if after_id is not None:
+                try:
+                    self.root.after_cancel(after_id)
+                except tk.TclError:
+                    pass
+                setattr(self, attribute, None)
         if self.messenger_service:
             self.messenger_service.stop()
+            self.messenger_service = None
+        for after_id in list(self._child_process_pollers.values()):
+            try:
+                self.root.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        self._child_process_pollers.clear()
+        child_processes = list(self._child_processes)
+        for process in child_processes:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+            except OSError:
+                pass
+        deadline = time.monotonic() + 1.5
+        for process in child_processes:
+            try:
+                if process.poll() is None:
+                    process.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                    process.wait(timeout=.5)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            except OSError:
+                pass
+        self._child_processes.clear()
+        tasks_stopped = self._tasks.shutdown()
+        if tasks_stopped:
+            try:
+                shutil.rmtree(self._drive_a_path)
+            except OSError:
+                pass
+        self._services_stopped = True
+        return True
 
     def shutdown_pyos(self):
         if not messagebox.askyesno(
@@ -1518,8 +2464,15 @@ class DesktopGUI:
             parent=self.root,
         ):
             return
-        self._stop_services()
+        if not self._stop_services():
+            return
         self.root.destroy()
+
+    def _root_destroyed(self, event):
+        if event.widget is self.root and not self._services_stopped:
+            # External destruction cannot be cancelled, so perform non-Tk cleanup directly.
+            self.windows.clear()
+            self._stop_services(close_windows=False, force=True)
 
     def uninstall_pyos(self):
         """Remove pyOS user data and virtual drives while retaining the installation."""
@@ -1534,14 +2487,7 @@ class DesktopGUI:
         )
         if not messagebox.askyesno("Uninstall pyOS", warning, icon=messagebox.WARNING, parent=self.root):
             return
-        entered_password = simpledialog.askstring(
-            "Uninstall pyOS", "Enter your current pyOS password:", show="*", parent=self.root,
-        )
-        if entered_password is None:
-            return
-        username = get_username()
-        if username is None or not verify_credentials(username, entered_password):
-            messagebox.showerror("Uninstall pyOS", "The password is incorrect.", parent=self.root)
+        if not self._require_recent_admin("uninstall pyOS for every account", force=True):
             return
         confirmation = simpledialog.askstring(
             "Confirm Uninstall",
@@ -1551,77 +2497,89 @@ class DesktopGUI:
         if confirmation != "UNINSTALL":
             messagebox.showinfo("Uninstall pyOS", "Uninstall cancelled.", parent=self.root)
             return
+        if not self._close_application_windows():
+            messagebox.showinfo(
+                "Uninstall pyOS",
+                "Uninstall cancelled because an application kept unsaved work open.",
+                parent=self.root,
+            )
+            return
 
         config = load_config()
-        install_dir = Path(config["install_dir"]).expanduser().resolve()
         data_dir = Path(config["data_dir"]).expanduser().resolve()
-        downloads_dir = Path(config["downloads_dir"]).expanduser().resolve()
         home = Path.home().resolve()
         failures = []
 
-        def is_dangerous_directory(path):
-            path = path.resolve()
-            if path == Path(path.anchor) or path in {home, install_dir, downloads_dir}:
-                return True
-            return any(protected.is_relative_to(path) for protected in (home, install_dir, downloads_dir))
-
-        def remove_path(path, allow_directory=True):
-            path = Path(path).expanduser()
+        def remove_verified_root(path, kind):
             try:
-                if path.is_symlink() or path.is_file():
-                    path.unlink(missing_ok=True)
-                elif path.is_dir() and allow_directory:
-                    if is_dangerous_directory(path):
-                        raise OSError(f"refused unsafe directory target: {path}")
-                    shutil.rmtree(path)
-            except OSError as error:
+                root = Path(path).expanduser().resolve()
+                if root in {home, Path(root.anchor)} or home.is_relative_to(root):
+                    raise OSError(f"refused unsafe directory target: {root}")
+                if not verify_storage_owner(root, kind=kind):
+                    raise OSError(f"ownership marker is missing or invalid ({kind})")
+                shutil.rmtree(root)
+            except (OSError, StorageOwnershipError) as error:
                 failures.append(f"{path}: {error}")
 
+        def remove_data_manifest(root, preserve_config=False):
+            try:
+                root = Path(root).expanduser().resolve()
+                if root in {home, Path(root.anchor)} or home.is_relative_to(root):
+                    raise OSError(f"refused unsafe data root: {root}")
+                if not verify_storage_owner(root):
+                    raise OSError("pyOS data ownership marker is missing or invalid")
+                config_path = Path(CONFIG_FILE).expanduser().resolve()
+                preserved = {
+                    config_path,
+                    config_path.with_name(config_path.name + ".bak"),
+                    config_path.with_name(config_path.name + ".lock"),
+                    config_path.with_name(config_path.name + ".bak.lock"),
+                } if preserve_config else set()
+                remove_owned_storage_paths(root, preserve=preserved)
+                if not preserve_config:
+                    (root / OWNER_FILENAME).unlink(missing_ok=True)
+                    try:
+                        root.rmdir()
+                    except OSError:
+                        # Preserve anything that was not explicitly registered by pyOS.
+                        pass
+            except (OSError, StorageOwnershipError, ValueError) as error:
+                failures.append(f"{root}: {error}")
+
         registered_drives = self._load_virtual_drives()
-        drive_paths = []
         for drive in registered_drives:
             raw_path = drive.get("path")
             if isinstance(raw_path, str) and raw_path.strip():
+                remove_verified_root(raw_path, "virtual-drive")
+
+        standalone_root = get_standalone_root(create=False).expanduser().resolve()
+        remove_data_manifest(data_dir, preserve_config=(standalone_root == data_dir))
+        if not failures and standalone_root != data_dir:
+            remove_data_manifest(standalone_root, preserve_config=True)
+
+        if not failures:
+            config_path = Path(CONFIG_FILE).expanduser().resolve()
+            for auxiliary in (
+                config_path.with_name(config_path.name + ".bak.lock"),
+                config_path.with_name(config_path.name + ".bak"),
+                config_path.with_name(config_path.name + ".lock"),
+            ):
                 try:
-                    drive_paths.append(Path(raw_path).expanduser().resolve())
+                    auxiliary.unlink(missing_ok=True)
                 except OSError as error:
-                    failures.append(f"{raw_path}: {error}")
-        for path in sorted(set(drive_paths), key=lambda item: len(item.parts), reverse=True):
-            remove_path(path)
+                    failures.append(f"{auxiliary}: {error}")
+            if not failures:
+                try:
+                    config_path.unlink(missing_ok=True)
+                    (standalone_root / OWNER_FILENAME).unlink(missing_ok=True)
+                    (standalone_root / (OWNER_FILENAME + ".lock")).unlink(missing_ok=True)
+                except OSError as error:
+                    failures.append(f"{config_path}: {error}")
+                try:
+                    standalone_root.rmdir()
+                except OSError:
+                    pass
 
-        remove_path(self.get_drive_a_path())
-        remove_path(get_drive_b_dir(create=False))
-
-        data_is_dedicated = (
-            data_dir not in {home, install_dir, downloads_dir, Path(data_dir.anchor)}
-            and not any(protected.is_relative_to(data_dir) for protected in (home, install_dir, downloads_dir))
-        )
-        if config.get("configured") and data_is_dedicated:
-            remove_path(data_dir)
-        else:
-            known_data = {
-                self.settings_path,
-                self.virtual_drives_path,
-                get_cli_settings_path(),
-                credentials_path(),
-                self.settings_path.with_name("email_settings.json"),
-                self.settings_path.parent / "apps",
-                data_dir / "Drive_B",
-            }
-            for path in known_data:
-                remove_path(path)
-
-        # Standalone-mode files and mod backups can exist outside the configured data directory.
-        for path in (
-            home / ".pyos_gui_settings.json",
-            home / ".pyOS_settings.json",
-            home / ".pyos_credentials.json",
-            Path(__file__).resolve().parent / ".pyos_mod_backups",
-            CONFIG_FILE,
-        ):
-            remove_path(path)
-
-        self._stop_services()
         if failures:
             preview = "\n".join(failures[:8])
             if len(failures) > 8:
@@ -1634,10 +2592,12 @@ class DesktopGUI:
         else:
             messagebox.showinfo(
                 "Uninstall pyOS",
-                "All pyOS data and registered virtual drives were removed. "
+                "All manifest-owned pyOS data and registered pyOS virtual drives were removed. "
                 "The program, modules, and packages remain installed.",
                 parent=self.root,
             )
+        if not self._stop_services(close_windows=False):
+            return
         self.root.destroy()
 
     def restart_pyos(self):
@@ -1645,15 +2605,23 @@ class DesktopGUI:
             "Restart pyOS", "Close and restart pyOS now?", parent=self.root
         ):
             return
+        process = None
         try:
-            subprocess.Popen([sys.executable, str(Path(__file__).resolve())])
+            process = subprocess.Popen([sys.executable, str(Path(__file__).resolve())])
         except OSError as error:
             messagebox.showerror("Restart pyOS", f"Could not restart pyOS: {error}", parent=self.root)
             return
-        self._stop_services()
+        if not self._stop_services():
+            try:
+                process.terminate()
+            except OSError:
+                pass
+            return
         self.root.destroy()
 
     def run_setup(self):
+        if not self._require_recent_admin("run pyOS Setup"):
+            return
         setup_path = Path(__file__).resolve().with_name("setup.py")
         if not setup_path.is_file():
             messagebox.showerror("pyOS Setup", f"Setup was not found at:\n{setup_path}", parent=self.root)
@@ -1665,6 +2633,8 @@ class DesktopGUI:
             messagebox.showerror("pyOS Setup", f"Could not open setup: {error}", parent=self.root)
 
     def restart_and_setup(self):
+        if not self._require_recent_admin("change or repair the pyOS installation"):
+            return
         if not messagebox.askyesno(
             "Restart and Run Setup",
             "Close pyOS, run setup, then launch pyOS again after setup closes?",
@@ -1681,8 +2651,9 @@ class DesktopGUI:
             "subprocess.Popen([sys.argv[1],sys.argv[3]])"
         )
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        process = None
         try:
-            subprocess.Popen(
+            process = subprocess.Popen(
                 [sys.executable, "-c", helper, sys.executable, str(setup_path),
                  str(Path(__file__).resolve())],
                 creationflags=creationflags,
@@ -1690,7 +2661,12 @@ class DesktopGUI:
         except OSError as error:
             messagebox.showerror("pyOS Setup", f"Could not start setup: {error}", parent=self.root)
             return
-        self._stop_services()
+        if not self._stop_services():
+            try:
+                process.terminate()
+            except OSError:
+                pass
+            return
         self.root.destroy()
 
     def _shutdown_messenger(self, event):
@@ -1699,6 +2675,9 @@ class DesktopGUI:
 
     def _poll_messenger_events(self):
         """Dispatch network events even while the Messenger window is closed."""
+        self._messenger_poll_after = None
+        if self._closing:
+            return
         try:
             while True:
                 event, payload = self.messenger_events.get_nowait()
@@ -1714,8 +2693,8 @@ class DesktopGUI:
                     self.show_notification("Messenger Error", str(payload), kind="system")
         except queue.Empty:
             pass
-        if self.root.winfo_exists():
-            self.root.after(200, self._poll_messenger_events)
+        if self.root.winfo_exists() and not self._closing:
+            self._messenger_poll_after = self.root.after(200, self._poll_messenger_events)
 
     def show_notification(self, title, message, kind="system", duration=6000):
         """Display a non-blocking desktop toast when allowed by preferences."""
@@ -1895,7 +2874,9 @@ class DesktopGUI:
                     detail.set("")
                     percentage.set("Working...")
             try:
-                self.root.after(0, apply_update)
+                self.post_ui_event(
+                    apply_update, coalesce_key=("task-progress", id(state))
+                )
             except tk.TclError:
                 pass
 
@@ -1908,8 +2889,11 @@ class DesktopGUI:
                         window.close()
                 except tk.TclError:
                     pass
+            if threading.get_ident() == self._ui_thread_id:
+                apply_close()
+                return
             try:
-                self.root.after(0, apply_close)
+                self.post_ui(apply_close)
             except tk.TclError:
                 pass
 
@@ -2048,9 +3032,10 @@ class DesktopGUI:
                             pass
                     self._update_after = self.root.after(15 * 60 * 1000, self.check_for_updates)
 
-            self.root.after(0, finish)
+            self.post_ui(finish)
 
-        threading.Thread(target=worker, daemon=True).start()
+        if self.run_background(worker) is None:
+            self._update_check_running = False
 
     def _handle_available_update(self, update, manual=False):
         """Compare update metadata and request consent before any download."""
@@ -2088,6 +3073,8 @@ class DesktopGUI:
             self.preferences["update_skipped_ref"] = reference
             self.save_preferences()
             return
+        if not self._require_recent_admin("install a pyOS update"):
+            return
         if getattr(sys, "frozen", False):
             asset = executable_asset(update)
             if not asset:
@@ -2111,6 +3098,10 @@ class DesktopGUI:
 
     def _install_executable_update(self, update, asset):
         """Stage an approved executable and replace this process after it exits."""
+        if self._update_install_running:
+            messagebox.showinfo("pyOS Update", "An update is already running.", parent=self.root)
+            return
+        self._update_install_running = True
         self.show_notification("pyOS Update", f"Downloading {update['name']}...", duration=12000)
         progress, close_progress = self.open_task_progress(
             "pyOS Update", f"Preparing {update['name']}..."
@@ -2119,50 +3110,124 @@ class DesktopGUI:
         def worker():
             try:
                 staged = stage_executable_update(asset, get_data_dir(), progress=progress)
+                current_digest = hashlib.sha256()
+                with Path(sys.executable).resolve().open("rb") as current_file:
+                    for chunk in iter(lambda: current_file.read(1024 * 1024), b""):
+                        current_digest.update(chunk)
+                staged["current_sha256"] = current_digest.hexdigest()
                 error = None
             except (OSError, ValueError, urllib.error.URLError, urllib.error.HTTPError) as exc:
                 staged, error = None, str(exc)
 
             def finish():
                 close_progress()
+                self._update_install_running = False
                 if error:
                     messagebox.showerror("pyOS Update", f"Executable update failed:\n{error}", parent=self.root)
                     return
                 current = Path(sys.executable).resolve()
-                backup = get_data_dir() / "update_backups" / "executables" / "pyOS-previous.exe"
-                backup.parent.mkdir(parents=True, exist_ok=True)
-                helper = get_data_dir() / "pending_updates" / "install-pyos-update.ps1"
-                helper.write_text(
-                    "param([int]$OldPid,[string]$Staged,[string]$Current,[string]$Backup)\n"
-                    "$ErrorActionPreference='Stop'\n"
-                    "Wait-Process -Id $OldPid -ErrorAction SilentlyContinue\n"
-                    "Copy-Item -LiteralPath $Current -Destination $Backup -Force\n"
-                    "Move-Item -LiteralPath $Staged -Destination $Current -Force\n"
-                    "Start-Process -FilePath $Current\n"
-                    "Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force\n",
-                    encoding="utf-8",
+                update_id = staged["update_id"]
+                backup = (
+                    get_data_dir() / "update_backups" / "executables" /
+                    f"pyOS-previous-{update_id}.exe"
                 )
-                self.preferences["update_installed_ref"] = update["ref"]
-                self.preferences["update_skipped_ref"] = ""
-                self.save_preferences()
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                pending = Path(staged["path"]).resolve().parent
+                helper = pending / f"install-pyos-update-{update_id}.ps1"
+                acknowledgement = pending / f"update-{update_id}.ack"
+                failure_report = pending / f"update-{update_id}.failed.txt"
+                update_lock = get_data_dir() / ".pyos-update.lock"
+                acknowledgement.unlink(missing_ok=True)
+                failure_report.unlink(missing_ok=True)
+                script = (
+                    "param([int]$OldPid,[string]$Staged,[string]$Current,[string]$Backup,"
+                    "[string]$Ref,[string]$Ack,[string]$Failure,[string]$Lock,"
+                    "[string]$ExpectedStaged,[string]$ExpectedCurrent,[string]$ExpectedSigner)\n"
+                    "$ErrorActionPreference='Stop'\n"
+                    "$backupMade=$false; $replaced=$false; $child=$null; $lockHandle=$null\n"
+                    "try {\n"
+                    "  Wait-Process -Id $OldPid -ErrorAction SilentlyContinue\n"
+                    "  $lockHandle=[System.IO.File]::Open($Lock,[System.IO.FileMode]::OpenOrCreate,"
+                    "[System.IO.FileAccess]::ReadWrite,[System.IO.FileShare]::None)\n"
+                    "  $currentHash=(Get-FileHash -LiteralPath $Current -Algorithm SHA256).Hash.ToLowerInvariant()\n"
+                    "  if ($currentHash -ne $ExpectedCurrent.ToLowerInvariant()) { throw 'The running executable changed after staging.' }\n"
+                    "  $stagedHash=(Get-FileHash -LiteralPath $Staged -Algorithm SHA256).Hash.ToLowerInvariant()\n"
+                    "  if ($stagedHash -ne $ExpectedStaged.ToLowerInvariant()) { throw 'The staged executable digest changed.' }\n"
+                    "  $signature=Get-AuthenticodeSignature -LiteralPath $Staged\n"
+                    "  $thumbprint=if($signature.SignerCertificate){$signature.SignerCertificate.Thumbprint}else{''}\n"
+                    "  if ($signature.Status -ne 'Valid' -or $thumbprint.ToUpperInvariant() -ne "
+                    "$ExpectedSigner.ToUpperInvariant()) { throw 'The staged executable signature is no longer trusted.' }\n"
+                    "  Copy-Item -LiteralPath $Current -Destination $Backup -Force\n"
+                    "  $backupMade=$true\n"
+                    "  Move-Item -LiteralPath $Staged -Destination $Current -Force\n"
+                    "  $replaced=$true\n"
+                    "  $child=Start-Process -FilePath $Current -ArgumentList @('--complete-update',$Ref,"
+                    "('`\"'+$Ack+'`\"')) -PassThru\n"
+                    "  $deadline=(Get-Date).AddMinutes(5)\n"
+                    "  $ackValid=$false\n"
+                    "  while ((Get-Date) -lt $deadline -and -not $ackValid -and -not $child.HasExited) {\n"
+                    "    if (Test-Path -LiteralPath $Ack) { try { "
+                    "$ackValid=((Get-Content -LiteralPath $Ack -Raw).Trim().ToLowerInvariant() -eq $Ref.ToLowerInvariant()) } catch {} }\n"
+                    "    if (-not $ackValid) { Start-Sleep -Milliseconds 500; $child.Refresh() }\n"
+                    "  }\n"
+                    "  if (-not $ackValid) {\n"
+                    "    if (-not $child.HasExited) { Stop-Process -Id $child.Id -Force }\n"
+                    "    Copy-Item -LiteralPath $Backup -Destination $Current -Force\n"
+                    "    $replaced=$false\n"
+                    "    Set-Content -LiteralPath $Failure -Encoding UTF8 "
+                    "-Value 'The new build did not provide a valid startup acknowledgement; rollback completed.'\n"
+                    "    Start-Process -FilePath $Current\n"
+                    "  }\n"
+                    "} catch {\n"
+                    "  if ($child -and -not $child.HasExited) { Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue }\n"
+                    "  if ($backupMade -and ($replaced -or -not (Test-Path -LiteralPath $Current))) { "
+                    "Copy-Item -LiteralPath $Backup -Destination $Current -Force }\n"
+                    "  Set-Content -LiteralPath $Failure -Encoding UTF8 -Value $_.Exception.ToString()\n"
+                    "  if (Test-Path -LiteralPath $Current) { Start-Process -FilePath $Current }\n"
+                    "} finally {\n"
+                    "  if ($lockHandle) { $lockHandle.Dispose() }\n"
+                    "  Remove-Item -LiteralPath $Staged -Force -ErrorAction SilentlyContinue\n"
+                    "  Remove-Item -LiteralPath $Ack -Force -ErrorAction SilentlyContinue\n"
+                    "}\n"
+                    "Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue\n"
+                )
+                atomic_write_bytes(helper, script.encode("utf-8"))
+                if not self._close_application_windows():
+                    helper.unlink(missing_ok=True)
+                    Path(staged["path"]).unlink(missing_ok=True)
+                    return
                 try:
                     subprocess.Popen(
                         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(helper),
                          "-OldPid", str(os.getpid()), "-Staged", staged["path"],
-                         "-Current", str(current), "-Backup", str(backup)],
+                          "-Current", str(current), "-Backup", str(backup),
+                          "-Ref", staged["ref"], "-Ack", str(acknowledgement),
+                          "-Failure", str(failure_report), "-Lock", str(update_lock),
+                          "-ExpectedStaged", staged["sha256"],
+                          "-ExpectedCurrent", staged["current_sha256"],
+                          "-ExpectedSigner", staged["signature"]["Thumbprint"]],
                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                     )
                 except OSError as exc:
+                    helper.unlink(missing_ok=True)
+                    Path(staged["path"]).unlink(missing_ok=True)
                     messagebox.showerror("pyOS Update", f"Could not start update helper:\n{exc}", parent=self.root)
                     return
+                self._stop_services(close_windows=False)
                 self.root.destroy()
 
-            self.root.after(0, finish)
+            self.post_ui(finish)
 
-        threading.Thread(target=worker, daemon=True).start()
+        if self.run_background(worker) is None:
+            self._update_install_running = False
+            close_progress()
 
     def _install_confirmed_update(self, update, project_dir):
         """Install an already-approved source update in a worker thread."""
+        if self._update_install_running:
+            messagebox.showinfo("pyOS Update", "An update is already running.", parent=self.root)
+            return
+        self._update_install_running = True
         self.show_notification("pyOS Update", f"Downloading {update['name']}...", duration=12000)
         progress, close_progress = self.open_task_progress(
             "pyOS Update", f"Preparing {update['name']}..."
@@ -2180,6 +3245,7 @@ class DesktopGUI:
 
             def finish():
                 close_progress()
+                self._update_install_running = False
                 if error:
                     messagebox.showerror("pyOS Update", f"Update installation failed:\n{error}", parent=self.root)
                     return
@@ -2195,9 +3261,11 @@ class DesktopGUI:
                 if restart:
                     self.restart_and_setup()
 
-            self.root.after(0, finish)
+            self.post_ui(finish)
 
-        threading.Thread(target=worker, daemon=True).start()
+        if self.run_background(worker) is None:
+            self._update_install_running = False
+            close_progress()
 
     def resize_icon_layer(self, event):
         """Keep the draggable launcher area fitted to the desktop canvas."""
@@ -2326,8 +3394,9 @@ class DesktopGUI:
     def save_preferences(self):
         """Persist desktop preferences for the next launch."""
         try:
-            self.settings_path.write_text(json.dumps(self.preferences, indent=2), encoding="utf-8")
-        except OSError as error:
+            register_owned_path(self.settings_path)
+            atomic_write_json(self.settings_path, self.preferences, backup=True)
+        except (OSError, JSONPersistenceError, StorageOwnershipError) as error:
             messagebox.showerror("Settings", f"Could not save settings: {error}")
 
     def _apply_widget_fonts(self, widget):
@@ -2356,6 +3425,56 @@ class DesktopGUI:
             return
         for child in children:
             self._apply_widget_fonts(child)
+
+    def _apply_widget_colors(self, widget):
+        """Replace legacy black-on-white defaults with the active named palette."""
+        if getattr(widget, "_skip_color_apply", False):
+            return
+        surface = self.preferences["surface_bg"]
+        foreground = self.preferences["text_fg"]
+        chrome = self.preferences["chrome_bg"]
+        chrome_text = self.preferences["chrome_fg"]
+        try:
+            widget_class = widget.winfo_class()
+            options = {}
+            if widget_class not in {"Canvas", "TFrame", "TLabel", "TButton", "TEntry"}:
+                try:
+                    background = str(widget.cget("background")).casefold()
+                    if background in {"white", "#fff", "#ffffff"}:
+                        options["background"] = surface
+                except tk.TclError:
+                    pass
+                try:
+                    color = str(widget.cget("foreground")).casefold()
+                    if color in {"black", "#000", "#000000"}:
+                        options["foreground"] = foreground
+                except tk.TclError:
+                    pass
+            if widget_class in {"Button", "Checkbutton", "Radiobutton"}:
+                options.update(activebackground=chrome, activeforeground=chrome_text)
+            if widget_class in {"Entry", "Text", "Listbox", "Spinbox"}:
+                options["insertbackground"] = foreground
+            if widget_class == "Listbox":
+                options.update(selectbackground=chrome, selectforeground=chrome_text)
+            if options:
+                widget.configure(**options)
+        except tk.TclError:
+            pass
+        try:
+            children = widget.winfo_children()
+        except tk.TclError:
+            return
+        for child in children:
+            self._apply_widget_colors(child)
+
+    def _finish_window_theme(self, window):
+        try:
+            if window.closed or not window.frame.winfo_exists():
+                return
+            self._apply_widget_colors(window.frame)
+            self._apply_widget_fonts(window.frame)
+        except tk.TclError:
+            pass
 
     def apply_preferences(self):
         """Apply preferences that can be updated while the desktop is running."""
@@ -2412,6 +3531,7 @@ class DesktopGUI:
                         activebackground=chrome_bg,
                         activeforeground=chrome_fg,
                     )
+            self._apply_widget_colors(window.frame)
         self.taskbar.clock_24h = self.preferences["clock_24h"]
         self.taskbar.show_seconds = self.preferences["show_seconds"]
         self.apply_desktop_background()
@@ -2814,8 +3934,7 @@ class DesktopGUI:
             1000, 84
         )
         self._register_desktop_icon(self.ai_chat_icon, "builtin:pyai")
-        enabled_apps = load_config().get("enabled_apps")
-        if isinstance(enabled_apps, list):
+        if self.enabled_apps is not None:
             optional_icons = {
                 "pyai": (self.ai_chat_icon,), "browser": (self.browser_icon,),
                 "media": (self.media_player_icon,), "messenger": (self.messenger_icon,),
@@ -2823,9 +3942,8 @@ class DesktopGUI:
                 "news": (self.news_icon,), "ide": (self.python_ide_icon,),
                 "modding": (self.modding_icon,),
             }
-            enabled = set(enabled_apps)
             for app_id, icons in optional_icons.items():
-                if app_id not in enabled:
+                if app_id not in self.enabled_apps:
                     for icon in icons:
                         icon.frame.place_forget()
         self.refresh_custom_app_icons()
@@ -2900,7 +4018,7 @@ class DesktopGUI:
         self.window_offset = (self.window_offset + 24) % 144
         window = DesktopWindow(self, title, 160 + self.window_offset, 100 + self.window_offset, width, height)
         self.windows.append(window)
-        self.root.after_idle(lambda target=window.frame: self._apply_widget_fonts(target))
+        self.root.after_idle(lambda target=window: self._finish_window_theme(target))
         return window
 
     def add_taskbar_shortcut(self, path):
@@ -3207,9 +4325,8 @@ class DesktopGUI:
         return window
 
     def get_drive_a_path(self):
-        path = get_profile_dir() / "Drive_A"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        self._drive_a_path.mkdir(parents=True, exist_ok=True)
+        return self._drive_a_path
 
     def get_drive_b_path(self):
         return get_drive_b_dir()
@@ -3225,7 +4342,8 @@ class DesktopGUI:
 
     def _save_virtual_drives(self, drives):
         self.virtual_drives_path.parent.mkdir(parents=True, exist_ok=True)
-        self.virtual_drives_path.write_text(json.dumps(drives, indent=2), encoding="utf-8")
+        register_owned_path(self.virtual_drives_path)
+        atomic_write_json(self.virtual_drives_path, drives, backup=True)
 
     def open_virtual_drive_manager(self):
         """Create and manage additional directory-backed virtual drives."""
@@ -3283,20 +4401,34 @@ class DesktopGUI:
             if any(drive.get("name", "").casefold() == drive_name.casefold() for drive in drives):
                 messagebox.showerror("Virtual Drives", "A drive with that name already exists.", parent=self.root)
                 return
+            created_path = None
+            registered = False
             try:
                 quota_mb = max(1, int(quota.get()))
                 parent = Path(location.get()).expanduser().resolve()
                 path = parent / drive_name
                 path.mkdir(parents=True, exist_ok=False)
+                created_path = path
+                ensure_storage_owner(path, kind="virtual-drive")
                 drive = {"name": drive_name, "path": str(path), "quota_mb": quota_mb,
                          "storage": storage.get(), "read_only": bool(read_only.get()),
                          "created": datetime.now().isoformat(timespec="seconds")}
                 drives.append(drive)
-                self._save_virtual_drives(drives)
+                try:
+                    self._save_virtual_drives(drives)
+                except (OSError, ValueError, JSONPersistenceError, StorageOwnershipError):
+                    drives.pop()
+                    raise
+                registered = True
             except FileExistsError:
                 messagebox.showerror("Virtual Drives", "That directory already exists.", parent=self.root)
                 return
-            except (OSError, ValueError) as error:
+            except (OSError, ValueError, JSONPersistenceError, StorageOwnershipError) as error:
+                if created_path is not None and not registered:
+                    try:
+                        shutil.rmtree(created_path)
+                    except OSError:
+                        pass
                 messagebox.showerror("Virtual Drives", f"Could not create drive: {error}", parent=self.root)
                 return
             refresh()
@@ -3329,6 +4461,8 @@ class DesktopGUI:
 
     def open_modding_environment(self):
         """Edit pyOS modules and settings with backups and syntax validation."""
+        if not self._ensure_app_enabled("modding", "Modding Environment"):
+            return
         window = self.create_window("Modding Environment", width=900, height=570)
         project = Path(__file__).resolve().parent
         excluded_parts = {
@@ -3347,7 +4481,9 @@ class DesktopGUI:
         )
         if self.settings_path.exists():
             candidates.append(self.settings_path.resolve())
-        current = {"path": None}
+        current = {
+            "path": None, "encoding": "utf-8", "bom": b"", "newline": os.linesep,
+        }
         status = tk.StringVar(value="Choose a pyOS module to begin.")
         sidebar = tk.Frame(window.content, bg=self.preferences["surface_bg"], width=190)
         sidebar.pack(side=tk.LEFT, fill=tk.Y, padx=6, pady=6)
@@ -3383,12 +4519,24 @@ class DesktopGUI:
             if not selection:
                 return
             path = candidates[selection[0]]
+            if editor.edit_modified():
+                choice = messagebox.askyesnocancel(
+                    "Modding Environment", "Save changes before opening another file?", parent=self.root,
+                )
+                if choice is None:
+                    if current["path"] in candidates:
+                        files.selection_clear(0, tk.END)
+                        files.selection_set(candidates.index(current["path"]))
+                    return
+                if choice and not save_mod():
+                    return
             try:
-                content = path.read_text(encoding="utf-8")
-            except OSError as error:
+                # Finish the read and strict decode before replacing the current buffer.
+                content, encoding, bom, newline = decode_text_document(path.read_bytes())
+            except (OSError, UnicodeError) as error:
                 messagebox.showerror("Modding Environment", str(error), parent=self.root)
                 return
-            current["path"] = path
+            current.update(path=path, encoding=encoding, bom=bom, newline=newline)
             editor.delete("1.0", tk.END)
             editor.insert("1.0", content)
             editor.edit_modified(False)
@@ -3404,64 +4552,109 @@ class DesktopGUI:
                     compile(content, str(path), "exec")
                 elif path.suffix.lower() == ".json":
                     json.loads(content)
+                encoding, bom = current["encoding"], current["bom"]
+                try:
+                    payload = encode_text_document(content, encoding, bom, current["newline"])
+                except UnicodeEncodeError:
+                    if not messagebox.askyesno(
+                        "Modding Environment",
+                        f"This edit cannot use the original {encoding} encoding. Convert to UTF-8?",
+                        parent=self.root,
+                    ):
+                        return False
+                    encoding, bom = "utf-8", b""
+                    payload = encode_text_document(content, encoding, bom, current["newline"])
                 backup_dir = project / ".pyos_mod_backups"
                 backup_dir.mkdir(exist_ok=True)
                 stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
                 shutil.copy2(path, backup_dir / f"{path.name}.{stamp}.bak")
-                path.write_text(content, encoding="utf-8")
+                atomic_write_bytes(path, payload)
+                current.update(encoding=encoding, bom=bom)
                 editor.edit_modified(False)
                 status.set(f"Saved {path.name}; backup created in {backup_dir.name}.")
                 if path.parent.resolve() == apps_directory.resolve():
                     self.refresh_custom_app_icons()
-            except (OSError, SyntaxError, ValueError, json.JSONDecodeError) as error:
+                return True
+            except (OSError, SyntaxError, UnicodeError, ValueError, json.JSONDecodeError) as error:
                 messagebox.showerror("Modding Environment", f"Not saved: {error}", parent=self.root)
+                return False
 
         tk.Button(toolbar, text="Save + Validate", command=save_mod).pack(side=tk.LEFT)
         tk.Button(toolbar, text="Reload", command=load_selected).pack(side=tk.LEFT, padx=5)
         tk.Button(toolbar, text="App Maker", command=self.open_app_maker).pack(side=tk.LEFT, padx=(8, 0))
         files.bind("<<ListboxSelect>>", load_selected)
         editor.bind("<Control-s>", lambda event: (save_mod(), "break")[1])
+        original_close = window.close
+        def close_modding():
+            if editor.edit_modified():
+                choice = messagebox.askyesnocancel(
+                    "Modding Environment", "Save changes before closing?", parent=self.root,
+                )
+                if choice is None or (choice and not save_mod()):
+                    return
+            original_close()
+        window.close_button.configure(command=close_modding)
 
     def _custom_apps_directory(self):
         path = self.settings_path.parent / "apps"
         path.mkdir(parents=True, exist_ok=True)
+        register_owned_path(path)
         return path
 
     def run_custom_app(self, path):
-        """Validate and run a user-created app inside a pyOS window."""
+        """Validate and launch a user-created app in a separate process."""
         path = Path(path).resolve()
         apps_directory = self._custom_apps_directory().resolve()
         if path.parent != apps_directory or path.suffix.lower() != ".py":
             raise ValueError("The app must be a Python file in the pyOS apps directory.")
-        source = path.read_text(encoding="utf-8")
-        code = compile(source, str(path), "exec")
-        namespace = {
-            "__name__": f"pyos_app_{path.stem}",
-            "__file__": str(path),
-            "tk": tk,
-            "ttk": ttk,
-            "messagebox": messagebox,
-        }
-        exec(code, namespace)
-        builder = namespace.get("build")
-        if not callable(builder):
+        source, _encoding, _bom, _newline = decode_text_document(path.read_bytes())
+        tree = ast.parse(source, filename=str(path), mode="exec")
+        compile(tree, str(path), "exec")
+        if not any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "build"
+                   for node in tree.body):
             raise ValueError("App must define build(app, window).")
-        title = str(namespace.get("APP_NAME", path.stem.replace("_", " ").title()))[:80]
-        app_window = self.create_window(title, width=640, height=440)
-        try:
-            builder(self, app_window)
-        except Exception:
-            app_window.close()
-            raise
-        return app_window
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        environment.pop("PYTHONHOME", None)
+        environment["PYTHONNOUSERSITE"] = "1"
+        command = (
+            [sys.executable, "--custom-app", str(path)]
+            if getattr(sys, "frozen", False)
+            else [sys.executable, str(Path(__file__).resolve()), "--custom-app", str(path)]
+        )
+        process = subprocess.Popen(command, cwd=str(apps_directory), env=environment)
+        self._child_processes.add(process)
+
+        def poll_process():
+            self._child_process_pollers.pop(process, None)
+            return_code = process.poll()
+            if return_code is None:
+                if not self._closing:
+                    try:
+                        self._child_process_pollers[process] = self.root.after(250, poll_process)
+                    except tk.TclError:
+                        pass
+                return
+            self._child_processes.discard(process)
+            if return_code and not self._closing:
+                self.show_notification(
+                    "Custom App", f"{path.name} exited with code {return_code}.", duration=6000,
+                )
+
+        poll_process()
+        return process
 
     def open_app_maker(self):
         """Create, edit, and launch Python apps hosted inside pyOS."""
+        if not self._ensure_app_enabled("ide", "App Maker"):
+            return
         window = self.create_window("App Maker", width=920, height=590)
         surface = self.preferences["surface_bg"]
         foreground = self.preferences["text_fg"]
         apps_directory = self._custom_apps_directory()
-        current = {"path": None}
+        current = {
+            "path": None, "encoding": "utf-8", "bom": b"", "newline": os.linesep,
+        }
         status = tk.StringVar(value="Create an app or select an existing one.")
         app_name = tk.StringVar(value="My App")
 
@@ -3489,7 +4682,7 @@ class DesktopGUI:
 
 
 def build(app, window):
-    """Build this app inside the supplied pyOS window."""
+    """Build this app inside its isolated pyOS app process."""
     content = window.content
     content.configure(bg="white")
 
@@ -3524,7 +4717,13 @@ def build(app, window):
                 app_list.see(index)
 
         def new_app():
-            current["path"] = None
+            if editor.edit_modified():
+                choice = messagebox.askyesnocancel(
+                    "App Maker", "Save changes before creating a new app?", parent=self.root,
+                )
+                if choice is None or (choice and save_app() is None):
+                    return
+            current.update(path=None, encoding="utf-8", bom=b"", newline=os.linesep)
             app_name.set("My App")
             editor.delete("1.0", tk.END)
             editor.insert("1.0", template)
@@ -3537,12 +4736,22 @@ def build(app, window):
             if not selection or selection[0] >= len(paths):
                 return
             path = paths[selection[0]]
+            if editor.edit_modified():
+                choice = messagebox.askyesnocancel(
+                    "App Maker", "Save changes before opening another app?", parent=self.root,
+                )
+                if choice is None or (choice and save_app() is None):
+                    if current["path"] in paths:
+                        app_list.selection_clear(0, tk.END)
+                        app_list.selection_set(paths.index(current["path"]))
+                    return
             try:
-                source = path.read_text(encoding="utf-8")
-            except OSError as error:
+                # Decode completely before touching the app currently shown in the editor.
+                source, encoding, bom, newline = decode_text_document(path.read_bytes())
+            except (OSError, UnicodeError) as error:
                 messagebox.showerror("App Maker", str(error), parent=self.root)
                 return
-            current["path"] = path
+            current.update(path=path, encoding=encoding, bom=bom, newline=newline)
             app_name.set(path.stem.replace("_", " ").title())
             editor.delete("1.0", tk.END)
             editor.insert("1.0", source)
@@ -3561,19 +4770,37 @@ def build(app, window):
         def save_app():
             source = editor.get("1.0", "end-1c")
             try:
-                syntax_tree = ast.parse(source, filename=str(target_path()), mode="exec")
-                compile(syntax_tree, str(target_path()), "exec")
+                destination = target_path()
+                syntax_tree = ast.parse(source, filename=str(destination), mode="exec")
+                compile(syntax_tree, str(destination), "exec")
                 if not any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "build"
                            for node in syntax_tree.body):
                     raise ValueError("App must define build(app, window).")
-                destination = target_path()
+                encoding, bom = current["encoding"], current["bom"]
+                try:
+                    payload = encode_text_document(source, encoding, bom, current["newline"])
+                except UnicodeEncodeError:
+                    if not messagebox.askyesno(
+                        "App Maker",
+                        f"This edit cannot use the original {encoding} encoding. Convert to UTF-8?",
+                        parent=self.root,
+                    ):
+                        return None
+                    encoding, bom = "utf-8", b""
+                    payload = encode_text_document(source, encoding, bom, current["newline"])
                 old_path = current["path"]
+                if (destination.exists() and destination != old_path
+                        and not messagebox.askyesno(
+                            "App Maker", f"{destination.name} already exists. Replace it?",
+                            icon=messagebox.WARNING, parent=self.root,
+                        )):
+                    return None
                 if destination.exists():
                     backup_dir = apps_directory / ".backups"
                     backup_dir.mkdir(exist_ok=True)
                     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
                     shutil.copy2(destination, backup_dir / f"{destination.name}.{stamp}.bak")
-                destination.write_text(source, encoding="utf-8")
+                atomic_write_bytes(destination, payload)
                 if old_path and old_path != destination and old_path.exists():
                     old_path.unlink()
                     old_key = "custom:" + old_path.name.casefold()
@@ -3582,13 +4809,13 @@ def build(app, window):
                     if old_position is not None:
                         self.preferences["icon_positions"][new_key] = old_position
                         self.save_preferences()
-                current["path"] = destination
+                current.update(path=destination, encoding=encoding, bom=bom)
                 editor.edit_modified(False)
                 refresh(destination)
                 self.refresh_custom_app_icons()
                 status.set(f"Saved and validated {destination.name}.")
                 return destination
-            except (OSError, SyntaxError, ValueError) as error:
+            except (OSError, SyntaxError, UnicodeError, ValueError) as error:
                 messagebox.showerror("App Maker", f"App was not saved: {error}", parent=self.root)
                 return None
 
@@ -3598,7 +4825,7 @@ def build(app, window):
                 return
             try:
                 self.run_custom_app(path)
-                status.set(f"Running {path.stem.replace('_', ' ').title()} inside pyOS.")
+                status.set(f"Running {path.stem.replace('_', ' ').title()} in an isolated process.")
             except Exception as error:
                 messagebox.showerror("App Maker", f"App could not run: {error}", parent=self.root)
 
@@ -3622,16 +4849,30 @@ def build(app, window):
 
         tk.Button(toolbar, text="New", command=new_app).pack(side=tk.LEFT, padx=(8, 0))
         tk.Button(toolbar, text="Save App", command=save_app).pack(side=tk.LEFT, padx=4)
-        tk.Button(toolbar, text="Run Inside pyOS", command=run_app).pack(side=tk.LEFT)
+        tk.Button(toolbar, text="Run Isolated", command=run_app).pack(side=tk.LEFT)
         tk.Button(toolbar, text="Delete", command=delete_app).pack(side=tk.RIGHT)
         app_list.bind("<<ListboxSelect>>", load_app)
         editor.bind("<Control-s>", lambda event: (save_app(), "break")[1])
         refresh()
         new_app()
 
+        original_close = window.close
+        def close_app_maker():
+            if editor.edit_modified():
+                choice = messagebox.askyesnocancel(
+                    "App Maker", "Save changes before closing?", parent=self.root,
+                )
+                if choice is None or (choice and save_app() is None):
+                    return
+            original_close()
+        window.close_button.configure(command=close_app_maker)
+
     def open_weather(self):
         """Show current conditions and a seven-day forecast for a selected location."""
+        if not self._ensure_app_enabled("weather", "Weather"):
+            return
         window = self.create_window("Weather", width=760, height=560)
+        request_gate = RequestGate()
         surface = self.preferences["surface_bg"]
         foreground = self.preferences["text_fg"]
         location_query = tk.StringVar()
@@ -3738,20 +4979,33 @@ def build(app, window):
                 status.set("Enter at least two characters for a location.")
                 return
             status.set("Loading weather data...")
+            generation = request_gate.next()
 
             def worker():
                 try:
                     latitude, longitude, label = auto_location() if use_auto else search_location(query)
                     data = fetch_forecast(latitude, longitude)
-                    self.root.after(0, lambda: render(data, label))
-                except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
-                    self.root.after(0, lambda message=str(error): status.set(f"Weather unavailable: {message}"))
+                    error = None
+                except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                    data, label, error = None, None, str(exc)
 
-            threading.Thread(target=worker, daemon=True).start()
+                def finish():
+                    if not request_gate.valid(generation) or not window.frame.winfo_exists():
+                        return
+                    if error:
+                        status.set(f"Weather unavailable: {error}")
+                    else:
+                        render(data, label)
+
+                self.post_ui(finish)
+
+            if self.run_background(worker) is None:
+                status.set("Weather request was not started because the task queue is busy.")
 
         tk.Button(toolbar, text="Search", command=load_weather).pack(side=tk.LEFT)
         tk.Button(toolbar, text="My Location", command=lambda: load_weather(True)).pack(side=tk.LEFT, padx=(5, 0))
         location_entry.bind("<Return>", lambda event: load_weather())
+        window.add_dispose_callback(request_gate.close)
         load_weather(True)
 
     def open_default_file_manager(self):
@@ -3835,7 +5089,10 @@ def build(app, window):
 
     def open_news(self):
         """Browse current headlines and search Google News RSS feeds."""
+        if not self._ensure_app_enabled("news", "News"):
+            return
         window = self.create_window("News", width=880, height=570)
+        request_gate = RequestGate()
         surface = self.preferences["surface_bg"]
         foreground = self.preferences["text_fg"]
         category = tk.StringVar(value="Top Stories")
@@ -3909,6 +5166,7 @@ def build(app, window):
         def refresh_news(event=None):
             url = feed_url()
             status.set("Updating headlines...")
+            generation = request_gate.next()
 
             def worker():
                 try:
@@ -3935,11 +5193,22 @@ def build(app, window):
                         if articles:
                             headline_list.selection_set(0)
                             show_article()
-                    self.root.after(0, display)
-                except (OSError, ET.ParseError, ValueError) as error:
-                    self.root.after(0, lambda message=str(error): status.set(f"News unavailable: {message}"))
+                    error = None
+                except (OSError, ET.ParseError, ValueError) as exc:
+                    fetched, error = [], str(exc)
 
-            threading.Thread(target=worker, daemon=True).start()
+                def finish():
+                    if not request_gate.valid(generation) or not window.frame.winfo_exists():
+                        return
+                    if error:
+                        status.set(f"News unavailable: {error}")
+                    else:
+                        display()
+
+                self.post_ui(finish)
+
+            if self.run_background(worker) is None:
+                status.set("News request was not started because the task queue is busy.")
 
         tk.Button(toolbar, text="Search / Refresh", command=refresh_news).pack(side=tk.LEFT)
         tk.Button(footer, text="Open Full Story", command=open_article).pack(side=tk.RIGHT, padx=(6, 0))
@@ -3947,10 +5216,13 @@ def build(app, window):
         headline_list.bind("<Double-Button-1>", lambda event: open_article())
         search_entry.bind("<Return>", refresh_news)
         section_box.bind("<<ComboboxSelected>>", refresh_news)
+        window.add_dispose_callback(request_gate.close)
         refresh_news()
 
     def open_games_suite(self):
         """Open the launcher for pyOS's small built-in games."""
+        if not self._ensure_app_enabled("games", "Games Suite"):
+            return
         window = self.create_window("Games Suite", width=560, height=390)
         background = self.preferences.get("surface_bg", "#ffffff")
         foreground = self.preferences.get("text_fg", "#000000")
@@ -3981,6 +5253,8 @@ def build(app, window):
 
     def open_eight_ball_pool(self):
         """Open a local two-player 8-ball pool game."""
+        if not self._ensure_app_enabled("games", "8-Ball Pool"):
+            return
         window = self.create_window("8-Ball Pool", width=850, height=610)
         background = self.preferences.get("surface_bg", "#ffffff")
         foreground = self.preferences.get("text_fg", "#000000")
@@ -4204,6 +5478,8 @@ def build(app, window):
 
     def open_snake(self):
         """Open a keyboard-controlled Snake game."""
+        if not self._ensure_app_enabled("games", "Snake"):
+            return
         window = self.create_window("Snake", width=570, height=540)
         background = self.preferences.get("surface_bg", "#ffffff")
         foreground = self.preferences.get("text_fg", "#000000")
@@ -4302,6 +5578,8 @@ def build(app, window):
 
     def open_sudoku(self):
         """Open a generated Sudoku puzzle."""
+        if not self._ensure_app_enabled("games", "Sudoku"):
+            return
         window = self.create_window("Sudoku", width=550, height=610)
         background = self.preferences.get("surface_bg", "#ffffff")
         foreground = self.preferences.get("text_fg", "#000000")
@@ -4339,8 +5617,19 @@ def build(app, window):
             numbers = random.sample(range(1, 10), 9)
             solution = [[numbers[pattern(row, column)] for column in columns] for row in rows]
             puzzle = [line[:] for line in solution]
-            for index in random.sample(range(81), 48):
-                puzzle[index // 9][index % 9] = 0
+            removed = 0
+            positions = list(range(81))
+            random.shuffle(positions)
+            for index in positions:
+                row, column = divmod(index, 9)
+                previous = puzzle[row][column]
+                puzzle[row][column] = 0
+                if count_sudoku_solutions(puzzle, limit=2) != 1:
+                    puzzle[row][column] = previous
+                else:
+                    removed += 1
+                if removed >= 48:
+                    break
             return puzzle, solution
 
         def new_puzzle():
@@ -4388,6 +5677,8 @@ def build(app, window):
 
     def open_chess(self):
         """Open chess against a lightweight automated opponent."""
+        if not self._ensure_app_enabled("games", "Chess"):
+            return
         try:
             import chess
         except ImportError:
@@ -4400,13 +5691,20 @@ def build(app, window):
         window = self.create_window("Automated Chess", width=670, height=700)
         background = self.preferences.get("surface_bg", "#ffffff")
         foreground = self.preferences.get("text_fg", "#000000")
-        status = tk.StringVar(value="You are White. Select a piece, then its destination.")
+        status = tk.StringVar(
+            value="You are White. Click squares, use arrow keys + Enter, or enter e2e4."
+        )
         tk.Label(window.content, textvariable=status, bg=background, fg=foreground).pack(pady=6)
-        board_canvas = tk.Canvas(window.content, width=576, height=576, highlightthickness=2,
-                                 highlightbackground=foreground)
+        board_canvas = tk.Canvas(
+            window.content, width=576, height=576, highlightthickness=2,
+            highlightbackground=foreground, highlightcolor="#1565c0", takefocus=True,
+        )
         board_canvas.pack(padx=10, pady=4)
         board = chess.Board()
-        state = {"selected": None, "thinking": False, "after": None}
+        state = {
+            "selected": None, "thinking": False, "after": None,
+            "keyboard_square": chess.E2,
+        }
         size = 72
         pieces = {
             "K": "♔", "Q": "♕", "R": "♖", "B": "♗", "N": "♘", "P": "♙",
@@ -4436,6 +5734,11 @@ def build(app, window):
                         board_canvas.create_text(x0 + size / 2, y0 + size / 2,
                                                  text=pieces[piece.symbol()],
                                                  font=("Segoe UI Symbol", 42))
+                    if square == state["keyboard_square"]:
+                        board_canvas.create_rectangle(
+                            x0 + 3, y0 + 3, x0 + size - 3, y0 + size - 3,
+                            outline="#1565c0", width=4,
+                        )
             for index, letter in enumerate("abcdefgh"):
                 board_canvas.create_text(index * size + 7, 568, text=letter,
                                          anchor=tk.SW, font=("Courier New", 8, "bold"))
@@ -4492,13 +5795,18 @@ def build(app, window):
             if not update_game_status():
                 status.set("Your turn (White).")
 
-        def clicked(event):
+        def finish_human_move(move):
+            board.push(move)
+            draw_board()
+            if not update_game_status():
+                state["thinking"] = True
+                status.set("Computer is thinking...")
+                state["after"] = self.root.after(250, computer_move)
+
+        def choose_square(square):
             if state["thinking"] or board.turn != chess.WHITE or board.is_game_over():
                 return
-            file_index, display_row = event.x // size, event.y // size
-            if not (0 <= file_index < 8 and 0 <= display_row < 8):
-                return
-            square = chess.square(file_index, 7 - display_row)
+            state["keyboard_square"] = square
             if state["selected"] is None:
                 piece = board.piece_at(square)
                 if piece and piece.color == chess.WHITE:
@@ -4511,25 +5819,82 @@ def build(app, window):
             if candidates:
                 move = next((candidate for candidate in candidates
                              if candidate.promotion == chess.QUEEN), candidates[0])
-                board.push(move)
-                draw_board()
-                if not update_game_status():
-                    state["thinking"] = True
-                    status.set("Computer is thinking...")
-                    state["after"] = self.root.after(250, computer_move)
+                finish_human_move(move)
             else:
                 draw_board()
+
+        def clicked(event):
+            file_index, display_row = event.x // size, event.y // size
+            if not (0 <= file_index < 8 and 0 <= display_row < 8):
+                return
+            choose_square(chess.square(file_index, 7 - display_row))
+            board_canvas.focus_set()
+
+        def keyboard_board(event):
+            square = state["keyboard_square"]
+            file_index, rank_index = chess.square_file(square), chess.square_rank(square)
+            movement = {
+                "Left": (-1, 0), "Right": (1, 0),
+                "Up": (0, 1), "Down": (0, -1),
+            }.get(event.keysym)
+            if movement:
+                file_index = max(0, min(7, file_index + movement[0]))
+                rank_index = max(0, min(7, rank_index + movement[1]))
+                state["keyboard_square"] = chess.square(file_index, rank_index)
+                draw_board()
+                status.set(
+                    f"Keyboard square {chess.square_name(state['keyboard_square'])}. "
+                    "Press Enter or Space to select."
+                )
+                return "break"
+            if event.keysym in {"Return", "space"}:
+                choose_square(square)
+                return "break"
+            if event.keysym == "Escape":
+                state["selected"] = None
+                draw_board()
+                return "break"
+            return None
+
+        move_var = tk.StringVar()
+
+        def play_notation(event=None):
+            if state["thinking"] or board.turn != chess.WHITE or board.is_game_over():
+                return "break"
+            value = move_var.get().strip().casefold()
+            try:
+                move = board.parse_uci(value)
+            except ValueError:
+                status.set("Enter a legal move such as e2e4 (add q for promotion).")
+                return "break"
+            move_var.set("")
+            state["selected"] = None
+            state["keyboard_square"] = move.to_square
+            finish_human_move(move)
+            return "break"
 
         def new_game():
             if state["after"] is not None:
                 self.root.after_cancel(state["after"])
             board.reset()
-            state.update(selected=None, thinking=False, after=None)
-            status.set("You are White. Select a piece, then its destination.")
+            state.update(
+                selected=None, thinking=False, after=None, keyboard_square=chess.E2,
+            )
+            status.set(
+                "You are White. Click squares, use arrow keys + Enter, or enter a move."
+            )
             draw_board()
 
         board_canvas.bind("<Button-1>", clicked)
-        tk.Button(window.content, text="New Game", command=new_game).pack(pady=5)
+        board_canvas.bind("<KeyPress>", keyboard_board)
+        controls = tk.Frame(window.content, bg=background)
+        controls.pack(pady=5)
+        tk.Label(controls, text="Move:", bg=background, fg=foreground).pack(side=tk.LEFT)
+        move_entry = tk.Entry(controls, textvariable=move_var, width=8)
+        move_entry.pack(side=tk.LEFT, padx=4)
+        move_entry.bind("<Return>", play_notation)
+        tk.Button(controls, text="Play Move", command=play_notation).pack(side=tk.LEFT, padx=3)
+        tk.Button(controls, text="New Game", command=new_game).pack(side=tk.LEFT, padx=7)
         window.frame.bind("<Destroy>", lambda event: (
             self.root.after_cancel(state["after"]) if event.widget is window.frame
             and state["after"] is not None else None
@@ -4544,7 +5909,10 @@ def build(app, window):
         allowed_extensions = {
             ".html", ".htm", ".css", ".js", ".json", ".svg", ".txt", ".md", ".xml",
         }
-        state = {"project": None, "file": None, "dirty": False, "loading": False}
+        state = {
+            "project": None, "file": None, "dirty": False, "loading": False,
+            "encoding": "utf-8", "bom": b"", "newline": os.linesep,
+        }
         status = tk.StringVar(value="Choose or create a website project folder.")
         project_label = tk.StringVar(value="No project open")
 
@@ -4643,12 +6011,26 @@ img { max-width: 100%; height: auto; }
             if target is None:
                 return False
             try:
-                target.write_text(editor.get("1.0", "end-1c"), encoding="utf-8")
+                content = editor.get("1.0", "end-1c")
+                encoding, bom = state["encoding"], state["bom"]
+                try:
+                    payload = encode_text_document(content, encoding, bom, state["newline"])
+                except UnicodeEncodeError:
+                    if not messagebox.askyesno(
+                        "Website Designer",
+                        f"This edit cannot use the original {encoding} encoding. Convert to UTF-8?",
+                        parent=self.root,
+                    ):
+                        return False
+                    encoding, bom = "utf-8", b""
+                    payload = encode_text_document(content, encoding, bom, state["newline"])
+                atomic_write_bytes(target, payload)
+                state.update(encoding=encoding, bom=bom)
                 state["dirty"] = False
                 file_title.set(target.name)
                 status.set(f"Saved {target.relative_to(state['project'])}")
                 return True
-            except OSError as error:
+            except (OSError, UnicodeError) as error:
                 messagebox.showerror("Website Designer", f"Could not save file:\n{error}", parent=self.root)
                 return False
 
@@ -4694,14 +6076,18 @@ img { max-width: 100%; height: auto; }
             if target.suffix.casefold() not in allowed_extensions or not confirm_discard():
                 return
             try:
-                content = target.read_text(encoding="utf-8")
+                # Read and decode the complete file before clearing the current editor.
+                content, encoding, bom, newline = decode_text_document(target.read_bytes())
             except (OSError, UnicodeError) as error:
                 messagebox.showerror("Website Designer", f"Could not open file:\n{error}", parent=self.root)
                 return
             state["loading"] = True
             editor.delete("1.0", tk.END)
             editor.insert("1.0", content)
-            state.update(file=target, dirty=False, loading=False)
+            state.update(
+                file=target, dirty=False, loading=False,
+                encoding=encoding, bom=bom, newline=newline,
+            )
             file_title.set(target.name)
             status.set(str(target.relative_to(state["project"])))
             highlight_source()
@@ -4752,11 +6138,14 @@ img { max-width: 100%; height: auto; }
                     }
                     for target, content in starters.items():
                         if not target.exists():
-                            target.write_text(content, encoding="utf-8")
+                            atomic_write_bytes(target, content.encode("utf-8"))
             except OSError as error:
                 messagebox.showerror("Website Designer", f"Could not create project:\n{error}", parent=self.root)
                 return
-            state.update(project=root, file=None, dirty=False)
+            state.update(
+                project=root, file=None, dirty=False,
+                encoding="utf-8", bom=b"", newline=os.linesep,
+            )
             project_label.set(root.name)
             refresh_tree(root / "index.html")
             if (root / "index.html").exists():
@@ -4784,7 +6173,7 @@ img { max-width: 100%; height: auto; }
                     raise ValueError("That file already exists.")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 content = page_template(Path(name).stem.replace("-", " ").title()) if kind == "page" else ""
-                target.write_text(content, encoding="utf-8")
+                atomic_write_bytes(target, content.encode("utf-8"))
             except (OSError, ValueError) as error:
                 messagebox.showerror("Website Designer", str(error), parent=self.root)
                 return
@@ -4918,89 +6307,24 @@ img { max-width: 100%; height: auto; }
         try:
             import paramiko
         except (ImportError, OSError) as import_error:
-            if getattr(sys, "frozen", False):
-                messagebox.showerror(
-                    "SSH Client",
-                    "Paramiko could not be loaded from this pyOS executable. "
-                    "Reinstall or rebuild pyOS with its bundled SSH components.\n\n"
-                    f"Technical details: {import_error}",
-                    parent=self.root,
-                )
-                return
-            if not messagebox.askyesno(
-                "Repair SSH Client",
-                "The active pyOS Python environment is missing Paramiko 4. "
-                "Install the SSH components now?",
+            messagebox.showerror(
+                "SSH Client",
+                "Paramiko 5 is unavailable. Run pyOS Setup as an administrator to install or repair "
+                "the fixed SSH components. pyOS will not use affected Paramiko 4 releases.\n\n"
+                f"Technical details: {import_error}",
                 parent=self.root,
-            ):
-                return
-            progress, close_progress = self.open_task_progress(
-                "Repair SSH Client", "Installing Paramiko 4..."
             )
-
-            def install_paramiko():
-                version = ""
-                try:
-                    progress("Downloading and installing Paramiko 4...")
-                    result = subprocess.run(
-                        [
-                            sys.executable, "-m", "pip", "install",
-                            "--disable-pip-version-check", "--upgrade", "paramiko>=4.0,<5.0",
-                        ],
-                        capture_output=True,
-                        text=True,
-                        errors="replace",
-                        timeout=300,
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    )
-                    if result.returncode:
-                        output = (result.stderr or result.stdout or "pip returned an error").strip()
-                        error = output[-1600:]
-                    else:
-                        progress("Verifying the SSH components...")
-                        verification = subprocess.run(
-                            [
-                                sys.executable, "-c",
-                                "import paramiko; print(paramiko.__version__)",
-                            ],
-                            capture_output=True,
-                            text=True,
-                            errors="replace",
-                            timeout=30,
-                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                        )
-                        if verification.returncode:
-                            output = (
-                                verification.stderr or verification.stdout
-                                or "Paramiko still could not be imported"
-                            ).strip()
-                            error = output[-1600:]
-                        else:
-                            error = None
-                            version = verification.stdout.strip()
-                except (OSError, subprocess.SubprocessError) as exc:
-                    error = str(exc)
-
-                def finish_install():
-                    close_progress()
-                    if error:
-                        messagebox.showerror(
-                            "SSH Client",
-                            f"Paramiko could not be installed:\n{error}",
-                            parent=self.root,
-                        )
-                        return
-                    messagebox.showinfo(
-                        "SSH Client",
-                        f"Paramiko {version or '4'} was installed successfully. "
-                        "The SSH Client will now open.",
-                        parent=self.root,
-                    )
-                    self.open_ssh_client()
-
-                self.root.after(0, finish_install)
-
-            threading.Thread(target=install_paramiko, daemon=True).start()
+            return
+        version_parts = tuple(
+            int(value) for value in re.findall(r"\d+", str(getattr(paramiko, "__version__", "")))[:3]
+        )
+        if not version_parts or version_parts <= (4, 0, 0):
+            messagebox.showerror(
+                "SSH Client",
+                f"Paramiko {getattr(paramiko, '__version__', 'unknown')} is blocked due to "
+                "CVE-2026-44405. Install a future fixed Paramiko release before using SSH.",
+                parent=self.root,
+            )
             return
 
         window = self.create_window("SSH Client", width=820, height=570)
@@ -5008,7 +6332,8 @@ img { max-width: 100%; height: auto; }
         foreground = self.preferences["text_fg"]
         chrome = self.preferences["chrome_bg"]
         chrome_text = self.preferences["chrome_fg"]
-        state = {"client": None, "channel": None, "closing": False, "reader": None}
+        state = {"client": None, "channel": None, "closing": False, "reader": None,
+                 "output_batch": None, "generation": 0}
 
         connection = tk.Frame(window.content, bg=surface, padx=8, pady=7)
         connection.pack(fill=tk.X)
@@ -5118,6 +6443,12 @@ img { max-width: 100%; height: auto; }
             clean = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))", "", text)
             terminal.configure(state=tk.NORMAL)
             terminal.insert(tk.END, clean)
+            try:
+                count = int(terminal.count("1.0", "end-1c", "chars")[0])
+                if count > MAX_TEXT_WIDGET_CHARS:
+                    terminal.delete("1.0", f"1.0+{count - MAX_TEXT_WIDGET_CHARS}c")
+            except (tk.TclError, TypeError):
+                pass
             terminal.see(tk.END)
             terminal.configure(state=tk.DISABLED)
 
@@ -5148,21 +6479,26 @@ img { max-width: 100%; height: auto; }
                 )
                 ready.set()
 
-            self.root.after(0, ask)
-            ready.wait()
-            return decision["accepted"]
+            if not self.post_ui(ask):
+                return False
+            ready.wait(120)
+            return ready.is_set() and not state["closing"] and decision["accepted"]
 
         class ConfirmHostKeyPolicy(paramiko.MissingHostKeyPolicy):
             def missing_host_key(self, client, hostname, key):
                 if not confirm_unknown_host(hostname, key):
                     raise paramiko.SSHException("Unknown host key was not accepted.")
                 client.get_host_keys().add(hostname, key.get_name(), key)
-                known_hosts.parent.mkdir(parents=True, exist_ok=True)
-                client.save_host_keys(str(known_hosts))
+                persist_ssh_host_key(paramiko, known_hosts, hostname, key)
 
         def disconnect(show_message=True):
+            state["generation"] += 1
             channel, client = state.get("channel"), state.get("client")
             state["channel"] = state["client"] = None
+            output_batch = state.get("output_batch")
+            if output_batch:
+                output_batch.close()
+                state["output_batch"] = None
             for resource in (channel, client):
                 if resource:
                     try:
@@ -5175,21 +6511,22 @@ img { max-width: 100%; height: auto; }
                 if show_message:
                     append_output("\n[Disconnected]\n")
 
-        def reader(channel):
+        def reader(channel, generation, output_batch):
             try:
-                while not state["closing"] and not channel.closed:
+                while (not state["closing"] and generation == state["generation"]
+                       and not channel.closed):
                     if channel.recv_ready():
                         data = channel.recv(32768).decode("utf-8", "replace")
-                        self.root.after(0, lambda value=data: append_output(value))
+                        output_batch.append(data)
                     elif channel.exit_status_ready():
                         break
                     else:
                         time.sleep(0.05)
             except (OSError, paramiko.SSHException) as error:
-                self.root.after(0, lambda value=str(error): append_output(f"\n[SSH error: {value}]\n"))
+                self.post_ui(lambda value=str(error): append_output(f"\n[SSH error: {value}]\n"))
             finally:
-                if not state["closing"]:
-                    self.root.after(0, lambda: disconnect(show_message=True))
+                if not state["closing"] and generation == state["generation"]:
+                    self.post_ui(lambda: disconnect(show_message=True))
 
         def connect():
             host, username = host_var.get().strip(), username_var.get().strip()
@@ -5208,17 +6545,15 @@ img { max-width: 100%; height: auto; }
             status_var.set(f"Connecting to {host}:{port}...")
             mode = auth_var.get()
             supplied_secret = secret_var.get()
+            state["generation"] += 1
+            generation = state["generation"]
 
             def worker():
                 client = paramiko.SSHClient()
-                client.load_system_host_keys()
-                if known_hosts.exists():
-                    try:
-                        client.load_host_keys(str(known_hosts))
-                    except (OSError, paramiko.SSHException):
-                        pass
-                client.set_missing_host_key_policy(ConfirmHostKeyPolicy())
                 try:
+                    client.load_system_host_keys()
+                    load_ssh_host_keys_locked(paramiko, client, known_hosts)
+                    client.set_missing_host_key_policy(ConfirmHostKeyPolicy())
                     client.connect(
                         hostname=host, port=port, username=username,
                         password=supplied_secret if mode == "Password" else None,
@@ -5234,28 +6569,40 @@ img { max-width: 100%; height: auto; }
                     channel.settimeout(0.0)
                 except Exception as error:
                     client.close()
-                    self.root.after(0, lambda value=str(error): (
+                    self.post_ui(lambda value=str(error): (
                         set_connected(False, "Connection failed"),
                         append_output(f"[Connection failed: {value}]\n"),
                         secret_var.set(""),
-                    ))
+                    ) if generation == state["generation"] and not state["closing"] else None)
                     return
 
                 def finish():
-                    if state["closing"] or not window.frame.winfo_exists():
+                    if (state["closing"] or generation != state["generation"]
+                            or not window.frame.winfo_exists()):
                         channel.close()
                         client.close()
                         return
                     state["client"], state["channel"] = client, channel
                     set_connected(True, f"Connected to {username}@{host}:{port}")
                     append_output(f"[Connected securely to {host}]\n")
-                    state["reader"] = threading.Thread(target=reader, args=(channel,), daemon=True)
+                    output_batch = UiTextBatcher(
+                        self.post_ui,
+                        lambda text: append_output(text)
+                        if generation == state["generation"] and not state["closing"] else None,
+                    )
+                    state["output_batch"] = output_batch
+                    state["reader"] = threading.Thread(
+                        target=reader, args=(channel, generation, output_batch), daemon=True
+                    )
                     state["reader"].start()
                     secret_var.set("")
 
-                self.root.after(0, finish)
+                self.post_ui(finish)
 
-            threading.Thread(target=worker, daemon=True).start()
+            if self.run_background(worker) is None:
+                connect_button.configure(state=tk.NORMAL)
+                status_var.set("Connection was not started because the task queue is busy.")
+                secret_var.set("")
 
         def send_command(event=None):
             channel = state.get("channel")
@@ -5296,7 +6643,11 @@ img { max-width: 100%; height: auto; }
         notebook.add(forwarding, text="Port Forwards")
 
         state = {"server": None, "thread": None, "refresh": None, "last_io": None,
-                 "last_time": None, "closing": False, "upnp": None, "public_port": None}
+                 "last_time": None, "closing": False, "upnp": None, "public_port": None,
+                 "mapping_renewal": None, "mapping_cleanup": None,
+                 "mapping_generation": 0, "mapping_thread": None,
+                 "pending_server": None, "traffic_generation": 0}
+        mapping_operation_lock = threading.Lock()
         folder_var = tk.StringVar(value=str(Path(folder)) if folder else str(Path.home()))
         port_var = tk.StringVar(value="8000")
         lan_var = tk.BooleanVar(value=False)
@@ -5594,7 +6945,10 @@ img { max-width: 100%; height: auto; }
         def forwarded_ports(mapping):
             """Enumerate the router's existing UPnP port-forward table."""
             entries = []
-            for index in range(1024):
+            deadline = time.monotonic() + 30
+            for index in range(256):
+                if time.monotonic() >= deadline:
+                    break
                 try:
                     response = upnp_soap(mapping, "GetGenericPortMappingEntry", (("PortMappingIndex", index),))
                 except RuntimeError as error:
@@ -5653,35 +7007,77 @@ img { max-width: 100%; height: auto; }
                     else:
                         display_forwarded_ports(entries)
 
-                self.root.after(0, finish)
+                self.post_ui(finish)
 
-            threading.Thread(target=worker, daemon=True).start()
+            if not self.run_background(worker):
+                scan_button.configure(state=tk.NORMAL)
+                forwarding_status.set("Scan deferred because pyOS is busy; try again shortly.")
 
         scan_button = tk.Button(forward_header, text="Scan Router", command=scan_router_ports)
         scan_button.pack(side=tk.RIGHT, padx=(8, 0))
 
+        def delete_public_mapping(upnp, mapped_port):
+            """Delete one captured mapping without touching Tk or shared UI state."""
+            if isinstance(upnp, dict) and upnp.get("kind") == "natpmp":
+                request = struct.pack(
+                    "!BBHHHI", 0, 2, 0, upnp["internal_port"],
+                    upnp["external_port"], 0,
+                )
+                natpmp_exchange(upnp["gateway"], request, 130)
+            elif isinstance(upnp, dict):
+                upnp_soap(upnp, "DeletePortMapping", (
+                    ("RemoteHost", ""), ("ExternalPort", mapped_port), ("Protocol", "TCP"),
+                ))
+            else:
+                upnp.deleteportmapping(mapped_port, "TCP")
+
         def remove_public_mapping():
+            """Remove the active public mapping asynchronously, retaining it on failure."""
             upnp, mapped_port = state.get("upnp"), state.get("public_port")
-            state["upnp"] = state["public_port"] = None
-            if upnp and mapped_port:
+            if not upnp or not mapped_port:
+                return False
+            cleanup = state.get("mapping_cleanup")
+            if cleanup is not None and cleanup.is_alive():
+                return True
+            state["mapping_generation"] += 1
+            renewal = state.get("mapping_renewal")
+            if renewal is not None:
                 try:
-                    if isinstance(upnp, dict) and upnp.get("kind") == "natpmp":
-                        request = struct.pack(
-                            "!BBHHHI", 0, 2, 0, upnp["internal_port"],
-                            upnp["external_port"], 0,
+                    self.root.after_cancel(renewal)
+                except tk.TclError:
+                    pass
+                state["mapping_renewal"] = None
+
+            def cleanup_worker():
+                try:
+                    with mapping_operation_lock:
+                        delete_public_mapping(upnp, mapped_port)
+                    error = None
+                except Exception as exc:
+                    error = str(exc)
+                if error is None and state.get("upnp") is upnp and state.get("public_port") == mapped_port:
+                    state["upnp"] = state["public_port"] = None
+                state["mapping_cleanup"] = None
+
+                def finish_cleanup():
+                    if state["closing"] or not window.frame.winfo_exists():
+                        return
+                    if error:
+                        log_request(
+                            f"Could not remove router port mapping; its finite lease will expire: {error}"
                         )
-                        natpmp_exchange(upnp["gateway"], request, 130)
-                    elif isinstance(upnp, dict):
-                        upnp_soap(upnp, "DeletePortMapping", (
-                            ("RemoteHost", ""), ("ExternalPort", mapped_port), ("Protocol", "TCP"),
-                        ))
                     else:
-                        upnp.deleteportmapping(mapped_port, "TCP")
-                    log_request(f"Removed public TCP port mapping {mapped_port}")
-                    if not state["closing"]:
+                        log_request(f"Removed public TCP port mapping {mapped_port}")
                         self.root.after(300, scan_router_ports)
-                except Exception as error:
-                    log_request(f"Could not remove router port mapping: {error}")
+
+                if not state["closing"]:
+                    self.post_ui(finish_cleanup)
+
+            # Non-daemon cleanup keeps process exit from abandoning a still-active mapping.
+            cleanup = threading.Thread(target=cleanup_worker, name="pyos-port-cleanup", daemon=False)
+            state["mapping_cleanup"] = cleanup
+            cleanup.start()
+            return True
 
         def create_public_mapping(port):
             if os.name == "nt":
@@ -5715,7 +7111,7 @@ img { max-width: 100%; height: auto; }
                         ("RemoteHost", ""), ("ExternalPort", port), ("Protocol", "TCP"),
                         ("InternalPort", port), ("InternalClient", internal_address),
                         ("Enabled", 1), ("PortMappingDescription", "pyOS Public Website"),
-                        ("LeaseDuration", 0),
+                        ("LeaseDuration", 3600),
                     ))
                     mapping_created = True
                     response = upnp_soap(mapping, "GetExternalIPAddress", ())
@@ -5733,8 +7129,8 @@ img { max-width: 100%; height: auto; }
                         except Exception:
                             pass
                     raise
+                mapping.update(internal_address=internal_address, internal_port=port)
                 state["upnp"], state["public_port"] = mapping, port
-                self.root.after(0, scan_router_ports)
                 return external_address, port
             try:
                 import miniupnpc
@@ -5751,7 +7147,7 @@ img { max-width: 100%; height: auto; }
                 upnp.selectigd()
                 internal_address = upnp.lanaddr or local_ip()
                 created = upnp.addportmapping(
-                    port, "TCP", internal_address, port, "pyOS Public Website", "", 0
+                    port, "TCP", internal_address, port, "pyOS Public Website", "", 3600
                 )
                 if not created:
                     raise RuntimeError("The router refused the port-forwarding request.")
@@ -5767,6 +7163,70 @@ img { max-width: 100%; height: auto; }
                 raise RuntimeError("The router did not provide a public IP address.")
             state["upnp"], state["public_port"] = upnp, port
             return external_address, port
+
+        def schedule_mapping_renewal(delay_ms=30 * 60 * 1000):
+            if state["closing"] or not state.get("upnp") or not state.get("server"):
+                return
+            previous = state.get("mapping_renewal")
+            if previous is not None:
+                try:
+                    self.root.after_cancel(previous)
+                except tk.TclError:
+                    pass
+            state["mapping_renewal"] = self.root.after(delay_ms, renew_public_mapping)
+
+        def renew_public_mapping():
+            state["mapping_renewal"] = None
+            mapping, mapped_port = state.get("upnp"), state.get("public_port")
+            if state["closing"] or not mapping or not mapped_port or not state.get("server"):
+                return
+            generation = state["mapping_generation"]
+
+            def worker():
+                try:
+                    with mapping_operation_lock:
+                        if (generation != state["mapping_generation"] or state["closing"]
+                                or mapping is not state.get("upnp")):
+                            return
+                        if isinstance(mapping, dict) and mapping.get("kind") == "natpmp":
+                            request = struct.pack(
+                                "!BBHHHI", 0, 2, 0, mapping["internal_port"],
+                                mapping["external_port"], 7200,
+                            )
+                            natpmp_exchange(mapping["gateway"], request, 130)
+                        elif isinstance(mapping, dict):
+                            upnp_soap(mapping, "AddPortMapping", (
+                                ("RemoteHost", ""), ("ExternalPort", mapped_port), ("Protocol", "TCP"),
+                                ("InternalPort", mapping["internal_port"]),
+                                ("InternalClient", mapping["internal_address"]),
+                                ("Enabled", 1), ("PortMappingDescription", "pyOS Public Website"),
+                                ("LeaseDuration", 3600),
+                            ))
+                        else:
+                            internal_address = mapping.lanaddr or local_ip()
+                            if not mapping.addportmapping(
+                                    mapped_port, "TCP", internal_address, mapped_port,
+                                    "pyOS Public Website", "", 3600):
+                                raise RuntimeError("Router refused to renew the mapping.")
+                    error = None
+                except Exception as exc:
+                    error = str(exc)
+
+                def finish():
+                    if state["closing"] or mapping is not state.get("upnp"):
+                        return
+                    if error:
+                        log_request(f"Could not renew public mapping; it will expire automatically: {error}")
+                        schedule_mapping_renewal(60 * 1000)
+                    else:
+                        log_request(f"Renewed public TCP port mapping {mapped_port}")
+                        schedule_mapping_renewal()
+
+                self.post_ui(finish)
+
+            if not self.run_background(worker):
+                log_request("Could not queue mapping renewal; retrying in one minute.")
+                schedule_mapping_renewal(60 * 1000)
 
         def start_hosting():
             folder = Path(folder_var.get()).expanduser()
@@ -5809,7 +7269,9 @@ img { max-width: 100%; height: auto; }
 
                 def log_message(self, fmt, *args):
                     message = f"{self.client_address[0]}  {fmt % args}"
-                    owner.root.after(0, lambda value=message: log_request(value))
+                    owner.post_ui_event(
+                        log_request, message, coalesce_key=("network-request", id(window)),
+                    )
 
                 def end_headers(self):
                     self.send_header("X-Content-Type-Options", "nosniff")
@@ -5822,43 +7284,102 @@ img { max-width: 100%; height: auto; }
             except OSError as error:
                 messagebox.showerror("Network & Hosting", f"Could not start server:\n{error}", parent=self.root)
                 return
+            state["pending_server"] = server
             external_address = None
             external_port = server.server_port
-            if public_var.get():
-                host_status.set("Requesting router port-forward...")
-                try:
-                    external_address, external_port = create_public_mapping(server.server_port)
-                except Exception as error:
+
+            def activate_server(external_address=None, external_port=server.server_port):
+                state["pending_server"] = None
+                if state["closing"]:
                     server.server_close()
                     remove_public_mapping()
-                    host_status.set("Public hosting failed")
-                    messagebox.showerror(
-                        "Public Hosting Unavailable",
-                        f"Could not create a public port-forward:\n\n{error}\n\n"
-                        "Your router may have UPnP disabled, your ISP may use carrier-grade NAT, or a firewall "
-                        "may block incoming connections.", parent=self.root,
-                    )
                     return
-            state["server"] = server
-            state["thread"] = threading.Thread(target=server.serve_forever, daemon=True)
-            state["thread"].start()
-            display_host = external_address or (local_ip() if lan_var.get() else "127.0.0.1")
-            url_var.set(f"http://{display_host}:{external_port}/")
-            host_status.set("PUBLIC - unencrypted HTTP" if public_var.get()
-                            else "Running on LAN" if lan_var.get() else "Running locally")
-            start_button.configure(state=tk.DISABLED)
-            stop_button.configure(state=tk.NORMAL)
-            open_button.configure(state=tk.NORMAL)
-            copy_button.configure(state=tk.NORMAL)
-            log_request(f"Server started for {folder}")
-            if external_address:
-                mapping_kind = "NAT-PMP" if isinstance(state.get("upnp"), dict) and state["upnp"].get("kind") == "natpmp" else "UPnP"
-                log_request(f"{mapping_kind} public TCP mapping created: {external_address}:{external_port}")
-                try:
-                    if not ipaddress.ip_address(external_address).is_global:
-                        log_request("Warning: router address is not globally routable; ISP carrier-grade NAT may block access")
-                except ValueError:
-                    pass
+                state["server"] = server
+                state["thread"] = threading.Thread(target=server.serve_forever, daemon=True)
+                state["thread"].start()
+                display_host = external_address or (local_ip() if lan_var.get() else "127.0.0.1")
+                url_var.set(f"http://{display_host}:{external_port}/")
+                host_status.set("PUBLIC - unencrypted HTTP" if public_var.get()
+                                else "Running on LAN" if lan_var.get() else "Running locally")
+                start_button.configure(state=tk.DISABLED)
+                stop_button.configure(state=tk.NORMAL)
+                open_button.configure(state=tk.NORMAL)
+                copy_button.configure(state=tk.NORMAL)
+                log_request(f"Server started for {folder}")
+                if external_address:
+                    mapping_kind = (
+                        "NAT-PMP" if isinstance(state.get("upnp"), dict)
+                        and state["upnp"].get("kind") == "natpmp" else "UPnP"
+                    )
+                    log_request(
+                        f"{mapping_kind} public TCP mapping created: {external_address}:{external_port}"
+                    )
+                    try:
+                        if not ipaddress.ip_address(external_address).is_global:
+                            log_request(
+                                "Warning: router address is not globally routable; "
+                                "ISP carrier-grade NAT may block access"
+                            )
+                    except ValueError:
+                        pass
+                    schedule_mapping_renewal()
+
+            if public_var.get():
+                host_status.set("Requesting router port-forward...")
+                start_button.configure(state=tk.DISABLED)
+
+                def mapping_worker():
+                    try:
+                        with mapping_operation_lock:
+                            address, mapped_port = create_public_mapping(server.server_port)
+                        error = None
+                    except Exception as exc:
+                        address, mapped_port, error = None, None, str(exc)
+
+                    if state["closing"]:
+                        server.server_close()
+                        remove_public_mapping()
+                        state["pending_server"] = None
+                        return
+
+                    def finish_mapping():
+                        if state["closing"]:
+                            server.server_close()
+                            remove_public_mapping()
+                            state["pending_server"] = None
+                            return
+                        if error:
+                            server.server_close()
+                            state["pending_server"] = None
+                            host_status.set("Public hosting failed")
+                            start_button.configure(state=tk.NORMAL)
+                            messagebox.showerror(
+                                "Public Hosting Unavailable",
+                                f"Could not create a public port-forward:\n\n{error}\n\n"
+                                "Your router may have UPnP disabled, your ISP may use carrier-grade NAT, "
+                                "or a firewall may block incoming connections.", parent=self.root,
+                            )
+                            return
+                        activate_server(address, mapped_port)
+
+                    if not self.post_ui(finish_mapping):
+                        server.server_close()
+                        remove_public_mapping()
+                        state["pending_server"] = None
+
+                mapping_thread = threading.Thread(
+                    target=mapping_worker, name="pyos-port-mapping", daemon=False,
+                )
+                state["mapping_thread"] = mapping_thread
+                mapping_thread.start()
+                return
+            activate_server(external_address, external_port)
+
+        def shutdown_http_server(server):
+            try:
+                server.shutdown()
+            finally:
+                server.server_close()
 
         def stop_hosting():
             server = state.get("server")
@@ -5866,7 +7387,10 @@ img { max-width: 100%; height: auto; }
                 return
             state["server"] = None
             remove_public_mapping()
-            threading.Thread(target=lambda: (server.shutdown(), server.server_close()), daemon=True).start()
+            threading.Thread(
+                target=shutdown_http_server, args=(server,),
+                name="pyos-http-shutdown", daemon=False,
+            ).start()
             host_status.set("Stopped")
             start_button.configure(state=tk.NORMAL)
             stop_button.configure(state=tk.DISABLED)
@@ -5917,46 +7441,67 @@ img { max-width: 100%; height: auto; }
             state["refresh"] = None
             if state["closing"] or not window.frame.winfo_exists():
                 return
-            rows, summary = [], ""
-            try:
-                import psutil
-                counters = psutil.net_io_counters()
-                now = time.monotonic()
-                previous, previous_time = state["last_io"], state["last_time"]
-                state["last_io"], state["last_time"] = counters, now
-                if previous and previous_time:
-                    elapsed = max(.001, now - previous_time)
-                    down = (counters.bytes_recv - previous.bytes_recv) / elapsed / 1024
-                    up = (counters.bytes_sent - previous.bytes_sent) / elapsed / 1024
-                    summary = f"Download {down:,.1f} KB/s   Upload {up:,.1f} KB/s"
-                else:
-                    summary = f"Received {counters.bytes_recv/1048576:,.1f} MB   Sent {counters.bytes_sent/1048576:,.1f} MB"
-                for connection in psutil.net_connections(kind="inet"):
-                    protocol = "TCP" if connection.type == socket.SOCK_STREAM else "UDP"
-                    rows.append((protocol, address_text(connection.laddr), address_text(connection.raddr),
-                                 connection.status or "-", connection.pid or "-"))
-            except (ImportError, OSError, PermissionError) as error:
-                summary = f"Limited view: {error}"
+            state["traffic_generation"] += 1
+            generation = state["traffic_generation"]
+            previous, previous_time = state["last_io"], state["last_time"]
+            refresh_button.configure(state=tk.DISABLED)
+
+            def worker():
+                rows, summary, counters, now = [], "", None, time.monotonic()
                 try:
-                    output = subprocess.run(
-                        ["netstat", "-ano"], capture_output=True, text=True, timeout=4,
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    ).stdout
-                    for line in output.splitlines():
-                        parts = line.split()
-                        if parts and parts[0].upper() in {"TCP", "UDP"} and len(parts) >= 4:
-                            if parts[0].upper() == "TCP" and len(parts) >= 5:
-                                rows.append((parts[0], parts[1], parts[2], parts[3], parts[4]))
-                            elif parts[0].upper() == "UDP":
-                                rows.append((parts[0], parts[1], parts[2], "-", parts[3]))
-                except (OSError, subprocess.SubprocessError):
-                    pass
-            connection_list.delete(*connection_list.get_children())
-            for row in sorted(rows, key=lambda value: (value[0], value[1]))[:1000]:
-                connection_list.insert("", tk.END, values=row)
-            traffic_status.set(f"{summary}   |   {len(rows)} connections")
-            if auto_refresh.get():
-                state["refresh"] = self.root.after(2000, refresh_traffic)
+                    import psutil
+                    counters = psutil.net_io_counters()
+                    if previous and previous_time:
+                        elapsed = max(.001, now - previous_time)
+                        down = (counters.bytes_recv - previous.bytes_recv) / elapsed / 1024
+                        up = (counters.bytes_sent - previous.bytes_sent) / elapsed / 1024
+                        summary = f"Download {down:,.1f} KB/s   Upload {up:,.1f} KB/s"
+                    else:
+                        summary = (
+                            f"Received {counters.bytes_recv/1048576:,.1f} MB   "
+                            f"Sent {counters.bytes_sent/1048576:,.1f} MB"
+                        )
+                    for connection in psutil.net_connections(kind="inet"):
+                        protocol = "TCP" if connection.type == socket.SOCK_STREAM else "UDP"
+                        rows.append((protocol, address_text(connection.laddr), address_text(connection.raddr),
+                                     connection.status or "-", connection.pid or "-"))
+                except (ImportError, OSError, PermissionError) as error:
+                    summary = f"Limited view: {error}"
+                    try:
+                        output = subprocess.run(
+                            ["netstat", "-ano"], capture_output=True, text=True, timeout=4,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        ).stdout
+                        for line in output.splitlines():
+                            parts = line.split()
+                            if parts and parts[0].upper() in {"TCP", "UDP"} and len(parts) >= 4:
+                                if parts[0].upper() == "TCP" and len(parts) >= 5:
+                                    rows.append((parts[0], parts[1], parts[2], parts[3], parts[4]))
+                                elif parts[0].upper() == "UDP":
+                                    rows.append((parts[0], parts[1], parts[2], "-", parts[3]))
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+
+                def finish():
+                    if (state["closing"] or generation != state["traffic_generation"]
+                            or not window.frame.winfo_exists()):
+                        return
+                    state["last_io"], state["last_time"] = counters, now
+                    connection_list.delete(*connection_list.get_children())
+                    for row in sorted(rows, key=lambda value: (value[0], value[1]))[:1000]:
+                        connection_list.insert("", tk.END, values=row)
+                    traffic_status.set(f"{summary}   |   {len(rows)} connections")
+                    refresh_button.configure(state=tk.NORMAL)
+                    if auto_refresh.get():
+                        state["refresh"] = self.root.after(2000, refresh_traffic)
+
+                self.post_ui(finish)
+
+            if not self.run_background(worker):
+                refresh_button.configure(state=tk.NORMAL)
+                traffic_status.set("Refresh deferred because pyOS is busy.")
+                if auto_refresh.get():
+                    state["refresh"] = self.root.after(2000, refresh_traffic)
 
         refresh_button = tk.Button(traffic_header, text="Refresh Now", command=refresh_traffic)
         refresh_button.pack(side=tk.RIGHT, padx=6)
@@ -5965,6 +7510,7 @@ img { max-width: 100%; height: auto; }
             if event is not None and event.widget is not window.frame:
                 return
             state["closing"] = True
+            state["traffic_generation"] += 1
             if state["refresh"] is not None:
                 try:
                     self.root.after_cancel(state["refresh"])
@@ -5974,14 +7520,27 @@ img { max-width: 100%; height: auto; }
             if server:
                 state["server"] = None
                 remove_public_mapping()
-                threading.Thread(target=lambda: (server.shutdown(), server.server_close()), daemon=True).start()
+                threading.Thread(
+                    target=shutdown_http_server, args=(server,),
+                    name="pyos-http-shutdown", daemon=False,
+                ).start()
+            pending_server = state.get("pending_server")
+            if pending_server is not None:
+                state["pending_server"] = None
+                try:
+                    pending_server.server_close()
+                except OSError:
+                    pass
 
         window.frame.bind("<Destroy>", close_network_app, add="+")
+        window.add_dispose_callback(close_network_app)
         refresh_traffic()
         self.root.after(400, scan_router_ports)
 
     def open_messenger(self):
         """Open the LAN peer-to-peer text and image messenger."""
+        if not self._ensure_app_enabled("messenger", "Messenger"):
+            return
         if self.messenger_window and self.messenger_window.frame.winfo_exists():
             self.desktop_canvas.tag_raise(self.messenger_window.window_id)
             return
@@ -6005,7 +7564,7 @@ img { max-width: 100%; height: auto; }
                 return
             try:
                 self.messenger_service = PeerMessenger(
-                    username, lambda event, payload: self.messenger_events.put((event, payload))
+                    username, self._queue_messenger_event
                 )
                 self.messenger_service.start()
             except OSError as error:
@@ -6078,24 +7637,38 @@ img { max-width: 100%; height: auto; }
                 conversation.insert(tk.END, message.get("text", "") + "\n\n")
             else:
                 conversation.insert(tk.END, f"[Image: {message.get('filename', 'image')}]\n")
-                try:
-                    from PIL import Image, ImageTk
-                    image = Image.open(io.BytesIO(message["data"]))
-                    if image.width * image.height > 25_000_000:
-                        raise ValueError("Image dimensions are too large to preview safely.")
-                    image.thumbnail((360, 240))
-                    photo = ImageTk.PhotoImage(image)
-                    image_references.append(photo)
-                    conversation.image_create(tk.END, image=photo)
-                    conversation.insert(tk.END, "\n\n")
-                except Exception:
-                    conversation.insert(tk.END, "Preview unavailable.\n\n")
-                if direction == "incoming":
+                raw_image = message.get("data")
+                if isinstance(raw_image, bytes):
+                    try:
+                        from PIL import Image, ImageTk
+                        image = Image.open(io.BytesIO(raw_image))
+                        if image.width * image.height > 25_000_000:
+                            raise ValueError("Image dimensions are too large to preview safely.")
+                        image.thumbnail((360, 240))
+                        photo = ImageTk.PhotoImage(image)
+                        image_references.append(photo)
+                        if len(image_references) > MAX_MESSENGER_IMAGES:
+                            del image_references[:-MAX_MESSENGER_IMAGES]
+                        conversation.image_create(tk.END, image=photo)
+                        conversation.insert(tk.END, "\n\n")
+                    except Exception:
+                        conversation.insert(tk.END, "Preview unavailable.\n\n")
+                else:
+                    conversation.insert(tk.END, "Preview no longer retained.\n\n")
+                if direction == "incoming" and isinstance(raw_image, bytes):
                     last_received_image["message"] = message
             conversation.configure(state=tk.DISABLED)
             conversation.see(tk.END)
+            try:
+                character_count = int(conversation.count("1.0", "end-1c", "chars")[0])
+                if character_count > MAX_TEXT_WIDGET_CHARS:
+                    conversation.configure(state=tk.NORMAL)
+                    conversation.delete("1.0", f"1.0+{character_count - MAX_TEXT_WIDGET_CHARS}c")
+                    conversation.configure(state=tk.DISABLED)
+            except (tk.TclError, TypeError):
+                pass
 
-        for historic_message in service.history:
+        for historic_message in service.history_snapshot()[-MAX_MESSENGER_HISTORY:]:
             render_message(historic_message)
 
         input_row = tk.Frame(chat_frame, bg=background)
@@ -6112,8 +7685,8 @@ img { max-width: 100%; height: auto; }
                 try:
                     action()
                 except (OSError, ValueError) as error:
-                    self.messenger_events.put(("error", f"Send failed: {error}"))
-            threading.Thread(target=worker, daemon=True).start()
+                    self._queue_messenger_event("error", f"Send failed: {error}")
+            return self.run_background(worker) is not None
 
         def send_text(event=None):
             recipient = selected_peer.get()
@@ -6123,8 +7696,10 @@ img { max-width: 100%; height: auto; }
                 return "break"
             if not text.strip():
                 return "break"
-            message_text.set("")
-            run_send(lambda: service.send_text(recipient, text))
+            if run_send(lambda: service.send_text(recipient, text)):
+                message_text.set("")
+            else:
+                status.set("Message was not queued because the task queue is busy.")
             return "break"
 
         def send_image():
@@ -6138,13 +7713,14 @@ img { max-width: 100%; height: auto; }
                 if path.suffix.lower() not in IMAGE_EXTENSIONS:
                     status.set("Choose a supported image file.")
                     return
-                run_send(lambda: service.send_image(recipient, path))
+                if not run_send(lambda: service.send_image(recipient, path)):
+                    status.set("Image was not queued because the task queue is busy.")
 
             self.open_file_picker(Path.home(), selected)
 
         def save_received_image():
             message = last_received_image["message"]
-            if not message:
+            if not message or not isinstance(message.get("data"), bytes):
                 status.set("No received image is available to save.")
                 return
             destination = filedialog.asksaveasfilename(
@@ -6155,7 +7731,7 @@ img { max-width: 100%; height: auto; }
             )
             if destination:
                 try:
-                    Path(destination).write_bytes(message["data"])
+                    atomic_write_bytes(destination, message["data"])
                     status.set(f"Saved {destination}")
                 except OSError as error:
                     status.set(f"Could not save image: {error}")
@@ -6700,8 +8276,11 @@ img { max-width: 100%; height: auto; }
         toolbar.pack(fill=tk.X)
         workspace = tk.Frame(window.content, bg="#777777")
         workspace.pack(fill=tk.BOTH, expand=True)
-        canvas = tk.Canvas(workspace, width=800, height=520, bg="white", highlightthickness=1,
-                           highlightbackground="#333333", cursor="crosshair")
+        canvas = tk.Canvas(
+            workspace, width=800, height=520, bg="white", highlightthickness=1,
+            highlightbackground="#333333", highlightcolor="#1565c0",
+            cursor="crosshair", takefocus=True,
+        )
         canvas.pack(expand=True, padx=12, pady=10)
         status = tk.StringVar(value="Pencil selected")
         tk.Label(window.content, textvariable=status, bg=surface, fg=foreground,
@@ -6711,6 +8290,8 @@ img { max-width: 100%; height: auto; }
             "image": Image.new("RGB", (800, 520), "white"), "photo": None,
             "tool": "pencil", "color": "#000000", "size": 4, "start": None,
             "last": None, "preview": None, "history": [], "path": None,
+            "source_path": None, "dirty": False, "resized_on_open": False,
+            "keyboard_cursor": [400, 260], "keyboard_active": False,
         }
         tool_buttons = {}
 
@@ -6719,11 +8300,31 @@ img { max-width: 100%; height: auto; }
             canvas.delete("bitmap")
             canvas.create_image(0, 0, image=state["photo"], anchor=tk.NW, tags="bitmap")
             canvas.tag_lower("bitmap")
+            canvas.delete("keyboard-cursor")
+            if state["keyboard_active"]:
+                x, y = state["keyboard_cursor"]
+                canvas.create_rectangle(
+                    x - 5, y - 5, x + 5, y + 5,
+                    outline="#1565c0", width=2, tags="keyboard-cursor",
+                )
 
         def snapshot():
             state["history"].append(state["image"].copy())
             if len(state["history"]) > 30:
                 del state["history"][0]
+            state["dirty"] = True
+
+        def confirm_discard():
+            if not state["dirty"]:
+                return True
+            choice = messagebox.askyesnocancel(
+                "Paint", "Save changes to this image before continuing?", parent=self.root,
+            )
+            if choice is None:
+                return False
+            if choice:
+                return bool(save_image())
+            return True
 
         def select_tool(tool):
             state["tool"] = tool
@@ -6740,6 +8341,7 @@ img { max-width: 100%; height: auto; }
         def undo():
             if state["history"]:
                 state["image"] = state["history"].pop()
+                state["dirty"] = True
                 render()
                 status.set("Undid last action")
 
@@ -6753,15 +8355,45 @@ img { max-width: 100%; height: auto; }
                 status.set("Canvas cleared")
 
         def new_image():
-            if messagebox.askyesno("Paint", "Start a new blank image?", parent=self.root):
-                snapshot()
-                state["image"] = Image.new("RGB", (800, 520), "white")
-                state["path"] = None
-                canvas.configure(width=800, height=520)
-                render()
-                status.set("New 800 x 520 image")
+            if not confirm_discard():
+                return
+            state["history"].clear()
+            state["image"] = Image.new("RGB", (800, 520), "white")
+            state["path"] = state["source_path"] = None
+            state["resized_on_open"] = False
+            state["dirty"] = False
+            state["keyboard_cursor"] = [400, 260]
+            canvas.configure(width=800, height=520)
+            render()
+            status.set("New 800 x 520 image")
+
+        def load_image_file(filename):
+            with Image.open(filename) as opened:
+                original_size = opened.size
+                image = opened.convert("RGB")
+            image.thumbnail((800, 520), Image.Resampling.LANCZOS)
+            was_resized = image.size != original_size
+            state["history"].clear()
+            state["image"] = image
+            state["source_path"] = str(filename)
+            # Never let Save replace a larger source with the display-sized working copy.
+            state["path"] = None if was_resized else str(filename)
+            state["resized_on_open"] = was_resized
+            state["dirty"] = False
+            state["keyboard_cursor"] = [image.width // 2, image.height // 2]
+            canvas.configure(width=image.width, height=image.height)
+            render()
+            if was_resized:
+                status.set(
+                    f"Opened resized copy of {Path(filename).name} ({original_size[0]} x {original_size[1]}); "
+                    "Save will ask for a new file."
+                )
+            else:
+                status.set(f"Opened {Path(filename).name} ({image.width} x {image.height})")
 
         def open_image():
+            if not confirm_discard():
+                return
             filename = filedialog.askopenfilename(
                 title="Open image", filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.gif"),
                                                 ("All files", "*.*")]
@@ -6769,14 +8401,7 @@ img { max-width: 100%; height: auto; }
             if not filename:
                 return
             try:
-                image = Image.open(filename).convert("RGB")
-                image.thumbnail((800, 520), Image.Resampling.LANCZOS)
-                snapshot()
-                state["image"] = image
-                state["path"] = filename
-                canvas.configure(width=image.width, height=image.height)
-                render()
-                status.set(f"Opened {Path(filename).name} ({image.width} x {image.height})")
+                load_image_file(filename)
             except (OSError, ValueError) as error:
                 messagebox.showerror("Paint", f"Could not open image:\n{error}", parent=self.root)
 
@@ -6794,11 +8419,16 @@ img { max-width: 100%; height: auto; }
                 image = state["image"]
                 if Path(filename).suffix.casefold() in {".jpg", ".jpeg"}:
                     image = image.convert("RGB")
-                image.save(filename)
+                atomic_save_image(image, filename)
                 state["path"] = filename
+                state["source_path"] = filename
+                state["resized_on_open"] = False
+                state["dirty"] = False
                 status.set(f"Saved {Path(filename).name}")
+                return filename
             except (OSError, ValueError) as error:
                 messagebox.showerror("Paint", f"Could not save image:\n{error}", parent=self.root)
+                return None
 
         def point(event):
             return (max(0, min(state["image"].width - 1, int(event.x))),
@@ -6815,6 +8445,9 @@ img { max-width: 100%; height: auto; }
                 pass
 
         def press(event):
+            if not getattr(event, "keyboard", False):
+                state["keyboard_active"] = False
+                canvas.focus_set()
             position = point(event)
             snapshot()
             state["start"] = state["last"] = position
@@ -6833,6 +8466,54 @@ img { max-width: 100%; height: auto; }
                 x, y = position
                 draw.ellipse((x-width/2, y-width/2, x+width/2, y+width/2), fill=color)
                 render()
+
+        def keyboard_canvas(event):
+            movement = {
+                "Left": (-1, 0), "Right": (1, 0),
+                "Up": (0, -1), "Down": (0, 1),
+            }.get(event.keysym)
+            if movement:
+                step = 10 if event.state & 0x0001 else 1
+                state["keyboard_cursor"][0] = max(
+                    0, min(state["image"].width - 1,
+                           state["keyboard_cursor"][0] + movement[0] * step)
+                )
+                state["keyboard_cursor"][1] = max(
+                    0, min(state["image"].height - 1,
+                           state["keyboard_cursor"][1] + movement[1] * step)
+                )
+                state["keyboard_active"] = True
+                render()
+                status.set(
+                    f"Keyboard cursor {tuple(state['keyboard_cursor'])}; "
+                    "Enter/Space draws, Escape cancels a shape anchor."
+                )
+                return "break"
+            if event.keysym in {"Return", "space"}:
+                keyboard_event = type(
+                    "PaintKeyboardPoint", (),
+                    {"x": state["keyboard_cursor"][0],
+                     "y": state["keyboard_cursor"][1], "keyboard": True},
+                )()
+                if state["tool"] in {"line", "rectangle", "ellipse"}:
+                    if state["start"] is None:
+                        press(keyboard_event)
+                        state["keyboard_active"] = True
+                        render()
+                        status.set("Shape anchor set; move with arrows and press Enter to finish.")
+                    else:
+                        release(keyboard_event)
+                else:
+                    press(keyboard_event)
+                    if state["start"] is not None:
+                        release(keyboard_event)
+                return "break"
+            if event.keysym == "Escape":
+                state["start"] = state["last"] = None
+                canvas.delete("preview")
+                status.set("Keyboard drawing cancelled")
+                return "break"
+            return None
 
         def drag(event):
             if state["start"] is None:
@@ -6896,18 +8577,28 @@ img { max-width: 100%; height: auto; }
         canvas.bind("<ButtonPress-1>", press)
         canvas.bind("<B1-Motion>", drag)
         canvas.bind("<ButtonRelease-1>", release)
+        canvas.bind("<KeyPress>", keyboard_canvas)
+        canvas.bind(
+            "<FocusIn>",
+            lambda event: (state.update(keyboard_active=True), render()),
+        )
+        canvas.bind(
+            "<FocusOut>",
+            lambda event: (state.update(keyboard_active=False), render()),
+        )
         select_tool("pencil")
         render()
         if path:
-            state["path"] = str(path)
             try:
-                image = Image.open(path).convert("RGB")
-                image.thumbnail((800, 520), Image.Resampling.LANCZOS)
-                state["image"] = image
-                canvas.configure(width=image.width, height=image.height)
-                render()
+                load_image_file(path)
             except (OSError, ValueError) as error:
                 status.set(f"Could not open image: {error}")
+
+        original_close = window.close
+        def close_paint():
+            if confirm_discard():
+                original_close()
+        window.close_button.configure(command=close_paint)
 
     def open_image_viewer(self, path=None):
         """Open an embedded image viewer for a file path."""
@@ -7021,7 +8712,7 @@ img { max-width: 100%; height: auto; }
         path_entry.bind("<Return>", lambda event: load_image(path_var.get()))
         image_canvas.bind("<Configure>", schedule_render)
         if path:
-            self.root.after(0, lambda: load_image(path))
+            self.post_ui(lambda: load_image(path))
         return window
 
     def open_notepad(self, initial_text=""):
@@ -7087,6 +8778,8 @@ img { max-width: 100%; height: auto; }
 
     def open_ai_chat(self):
         """Open pyAI, the chat assistant backed by a local Ollama server."""
+        if not self._ensure_app_enabled("pyai", "pyAI"):
+            return
         surface_bg = self.preferences["surface_bg"]
         text_fg = self.preferences["text_fg"]
         font_size = self.preferences["font_size"]
@@ -7099,7 +8792,9 @@ img { max-width: 100%; height: auto; }
             "closed": False,
             "cancel": threading.Event(),
             "history": [],
+            "transcript_chars": 0,
         }
+        request_gate = RequestGate()
 
         def client():
             return OllamaClient(self.preferences["ai_chat_url"])
@@ -7164,6 +8859,11 @@ img { max-width: 100%; height: auto; }
                 transcript.insert(tk.END, text, tag)
             else:
                 transcript.insert(tk.END, text)
+            state["transcript_chars"] += len(text)
+            if state["transcript_chars"] > MAX_TEXT_WIDGET_CHARS:
+                excess = state["transcript_chars"] - MAX_TEXT_WIDGET_CHARS
+                transcript.delete("1.0", f"1.0+{excess}c")
+                state["transcript_chars"] = MAX_TEXT_WIDGET_CHARS
             transcript.see(tk.END)
             transcript.config(state=tk.DISABLED)
 
@@ -7229,16 +8929,23 @@ img { max-width: 100%; height: auto; }
             send_button.config(state=tk.DISABLED)
             status_var.set("Checking Ollama...")
             model = current_model()
+            generation = request_gate.next()
 
             def worker():
                 try:
                     names = client().list_models()
                 except (urllib.error.URLError, OSError, ValueError):
-                    self.root.after(0, lambda: alive() and handle_offline())
+                    self.post_ui(lambda: request_gate.valid(generation) and alive() and handle_offline())
                     return
-                self.root.after(0, lambda found=names: alive() and handle_models(found, model))
+                self.post_ui(
+                    lambda found=names: request_gate.valid(generation)
+                    and alive() and handle_models(found, model)
+                )
 
-            threading.Thread(target=worker, daemon=True).start()
+            if self.run_background(worker) is None and alive():
+                state["phase"] = "queue_busy"
+                status_var.set("AI check was not started because the task queue is busy.")
+                show_action("Retry when other background tasks have finished.")
 
         def poll_server(attempts):
             def worker():
@@ -7246,13 +8953,19 @@ img { max-width: 100%; height: auto; }
                     client().list_models()
                 except (urllib.error.URLError, OSError, ValueError):
                     if attempts > 1:
-                        self.root.after(1000, lambda: alive() and poll_server(attempts - 1))
+                        self.post_ui(
+                            lambda: alive() and self.root.after(
+                                1000, lambda: alive() and poll_server(attempts - 1)
+                            )
+                        )
                     else:
-                        self.root.after(0, lambda: alive() and handle_offline())
+                        self.post_ui(lambda: alive() and handle_offline())
                     return
-                self.root.after(0, lambda: alive() and run_check())
+                self.post_ui(lambda: alive() and run_check())
 
-            threading.Thread(target=worker, daemon=True).start()
+            if self.run_background(worker) is None and alive():
+                status_var.set("AI server check is waiting for task capacity.")
+                self.root.after(1000, lambda: alive() and poll_server(attempts))
 
         def start_server():
             try:
@@ -7275,6 +8988,7 @@ img { max-width: 100%; height: auto; }
             state["phase"] = "pulling"
             state["cancel"] = threading.Event()
             cancel_event = state["cancel"]
+            generation = request_gate.next()
             status_var.set(f"Pulling {model}...")
             show_action(f"Downloading '{model}'. You can keep using the desktop meanwhile.",
                         "Cancel", cancel_event.set, show_retry=False)
@@ -7288,7 +9002,10 @@ img { max-width: 100%; height: auto; }
                 else:
                     message = f"Pulling {model}: {status_text or '...'}"
                 task_progress(status_text or f"Downloading {model}", completed, total)
-                self.root.after(0, lambda text=message: alive() and status_var.set(text))
+                self.post_ui_event(
+                    lambda text=message: alive() and status_var.set(text),
+                    coalesce_key=("ai-pull-status", id(state)),
+                )
 
             def worker():
                 try:
@@ -7299,7 +9016,7 @@ img { max-width: 100%; height: auto; }
 
                 def done():
                     close_task_progress()
-                    if not alive():
+                    if not alive() or not request_gate.valid(generation):
                         return
                     if cancel_event.is_set():
                         status_var.set("Download cancelled")
@@ -7310,9 +9027,16 @@ img { max-width: 100%; height: auto; }
                     else:
                         run_check()
 
-                self.root.after(0, done)
+                self.post_ui(done)
 
-            threading.Thread(target=worker, daemon=True).start()
+            if self.run_background(worker) is None:
+                close_task_progress()
+                state["phase"] = "queue_busy"
+                status_var.set("Model download was not started because the task queue is busy.")
+                show_action(
+                    "Retry when other background tasks have finished.",
+                    "Download model", start_pull,
+                )
 
         def finish_generation(tokens, error, cancel_event):
             if not alive():
@@ -7321,6 +9045,7 @@ img { max-width: 100%; height: auto; }
             if reply:
                 # A stopped partial reply is still valid conversation context.
                 state["history"].append({"role": "assistant", "content": reply})
+                state["history"] = state["history"][-MAX_AI_MESSAGES:]
             if cancel_event.is_set():
                 append_transcript(" [stopped]\n\n", "system")
             elif error:
@@ -7338,20 +9063,27 @@ img { max-width: 100%; height: auto; }
             input_box.delete("1.0", tk.END)
             model = current_model()
             state["history"].append({"role": "user", "content": prompt})
+            state["history"] = state["history"][-MAX_AI_MESSAGES:]
             append_transcript(f"YOU> {prompt}\n", "you")
             append_transcript(f"{model.upper()}> ")
             state["phase"] = "generating"
             state["cancel"] = threading.Event()
             cancel_event = state["cancel"]
+            generation = request_gate.next()
             send_button.config(state=tk.DISABLED)
             status_var.set("Generating... (Stop below)")
             show_action("", "Stop", cancel_event.set, show_retry=False)
             tokens = []
+            token_batch = UiTextBatcher(
+                self.post_ui,
+                lambda text: append_transcript(text)
+                if request_gate.valid(generation) and alive() else None,
+            )
 
             def on_token(text, done):
                 if text:
                     tokens.append(text)
-                    self.root.after(0, lambda chunk=text: alive() and append_transcript(chunk))
+                    token_batch.append(text)
 
             def worker():
                 try:
@@ -7359,18 +9091,28 @@ img { max-width: 100%; height: auto; }
                     error = None
                 except (urllib.error.URLError, OSError, ValueError) as exc:
                     error = str(exc)
-                self.root.after(0, lambda: finish_generation(tokens, error, cancel_event))
+                self.post_ui(
+                    lambda: request_gate.valid(generation)
+                    and finish_generation(tokens, error, cancel_event)
+                )
 
-            threading.Thread(target=worker, daemon=True).start()
+            if self.run_background(worker) is None:
+                token_batch.close()
+                finish_generation(
+                    tokens, "The task queue is busy; generation was not started.", cancel_event
+                )
             return "break"
 
         def new_chat():
             if state["phase"] in {"generating", "pulling"}:
                 state["cancel"].set()
             state["history"] = []
+            request_gate.next()
             transcript.config(state=tk.NORMAL)
             transcript.delete("1.0", tk.END)
             transcript.config(state=tk.DISABLED)
+            state["transcript_chars"] = 0
+            run_check()
 
         def apply_model(event=None):
             name = model_var.get().strip()
@@ -7386,6 +9128,7 @@ img { max-width: 100%; height: auto; }
         def close_chat():
             state["closed"] = True
             state["cancel"].set()
+            request_gate.close()
             window.close()
 
         tk.Button(toolbar, text="New Chat", command=new_chat).pack(side=tk.LEFT, padx=6, pady=3)
@@ -7404,20 +9147,28 @@ img { max-width: 100%; height: auto; }
 
     def open_text_editor(self, path=None):
         """Open an embedded text editor window."""
-        file_path = Path(path) if path else Path.home() / "untitled.txt"
-        window_title = file_path.name if path else "Text Editor"
+        file_path = Path(path) if path else None
+        suggested_path = file_path or Path.home() / "untitled.txt"
+        window_title = file_path.name if file_path else "Text Editor"
         window = self.create_window(window_title, width=780, height=500)
+        surface = self.preferences.get("surface_bg", "#ffffff")
+        foreground = self.preferences.get("text_fg", "#000000")
+        document = {
+            "path": file_path, "encoding": "utf-8", "bom": b"", "newline": os.linesep,
+            "loading": False,
+        }
 
-        toolbar = tk.Frame(window.content, bg="white", relief=tk.RAISED, bd=1)
+        toolbar = tk.Frame(window.content, bg=surface, relief=tk.RAISED, bd=1)
         toolbar.pack(fill=tk.X)
 
-        tk.Label(toolbar, text="Path:", bg="white", fg="black").pack(side=tk.LEFT, padx=(6, 2), pady=5)
-        path_var = tk.StringVar(value=str(file_path))
-        path_entry = tk.Entry(toolbar, textvariable=path_var)
+        tk.Label(toolbar, text="Path:", bg=surface, fg=foreground).pack(side=tk.LEFT, padx=(6, 2), pady=5)
+        path_var = tk.StringVar(value=str(suggested_path))
+        path_entry = tk.Entry(toolbar, textvariable=path_var, bg=surface, fg=foreground,
+                              insertbackground=foreground)
         path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4, pady=5)
 
         status_var = tk.StringVar(value="")
-        status_label = tk.Label(window.content, textvariable=status_var, bg="white", fg="black", anchor=tk.W)
+        status_label = tk.Label(window.content, textvariable=status_var, bg=surface, fg=foreground, anchor=tk.W)
         status_label.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=(0, 4))
 
         editor = scrolledtext.ScrolledText(
@@ -7425,6 +9176,9 @@ img { max-width: 100%; height: auto; }
             wrap=tk.WORD,
             font=("Consolas", 10),
             undo=True,
+            bg=surface,
+            fg=foreground,
+            insertbackground=foreground,
         )
         editor.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
@@ -7432,38 +9186,109 @@ img { max-width: 100%; height: auto; }
             status_var.set(message)
             self.root.after(3000, lambda: status_var.set("") if status_var.get() == message else None)
 
-        def load_file(target):
+        def update_title(event=None):
+            if document["loading"]:
+                return
+            dirty = bool(editor.edit_modified())
+            name = document["path"].name if document["path"] else "Untitled"
+            window.title = ("*" if dirty else "") + name
+            window.title_label.configure(text=window.title)
+
+        def save_file(save_as=False):
+            target = Path(path_var.get()).expanduser()
+            current_path = document["path"]
+            if save_as or document_needs_save_as(current_path, target):
+                selected = filedialog.asksaveasfilename(
+                    parent=self.root, title="Save text file", initialdir=str(target.parent),
+                    initialfile=target.name, filetypes=(("Text files", "*.txt"), ("All files", "*.*")),
+                )
+                if not selected:
+                    return False
+                target = Path(selected)
+            text = editor.get("1.0", "end-1c")
+            try:
+                try:
+                    payload = encode_text_document(
+                        text, document["encoding"], document["bom"], document["newline"]
+                    )
+                except UnicodeEncodeError:
+                    if not messagebox.askyesno(
+                        "Text Editor",
+                        f"The new text cannot be represented as {document['encoding']}. Convert this file to UTF-8?",
+                        parent=self.root,
+                    ):
+                        return False
+                    document.update(encoding="utf-8", bom=b"")
+                    payload = encode_text_document(text, "utf-8", b"", document["newline"])
+                atomic_write_bytes(target, payload)
+                document["path"] = target
+                path_var.set(str(target))
+                editor.edit_modified(False)
+                update_title()
+                newline_label = (
+                    "Mixed" if isinstance(document["newline"], dict) else
+                    "CRLF" if document["newline"] == "\r\n" else
+                    "CR" if document["newline"] == "\r" else "LF"
+                )
+                set_status(
+                    f"Saved {target} ({document['encoding']}, {newline_label})"
+                )
+                return True
+            except (OSError, UnicodeError) as error:
+                messagebox.showerror("Text Editor", f"Could not save file: {error}", parent=self.root)
+                return False
+
+        def confirm_discard():
+            if not editor.edit_modified():
+                return True
+            choice = messagebox.askyesnocancel(
+                "Text Editor", "Save changes before continuing?", parent=self.root,
+            )
+            if choice is None:
+                return False
+            return save_file() if choice else True
+
+        def load_file(target, prompt=True):
+            target = Path(target).expanduser()
+            if prompt and not confirm_discard():
+                return False
+            try:
+                if target.exists():
+                    # Read and decode completely before touching the current editor buffer.
+                    text, encoding, bom, newline = decode_text_document(target.read_bytes())
+                else:
+                    text, encoding, bom, newline = "", "utf-8", b"", os.linesep
+            except (OSError, UnicodeError) as error:
+                messagebox.showerror("Text Editor", f"Could not open file: {error}", parent=self.root)
+                return False
+            document["loading"] = True
             try:
                 editor.delete("1.0", tk.END)
-                if target.exists():
-                    editor.insert("1.0", target.read_text(encoding="utf-8", errors="replace"))
-                    set_status(f"Opened {target}")
-                else:
-                    set_status("New file")
+                editor.insert("1.0", text)
+                document.update(path=target, encoding=encoding, bom=bom, newline=newline)
+                path_var.set(str(target))
                 editor.edit_modified(False)
-            except OSError as e:
-                messagebox.showerror("Text Editor", f"Could not open file: {e}")
-
-        def save_file():
-            target = Path(path_var.get()).expanduser()
-            try:
-                if target.parent:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(editor.get("1.0", tk.END + "-1c"), encoding="utf-8")
-                editor.edit_modified(False)
-                set_status(f"Saved {target}")
-            except OSError as e:
-                messagebox.showerror("Text Editor", f"Could not save file: {e}")
+                update_title()
+                set_status(f"Opened {target} ({encoding})" if target.exists() else "New file")
+            finally:
+                document["loading"] = False
+            update_title()
+            return True
 
         def new_file():
+            if not confirm_discard():
+                return
+            document["loading"] = True
             path_var.set(str(Path.home() / "untitled.txt"))
             editor.delete("1.0", tk.END)
+            document.update(path=None, encoding="utf-8", bom=b"", newline=os.linesep)
             editor.edit_modified(False)
+            document["loading"] = False
+            update_title()
             set_status("New file")
 
         def open_from_path():
             def open_selected_file(target):
-                path_var.set(str(target))
                 load_file(target)
 
             start_path = Path(path_var.get()).expanduser()
@@ -7473,9 +9298,21 @@ img { max-width: 100%; height: auto; }
         tk.Button(toolbar, text="New", command=new_file).pack(side=tk.LEFT, padx=4, pady=4)
         tk.Button(toolbar, text="Open", command=open_from_path).pack(side=tk.LEFT, padx=4, pady=4)
         tk.Button(toolbar, text="Save", command=save_file).pack(side=tk.LEFT, padx=4, pady=4)
+        tk.Button(toolbar, text="Save As", command=lambda: save_file(True)).pack(side=tk.LEFT, padx=4, pady=4)
         editor.bind("<Control-s>", lambda event: (save_file(), "break")[1])
+        editor.bind("<<Modified>>", update_title)
 
-        load_file(file_path)
+        original_close = window.close
+        def close_editor():
+            if confirm_discard():
+                original_close()
+        window.close_button.configure(command=close_editor)
+
+        if file_path is not None:
+            load_file(file_path, prompt=False)
+        else:
+            editor.edit_modified(False)
+            update_title()
 
     def open_file_picker(self, start_path, on_select):
         """Open an embedded file picker and call on_select with the chosen file."""
@@ -7545,6 +9382,8 @@ img { max-width: 100%; height: auto; }
 
     def open_media_player(self, path=None):
         """Open an embedded VLC-backed audio and video player."""
+        if not self._ensure_app_enabled("media", "Media Player"):
+            return
         dll_handles = []
         if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
             candidates = [
@@ -7978,14 +9817,17 @@ img { max-width: 100%; height: auto; }
 
     def open_python_ide(self, path=None):
         """Open an embedded Python code environment."""
-        file_path = Path(path) if path else Path.home() / "script.py"
+        if not self._ensure_app_enabled("ide", "Python IDE"):
+            return
+        file_path = Path(path) if path else None
+        suggested_path = file_path or Path.home() / "script.py"
         window = self.create_window("Python IDE", width=900, height=610)
 
         toolbar = tk.Frame(window.content, bg="white", relief=tk.RAISED, bd=1)
         toolbar.pack(fill=tk.X)
 
         tk.Label(toolbar, text="File:", bg="white", fg="black").pack(side=tk.LEFT, padx=(6, 2), pady=5)
-        path_var = tk.StringVar(value=str(file_path))
+        path_var = tk.StringVar(value=str(suggested_path))
         path_entry = tk.Entry(toolbar, textvariable=path_var)
         path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4, pady=5)
 
@@ -8034,11 +9876,22 @@ img { max-width: 100%; height: auto; }
             pady=(0, 4),
         )
 
-        state = {"process": None, "mode": None}
+        state = {
+            "process": None, "mode": None, "generation": 0, "closed": False,
+            "path": file_path,
+            "encoding": "utf-8", "bom": b"", "newline": os.linesep,
+            "output_batch": None,
+        }
 
         def append_output(text):
             output.configure(state=tk.NORMAL)
             output.insert(tk.END, text)
+            try:
+                count = int(output.count("1.0", "end-1c", "chars")[0])
+                if count > MAX_TEXT_WIDGET_CHARS:
+                    output.delete("1.0", f"1.0+{count - MAX_TEXT_WIDGET_CHARS}c")
+            except (tk.TclError, TypeError):
+                pass
             output.see(tk.END)
             output.configure(state=tk.DISABLED)
 
@@ -8047,31 +9900,77 @@ img { max-width: 100%; height: auto; }
             output.delete("1.0", tk.END)
             output.configure(state=tk.DISABLED)
 
-        def load_file(target):
+        def confirm_discard():
+            if not editor.edit_modified():
+                return True
+            choice = messagebox.askyesnocancel(
+                "Python IDE", "Save changes before continuing?", parent=self.root,
+            )
+            if choice is None:
+                return False
+            return bool(save_file()) if choice else True
+
+        def load_file(target, prompt=True):
+            target = Path(target).expanduser()
+            if prompt and not confirm_discard():
+                return False
             try:
-                editor.delete("1.0", tk.END)
                 if target.exists():
-                    editor.insert("1.0", target.read_text(encoding="utf-8", errors="replace"))
-                    status_var.set(f"Opened {target}")
+                    text, encoding, bom, newline = decode_text_document(target.read_bytes())
                 else:
-                    status_var.set("New Python file")
-                editor.edit_modified(False)
-            except OSError as e:
-                messagebox.showerror("Python IDE", f"Could not open file: {e}")
+                    text, encoding, bom, newline = "", "utf-8", b"", os.linesep
+            except (OSError, UnicodeError) as error:
+                messagebox.showerror("Python IDE", f"Could not open file: {error}", parent=self.root)
+                return False
+            editor.delete("1.0", tk.END)
+            editor.insert("1.0", text)
+            state.update(path=target, encoding=encoding, bom=bom, newline=newline)
+            path_var.set(str(target))
+            status_var.set(f"Opened {target}" if target.exists() else "New Python file")
+            editor.edit_modified(False)
+            return True
 
         def save_file():
             target = Path(path_var.get()).expanduser()
             if target.suffix.lower() != ".py":
                 target = target.with_suffix(".py")
                 path_var.set(str(target))
+            if document_needs_save_as(state["path"], target):
+                selected = filedialog.asksaveasfilename(
+                    parent=self.root,
+                    title="Save Python file",
+                    initialdir=str(target.parent),
+                    initialfile=target.name,
+                    defaultextension=".py",
+                    filetypes=(("Python files", "*.py"), ("All files", "*.*")),
+                )
+                if not selected:
+                    return None
+                target = Path(selected)
+                if target.suffix.lower() != ".py":
+                    target = target.with_suffix(".py")
+                path_var.set(str(target))
             try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(editor.get("1.0", tk.END + "-1c"), encoding="utf-8")
+                text = editor.get("1.0", "end-1c")
+                try:
+                    payload = encode_text_document(
+                        text, state["encoding"], state["bom"], state["newline"]
+                    )
+                except UnicodeEncodeError:
+                    if not messagebox.askyesno(
+                        "Python IDE", "This edit cannot use the original encoding. Convert to UTF-8?",
+                        parent=self.root,
+                    ):
+                        return None
+                    state.update(encoding="utf-8", bom=b"")
+                    payload = encode_text_document(text, "utf-8", b"", state["newline"])
+                atomic_write_bytes(target, payload)
+                state["path"] = target
                 editor.edit_modified(False)
                 status_var.set(f"Saved {target}")
                 return target
-            except OSError as e:
-                messagebox.showerror("Python IDE", f"Could not save file: {e}")
+            except (OSError, UnicodeError) as error:
+                messagebox.showerror("Python IDE", f"Could not save file: {error}", parent=self.root)
                 return None
 
         def open_from_picker():
@@ -8079,37 +9978,49 @@ img { max-width: 100%; height: auto; }
             initial_dir = start_path.parent if start_path.suffix else start_path
 
             def open_selected_file(target):
-                path_var.set(str(target))
                 load_file(target)
 
             self.open_file_picker(initial_dir, open_selected_file)
 
         def new_file():
+            if not confirm_discard():
+                return
             stop_process()
             path_var.set(str(Path.home() / "script.py"))
             editor.delete("1.0", tk.END)
             editor.insert("1.0", "print(\"Hello from pyOS\")\n")
+            state.update(path=None, encoding="utf-8", bom=b"", newline=os.linesep)
             editor.edit_modified(False)
             clear_output()
             status_var.set("New Python file")
 
-        def read_process_output(process):
-            while True:
-                chunk = process.stdout.read(1)
-                if not chunk:
-                    break
-                self.root.after(0, append_output, chunk)
+        def read_process_output(process, generation, finished_mode, output_batch):
+            decoder = codecs.getincrementaldecoder(locale.getpreferredencoding(False) or "utf-8")(
+                errors="replace"
+            )
+            try:
+                while True:
+                    chunk = process.stdout.read(4096)
+                    if not chunk:
+                        break
+                    output_batch.append(decoder.decode(chunk))
+                output_batch.append(decoder.decode(b"", final=True))
+            except (OSError, ValueError):
+                pass
             exit_code = process.wait()
-            finished_mode = state["mode"] or "process"
-            self.root.after(0, lambda: status_var.set(f"{finished_mode.title()} finished with exit code {exit_code}"))
-            self.root.after(0, lambda: state.update({"process": None, "mode": None}))
 
-        def start_process(args, mode):
+            def finished():
+                if (state["closed"] or generation != state["generation"]
+                        or state["process"] is not process):
+                    return
+                status_var.set(f"{finished_mode.title()} finished with exit code {exit_code}")
+                state.update(process=None, mode=None, output_batch=None)
+
+            self.post_ui(finished)
+
+        def start_process(target, args, mode):
             if state["process"] and state["process"].poll() is None:
                 messagebox.showwarning("Python IDE", "A Python process is already running.")
-                return
-            target = save_file()
-            if not target:
                 return
             clear_output()
             append_output(f"$ {' '.join(args)}\n\n")
@@ -8120,26 +10031,39 @@ img { max-width: 100%; height: auto; }
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
+                    text=False,
+                    bufsize=0,
                 )
             except OSError as e:
                 messagebox.showerror("Python IDE", f"Could not start Python: {e}")
                 return
             state["process"] = process
             state["mode"] = mode
+            state["generation"] += 1
+            generation = state["generation"]
             status_var.set(f"{mode.title()} running")
-            threading.Thread(target=read_process_output, args=(process,), daemon=True).start()
+            output_batch = UiTextBatcher(
+                self.post_ui,
+                lambda text: append_output(text)
+                if generation == state["generation"] and not state["closed"] else None,
+            )
+            state["output_batch"] = output_batch
+            threading.Thread(
+                target=read_process_output,
+                args=(process, generation, mode, output_batch),
+                name=f"pyos-ide-output-{generation}",
+                daemon=True,
+            ).start()
 
         def run_file():
             target = save_file()
             if target:
-                start_process([sys.executable, str(target)], "run")
+                start_process(target, [sys.executable, str(target)], "run")
 
         def debug_file():
             target = save_file()
             if target:
-                start_process([sys.executable, "-m", "pdb", str(target)], "debug")
+                start_process(target, [sys.executable, "-m", "pdb", str(target)], "debug")
                 debug_entry.focus_set()
 
         def send_debug_command(event=None):
@@ -8151,7 +10075,7 @@ img { max-width: 100%; height: auto; }
                 return "break"
             try:
                 append_output(f"(pdb) {command}\n")
-                process.stdin.write(command + "\n")
+                process.stdin.write((command + "\n").encode("utf-8"))
                 process.stdin.flush()
             except Exception as e:
                 messagebox.showerror("Python IDE", f"Could not send debug command: {e}")
@@ -8159,11 +10083,31 @@ img { max-width: 100%; height: auto; }
 
         def stop_process():
             process = state["process"]
+            state["generation"] += 1
+            output_batch = state.get("output_batch")
+            if output_batch:
+                output_batch.close()
             if process and process.poll() is None:
-                process.terminate()
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+                def reap():
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            process.kill()
+                            process.wait(timeout=2)
+                        except (OSError, subprocess.SubprocessError):
+                            pass
+                threading.Thread(
+                    target=reap, name="pyos-ide-reaper", daemon=True,
+                ).start()
                 status_var.set("Process stopped")
             state["process"] = None
             state["mode"] = None
+            state["output_batch"] = None
 
         tk.Button(toolbar, text="New", command=new_file).pack(side=tk.LEFT, padx=4, pady=4)
         tk.Button(toolbar, text="Open", command=open_from_picker).pack(side=tk.LEFT, padx=4, pady=4)
@@ -8176,6 +10120,9 @@ img { max-width: 100%; height: auto; }
         original_close = window.close
 
         def close_ide():
+            if not confirm_discard():
+                return
+            state["closed"] = True
             stop_process()
             original_close()
 
@@ -8183,10 +10130,17 @@ img { max-width: 100%; height: auto; }
         editor.bind("<Control-s>", lambda event: (save_file(), "break")[1])
         editor.bind("<F5>", lambda event: (run_file(), "break")[1])
         debug_entry.bind("<Return>", send_debug_command)
-        load_file(file_path)
+        if file_path is not None:
+            load_file(file_path, prompt=False)
+        else:
+            editor.insert("1.0", "print(\"Hello from pyOS\")\n")
+            editor.edit_modified(False)
+            status_var.set("New Python file — Save will ask for a destination")
 
     def open_browser(self):
         """Open a simple embedded internet browser."""
+        if not self._ensure_app_enabled("browser", "Internet Browser"):
+            return
         window = self.create_window("Internet Browser", width=850, height=560)
 
         toolbar = tk.Frame(window.content, bg="white", relief=tk.RAISED, bd=1)
@@ -8216,6 +10170,7 @@ img { max-width: 100%; height: auto; }
 
         renderer = {"html_frame": None, "source_view": None}
         renderer_error = {"message": ""}
+        request_gate = RequestGate()
         page_cache = {
             "url": "",
             "status": None,
@@ -8228,18 +10183,11 @@ img { max-width: 100%; height: auto; }
             try:
                 from tkinterweb import HtmlFrame
                 return HtmlFrame
-            except ImportError:
-                status_var.set("Installing HTML/CSS renderer...")
-                self.root.update_idletasks()
-                try:
-                    subprocess.check_call([
-                        sys.executable, "-m", "pip", "install", "tkinterweb[javascript]>=4.25,<5.0"
-                    ])
-                    from tkinterweb import HtmlFrame
-                    return HtmlFrame
-                except Exception as e:
-                    renderer_error["message"] = str(e)
-                    return None
+            except (ImportError, OSError) as error:
+                renderer_error["message"] = (
+                    f"{error}. Run pyOS Setup to install the optional HTML/CSS renderer."
+                )
+                return None
 
         HtmlFrame = get_html_frame_class()
         if HtmlFrame:
@@ -8288,45 +10236,61 @@ img { max-width: 100%; height: auto; }
             url = normalize_url(url_var.get())
             if not url:
                 return
+            generation = request_gate.next()
             url_var.set(url)
             update_network_status("Loading")
             set_source_content("Loading...")
-            self.root.update_idletasks()
+            go_button.configure(state=tk.DISABLED)
 
-            html_frame = renderer["html_frame"]
-            request = urllib.request.Request(url, headers={"User-Agent": "pyOS Browser/1.0"})
-            try:
-                with urllib.request.urlopen(request, timeout=12) as response:
-                    data = response.read(10 * 1024 * 1024 + 1)
-                    if len(data) > 10 * 1024 * 1024:
-                        raise ValueError("Page exceeds the 10 MB browser limit")
-                    encoding = response.headers.get_content_charset() or "utf-8"
-                    page_text = data.decode(encoding, errors="replace")
-                    final_url = response.geturl()
-                    page_cache.update({
-                        "url": final_url,
-                        "status": response.status,
-                        "headers": dict(response.headers.items()),
-                        "data": data,
-                        "source": page_text,
-                    })
+            def worker():
+                try:
+                    request = urllib.request.Request(url, headers={"User-Agent": "pyOS Browser/1.0"})
+                    with urllib.request.urlopen(request, timeout=12) as response:
+                        data = response.read(10 * 1024 * 1024 + 1)
+                        if len(data) > 10 * 1024 * 1024:
+                            raise ValueError("Page exceeds the 10 MB browser limit")
+                        encoding = response.headers.get_content_charset() or "utf-8"
+                        page_text = data.decode(encoding, errors="replace")
+                        result = {
+                            "url": response.geturl(), "status": response.status,
+                            "headers": dict(response.headers.items()), "data": data,
+                            "source": page_text,
+                        }
+                    error = None
+                except (OSError, ValueError, LookupError, urllib.error.URLError) as exc:
+                    result, error = None, str(exc)
+
+                def finish():
+                    if not request_gate.valid(generation) or not window.frame.winfo_exists():
+                        return
+                    go_button.configure(state=tk.NORMAL)
+                    if error:
+                        set_source_content(f"Could not load page:\n{error}")
+                        update_network_status("Load failed")
+                        return
+                    page_cache.update(result)
+                    final_url = result["url"]
                     url_var.set(final_url)
+                    html_frame = renderer["html_frame"]
                     if html_frame:
-                        html_frame.load_html(page_text, base_url=final_url)
+                        html_frame.load_html(result["source"], base_url=final_url)
                         javascript_state = "on" if javascript_enabled.get() else "off"
                         update_network_status(
                             f"Rendered {final_url} | HTML/CSS active | JavaScript {javascript_state}"
                         )
-                        return
-                    set_source_content(page_text)
-                    reason = renderer_error["message"] or "renderer unavailable"
-                    update_network_status(f"Loaded source for {final_url} | HTML/CSS renderer unavailable: {reason}")
-            except urllib.error.URLError as e:
-                set_source_content(f"Could not load page:\n{e}")
-                update_network_status("Load failed")
-            except (OSError, ValueError) as e:
-                set_source_content(f"Network error:\n{e}")
-                update_network_status("Load failed")
+                    else:
+                        set_source_content(result["source"])
+                        reason = renderer_error["message"] or "renderer unavailable"
+                        update_network_status(
+                            f"Loaded source for {final_url} | HTML/CSS renderer unavailable: {reason}"
+                        )
+
+                self.post_ui(finish)
+
+            if self.run_background(worker) is None:
+                go_button.configure(state=tk.NORMAL)
+                set_source_content("Page load was not started because the task queue is busy.")
+                update_network_status("Load not started")
 
         def open_shortcut(target):
             url_var.set(target)
@@ -8386,7 +10350,7 @@ img { max-width: 100%; height: auto; }
             if not destination:
                 return
             try:
-                Path(destination).write_bytes(page_cache["data"])
+                atomic_write_bytes(destination, page_cache["data"])
                 update_network_status(f"Saved {destination}")
             except OSError as error:
                 messagebox.showerror("Download Page", f"Could not save page: {error}")
@@ -8444,7 +10408,8 @@ img { max-width: 100%; height: auto; }
                     pass
                 status_var.set(f"Could not change JavaScript mode: {error}")
 
-        tk.Button(toolbar, text="Go", command=load_url).pack(side=tk.LEFT, padx=4, pady=4)
+        go_button = tk.Button(toolbar, text="Go", command=load_url)
+        go_button.pack(side=tk.LEFT, padx=4, pady=4)
         javascript_toggle = tk.Checkbutton(
             toolbar, text="JavaScript", variable=javascript_enabled, command=toggle_javascript,
             bg="white", fg="black",
@@ -8482,6 +10447,12 @@ img { max-width: 100%; height: auto; }
         else:
             reason = renderer_error["message"] or "tkinterweb unavailable"
             update_network_status(f"Ready | HTML/CSS renderer missing: {reason}")
+
+        original_close = window.close
+        def close_browser():
+            request_gate.close()
+            original_close()
+        window.close_button.configure(command=close_browser)
     
     def open_drive_a(self):
         """Open Drive A (Temporary)"""
@@ -9097,22 +11068,26 @@ Features:
     def show_context_menu(self, event):
         """Show right-click context menu"""
         context_menu = tk.Menu(self.root, tearoff=0)
-        context_menu.add_command(label="Open Terminal", command=self.open_cli)
-        context_menu.add_command(label="Open File Manager", command=self.open_default_file_manager)
-        context_menu.add_command(label="New Sticky Note", command=self.open_notepad)
-        context_menu.add_command(label="Open Text Editor", command=self.open_text_editor)
-        context_menu.add_command(label="Open Image Viewer", command=self.open_image_viewer)
-        context_menu.add_command(label="Open Internet Browser", command=self.open_browser)
-        context_menu.add_command(label="Open Python IDE", command=self.open_python_ide)
-        context_menu.add_command(label="Open Media Player", command=self.open_media_player)
-        context_menu.add_command(label="Open Calculator", command=self.open_calculator)
-        context_menu.add_command(label="Open Messenger", command=self.open_messenger)
-        context_menu.add_command(label="Open SSH Client", command=self.open_ssh_client)
-        context_menu.add_command(label="Open Games Suite", command=self.open_games_suite)
-        context_menu.add_command(label="Open Modding Environment", command=self.open_modding_environment)
-        context_menu.add_command(label="Manage Virtual Drives", command=self.open_virtual_drive_manager)
-        context_menu.add_command(label="Open Weather", command=self.open_weather)
-        context_menu.add_command(label="Open News", command=self.open_news)
+        def add(label, command, app_id=None):
+            if app_id is None or self._app_enabled(app_id):
+                context_menu.add_command(label=label, command=command)
+
+        add("Open Terminal", self.open_cli)
+        add("Open File Manager", self.open_default_file_manager)
+        add("New Sticky Note", self.open_notepad)
+        add("Open Text Editor", self.open_text_editor)
+        add("Open Image Viewer", self.open_image_viewer)
+        add("Open Internet Browser", self.open_browser, "browser")
+        add("Open Python IDE", self.open_python_ide, "ide")
+        add("Open Media Player", self.open_media_player, "media")
+        add("Open Calculator", self.open_calculator)
+        add("Open Messenger", self.open_messenger, "messenger")
+        add("Open SSH Client", self.open_ssh_client)
+        add("Open Games Suite", self.open_games_suite, "games")
+        add("Open Modding Environment", self.open_modding_environment, "modding")
+        add("Manage Virtual Drives", self.open_virtual_drive_manager)
+        add("Open Weather", self.open_weather, "weather")
+        add("Open News", self.open_news, "news")
         context_menu.add_separator()
         context_menu.add_command(label="Lock Desktop", command=self.lock_desktop)
         context_menu.add_command(label="Refresh", command=self.refresh_desktop)
@@ -9123,6 +11098,70 @@ Features:
     def refresh_desktop(self):
         """Refresh desktop"""
         messagebox.showinfo("Refresh", "Desktop refreshed!")
+
+
+class IsolatedCustomAppWindow:
+    """Small compatibility surface supplied to a custom app subprocess."""
+
+    def __init__(self, root, title, width=640, height=440, toplevel=False):
+        self.root = tk.Toplevel(root) if toplevel else root
+        self.root.title(title)
+        self.root.geometry(f"{width}x{height}")
+        self.content = tk.Frame(self.root, bg="white")
+        self.content.pack(fill=tk.BOTH, expand=True)
+
+    def close(self):
+        self.root.destroy()
+
+
+class IsolatedCustomAppHost:
+    """Deliberately limited host object; it exposes no DesktopGUI state or credentials."""
+
+    def __init__(self, root):
+        self.root = root
+        self.preferences = dict(THEME_PRESETS["Classic"])
+
+    def create_window(self, title, width=640, height=440):
+        return IsolatedCustomAppWindow(self.root, title, width, height, toplevel=True)
+
+    def show_notification(self, title, message, **_kwargs):
+        messagebox.showinfo(title, message, parent=self.root)
+
+
+def run_isolated_custom_app(path):
+    """Execute one custom app in this dedicated child interpreter."""
+    path = Path(path).expanduser().resolve()
+    if path.suffix.casefold() != ".py" or path.parent.name.casefold() != "apps" or not path.is_file():
+        raise ValueError("Custom app path is outside a pyOS apps directory.")
+    source, _encoding, _bom, _newline = decode_text_document(path.read_bytes())
+    code = compile(source, str(path), "exec")
+    namespace = {
+        "__name__": f"pyos_isolated_app_{path.stem}",
+        "__file__": str(path),
+        "tk": tk,
+        "ttk": ttk,
+        "messagebox": messagebox,
+    }
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        exec(code, namespace)
+        builder = namespace.get("build")
+        if not callable(builder):
+            raise ValueError("App must define build(app, window).")
+        title = str(namespace.get("APP_NAME", path.stem.replace("_", " ").title()))[:80]
+        window = IsolatedCustomAppWindow(root, title)
+        host = IsolatedCustomAppHost(root)
+        builder(host, window)
+        root.deiconify()
+        root.mainloop()
+    except Exception as error:
+        try:
+            root.deiconify()
+            messagebox.showerror("Custom App", f"{path.name} could not run:\n\n{error}", parent=root)
+        finally:
+            root.destroy()
+        raise
 
 
 DESKTOP_APP_LAUNCHERS = {
@@ -9159,22 +11198,136 @@ DESKTOP_APP_LAUNCHERS = {
     "about": "show_about",
 }
 
+
+def acknowledge_update_startup(reference, acknowledgement, data_dir=None):
+    """Write a constrained health acknowledgement before interactive login can delay it."""
+    if not re.fullmatch(r"[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?", str(reference)):
+        raise ValueError("The update acknowledgement has an invalid immutable reference.")
+    pending = (Path(data_dir) if data_dir is not None else get_data_dir()) / "pending_updates"
+    pending = pending.expanduser().resolve()
+    acknowledgement = Path(acknowledgement).expanduser().resolve()
+    if (acknowledgement.parent != pending or
+            not re.fullmatch(r"update-[0-9a-f]{32}\.ack", acknowledgement.name)):
+        raise ValueError("The update acknowledgement path is outside the pending-update directory.")
+    atomic_write_bytes(acknowledgement, str(reference).lower().encode("ascii"))
+
+
+def recover_startup_source_update(config, executable_handoff=False):
+    """Recover source state unless an executable helper owns the update lock."""
+    if executable_handoff:
+        return None
+    return recover_source_update(config["install_dir"], config["data_dir"])
+
+
 def main():
     """Main entry point"""
-    relaunch_in_configured_environment(__file__)
+    if len(sys.argv) >= 3 and sys.argv[1] == "--custom-app":
+        run_isolated_custom_app(sys.argv[2])
+        return
+    update_completion = None
+    if len(sys.argv) >= 4 and sys.argv[1] == "--complete-update":
+        update_completion = (sys.argv[2], Path(sys.argv[3]).expanduser())
+    try:
+        relaunch_in_configured_environment(__file__)
+    except ConfigurationError as error:
+        failure_root = tk.Tk()
+        failure_root.withdraw()
+        messagebox.showerror(
+            "pyOS Configuration Recovery Required",
+            f"pyOS refused to use an invalid configuration and did not switch storage locations.\n\n{error}\n\n"
+            "Restore a validated install.json backup or repair the configuration before starting pyOS.",
+            parent=failure_root,
+        )
+        failure_root.destroy()
+        return
     root = tk.Tk()
     root.withdraw()
-    username = authenticate(root, cancellable=False, allow_remembered=True)
+    try:
+        startup_config = load_config()
+        # The executable handoff helper intentionally owns the global update
+        # lock until this replacement acknowledges a healthy startup.  Frozen
+        # builds never create source-overlay journals, so do not self-deadlock
+        # by trying to acquire that same lock during the one handoff launch.
+        # Every ordinary GUI/CLI startup still performs durable source recovery.
+        recovered_update = recover_startup_source_update(
+            startup_config, executable_handoff=bool(update_completion),
+        )
+    except (ConfigurationError, OSError, ValueError) as error:
+        messagebox.showerror(
+            "pyOS Update Recovery Required",
+            f"pyOS could not safely recover an interrupted source update:\n\n{error}\n\n"
+            "Restore the recorded update backup or resolve the changed file before starting pyOS.",
+            parent=root,
+        )
+        root.destroy()
+        return
+    if recovered_update:
+        messagebox.showinfo(
+            "pyOS Update Recovered",
+            "An interrupted source update was rolled back before pyOS continued.",
+            parent=root,
+        )
+    try:
+        # Validate account storage without waiting for interactive credentials.  A healthy
+        # replacement can then acknowledge promptly even when the user is away.
+        has_account()
+    except (CredentialStoreError, ConfigurationError) as error:
+        messagebox.showerror(
+            "pyOS Account Recovery Required",
+            f"pyOS detected invalid account state and failed closed. No replacement administrator was created.\n\n"
+            f"{error}\n\nRestore the validated credentials.json.bak file or repair the credential store, "
+            "then restart pyOS.", parent=root,
+        )
+        root.destroy()
+        return
+    if update_completion:
+        reference, acknowledgement = update_completion
+        try:
+            acknowledge_update_startup(reference, acknowledgement)
+        except (OSError, ValueError) as error:
+            messagebox.showerror(
+                "pyOS Update", f"The new build could not acknowledge startup:\n{error}", parent=root,
+            )
+            root.destroy()
+            return
+    try:
+        username = authenticate(root, cancellable=False, allow_remembered=True)
+    except (CredentialStoreError, ConfigurationError) as error:
+        messagebox.showerror(
+            "pyOS Account Recovery Required",
+            f"pyOS detected invalid account state and failed closed. No replacement administrator was created.\n\n"
+            f"{error}\n\nRestore the validated credentials.json.bak file or repair the credential store, "
+            "then restart pyOS.", parent=root,
+        )
+        root.destroy()
+        return
+    if not username:
+        # authenticate() reports fail-closed storage recovery errors itself.
+        # Never turn an indeterminate authentication result into a desktop
+        # session, even when a dialog callback had to close early.
+        root.destroy()
+        return
     app = DesktopGUI(root)
     app.username = username
     app.system_user_var.set(username)
+    if update_completion:
+        reference, _acknowledgement = update_completion
+        app.preferences["update_installed_ref"] = reference
+        app.preferences["update_skipped_ref"] = ""
+        app.save_preferences()
     root.update_idletasks()
     root.deiconify()
     app.start_notifications()
     if len(sys.argv) >= 3 and sys.argv[1] == "--app":
         launcher = DESKTOP_APP_LAUNCHERS.get(sys.argv[2].casefold())
         if launcher:
-            root.after(0, getattr(app, launcher))
+            app_id = METHOD_OPTIONAL_APP.get(launcher)
+            if app_id is None or app._app_enabled(app_id):
+                root.after(0, getattr(app, launcher))
+            else:
+                messagebox.showerror(
+                    "pyOS", f"That application was disabled during Setup: {sys.argv[2]}", parent=root,
+                )
         else:
             messagebox.showerror("pyOS", f"Unknown desktop application: {sys.argv[2]}")
     root.mainloop()

@@ -6,14 +6,20 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
+import uuid
 import venv
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
-from pyos_config import CONFIG_FILE, load_config, save_config
+from pyos_config import (
+    CONFIG_FILE, LEGACY_CONFIG_FILE, OWNED_TREE as STORAGE_OWNED_TREE,
+    StorageOwnershipError, ensure_storage_owner, get_standalone_root, load_config,
+    owned_path_entries, register_owned_path, save_config, verify_storage_owner,
+)
 
 
 SOURCE_DIR = Path(__file__).resolve().parent
@@ -26,7 +32,7 @@ PYTHON_PACKAGES = (
     "fido2>=2.2,<3.0",
     "Pillow>=12.0",
     "mido>=1.3",
-    "paramiko>=4.0,<5.0",
+    "paramiko>=5.0,<6.0",
     "pygame-ce>=2.5",
     "psutil>=6.0",
     "python-vlc>=3.0",
@@ -46,6 +52,317 @@ OPTIONAL_APPS = (
     ("weather", "Weather"), ("news", "News reader"),
     ("ide", "Python IDE and App Maker"), ("modding", "Modding tools"),
 )
+
+INSTALL_PRODUCT = "pyOS"
+INSTALL_SCHEMA_VERSION = 2
+OWNERSHIP_MARKER = ".pyos-installation-owner.json"
+INSTALL_MANIFEST = "install_manifest.json"
+MANIFEST_METADATA_PATHS = {OWNERSHIP_MARKER, INSTALL_MANIFEST}
+OWNED_FILE = "file"
+OWNED_TREE = "tree"
+RECURSIVE_OWNED_PATHS = {".venv"}
+WINDOWS_RESERVED_NAMES = {
+    "con", "prn", "aux", "nul", *(f"com{number}" for number in range(1, 10)),
+    *(f"lpt{number}" for number in range(1, 10)),
+}
+
+
+def paths_overlap(first, second):
+    """Return whether either resolved directory contains the other."""
+    first = Path(first).expanduser().resolve()
+    second = Path(second).expanduser().resolve()
+    return first == second or first.is_relative_to(second) or second.is_relative_to(first)
+
+
+def _unsafe_generic_roots():
+    """Return generic/system directories that pyOS must never claim wholesale."""
+    home = Path.home().expanduser().resolve()
+    candidates = {
+        home / name for name in (
+            "Desktop", "Documents", "Downloads", "Music", "Pictures", "Videos",
+            "AppData", "Applications", "Library", "OneDrive",
+        )
+    }
+    candidates.add(Path(tempfile.gettempdir()))
+    for variable in (
+        "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PUBLIC", "SystemRoot",
+        "ProgramFiles", "ProgramFiles(x86)", "TEMP", "TMP",
+    ):
+        value = os.environ.get(variable)
+        if value:
+            candidates.add(Path(value).expanduser())
+    if os.name != "nt":
+        candidates.update(Path(value) for value in (
+            "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64",
+            "/media", "/mnt", "/opt", "/proc", "/root", "/run", "/sbin",
+            "/srv", "/sys", "/tmp", "/usr", "/var",
+        ))
+    return {candidate.resolve(strict=False) for candidate in candidates}
+
+
+def _validate_managed_root(path, label):
+    """Reject roots where installer ownership could encompass unrelated data."""
+    path = Path(path).expanduser().resolve(strict=False)
+    home = Path.home().expanduser().resolve(strict=False)
+    filesystem_root = Path(path.anchor).resolve(strict=False)
+    if (path == filesystem_root or path == home or home.is_relative_to(path) or
+            path in _unsafe_generic_roots()):
+        raise ValueError(f"The {label} directory is an unsafe generic or protected root: {path}")
+    return path
+
+
+def _safe_owned_relative(value):
+    if not isinstance(value, str) or not value or "\\" in value or "\0" in value:
+        raise ValueError("The installation manifest contains an unsafe owned path.")
+    path = PurePosixPath(value)
+    if (path.is_absolute() or path == PurePosixPath(".") or ".." in path.parts or
+            not path.parts or any(
+                ":" in part or part != part.rstrip(" .") or
+                part.rstrip(" .").split(".", 1)[0].casefold() in WINDOWS_RESERVED_NAMES
+                for part in path.parts
+            )):
+        raise ValueError("The installation manifest contains an unsafe owned path.")
+    return Path(*path.parts)
+
+
+def _atomic_write_json(path, payload):
+    path = Path(path)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _valid_installation_id(value):
+    try:
+        parsed = uuid.UUID(str(value))
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return str(parsed) if parsed.version == 4 else None
+
+
+def load_install_ownership(install_dir):
+    """Load and cross-check the ownership marker and uninstall manifest."""
+    install_dir = Path(install_dir).expanduser().resolve()
+    marker_path = install_dir / OWNERSHIP_MARKER
+    manifest_path = install_dir / INSTALL_MANIFEST
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as error:
+        raise ValueError("The installation ownership marker or manifest is missing or invalid.") from error
+    if not isinstance(marker, dict) or not isinstance(manifest, dict):
+        raise ValueError("The installation ownership metadata is invalid.")
+    installation_id = _valid_installation_id(marker.get("installation_id"))
+    if (marker.get("product") != INSTALL_PRODUCT or
+            marker.get("schema_version") != INSTALL_SCHEMA_VERSION or
+            manifest.get("product") != INSTALL_PRODUCT or
+            manifest.get("schema_version") != INSTALL_SCHEMA_VERSION or
+            not installation_id or manifest.get("installation_id") != installation_id):
+        raise ValueError("The installation ownership marker does not match its manifest.")
+    try:
+        recorded_root = Path(manifest["install_dir"]).expanduser().resolve()
+    except (KeyError, TypeError, OSError) as error:
+        raise ValueError("The installation manifest has no valid installation root.") from error
+    if recorded_root != install_dir:
+        raise ValueError("The installation manifest belongs to a different directory.")
+    raw_owned = manifest.get("owned_paths")
+    if not isinstance(raw_owned, list):
+        raise ValueError("The installation manifest has no owned path list.")
+    owned = {_safe_owned_relative(value).as_posix() for value in raw_owned}
+    if not MANIFEST_METADATA_PATHS.issubset(owned):
+        raise ValueError("The installation manifest does not own its metadata files.")
+    raw_external = manifest.get("external_files", [])
+    if not isinstance(raw_external, list) or not all(isinstance(value, str) for value in raw_external):
+        raise ValueError("The installation manifest has an invalid external file list.")
+    raw_types = manifest.get("owned_path_types")
+    if raw_types is None:
+        # A pre-hardening schema-2 manifest is treated conservatively: every
+        # entry is a file.  Repair can explicitly reclaim .venv as a tree.
+        path_types = {value: OWNED_FILE for value in owned}
+    elif not isinstance(raw_types, dict):
+        raise ValueError("The installation manifest has an invalid owned path type map.")
+    else:
+        path_types = {}
+        for value, kind in raw_types.items():
+            normalized = _safe_owned_relative(value).as_posix()
+            if normalized not in owned or kind not in {OWNED_FILE, OWNED_TREE}:
+                raise ValueError("The installation manifest has an invalid owned path type.")
+            if kind == OWNED_TREE and normalized not in RECURSIVE_OWNED_PATHS:
+                raise ValueError("The installation manifest claims an unsafe recursive tree.")
+            path_types[normalized] = kind
+        if set(path_types) != owned:
+            raise ValueError("The installation manifest does not type every owned path.")
+    if any(path_types[value] != OWNED_FILE for value in MANIFEST_METADATA_PATHS):
+        raise ValueError("Installation ownership metadata must be regular files.")
+    manifest["owned_paths"] = sorted(owned)
+    manifest["owned_path_types"] = path_types
+    manifest["external_files"] = raw_external
+    return marker, manifest
+
+
+def _safe_install_root(install_dir):
+    install_dir = Path(install_dir).expanduser().resolve()
+    home = Path.home().resolve()
+    if (not install_dir.is_dir() or install_dir == Path(install_dir.anchor) or
+            install_dir == home or home.is_relative_to(install_dir)):
+        raise ValueError("The configured installation directory is unsafe to remove.")
+    return install_dir
+
+
+def _validated_uninstall_targets(install_dir):
+    install_dir = _safe_install_root(install_dir)
+    _marker, manifest = load_install_ownership(install_dir)
+    metadata_targets = []
+    content_targets = []
+    for value in manifest["owned_paths"]:
+        relative = _safe_owned_relative(value)
+        target = install_dir / relative
+        # A symlink at the target is safe to unlink, but a symlink in a parent
+        # could redirect a manifest entry outside the owned installation root.
+        if not target.parent.resolve(strict=False).is_relative_to(install_dir):
+            raise ValueError("An installation manifest path escapes the owned directory.")
+        if relative.as_posix() in MANIFEST_METADATA_PATHS:
+            metadata_targets.append((target, manifest["owned_path_types"][relative.as_posix()]))
+        else:
+            content_targets.append((target, manifest["owned_path_types"][relative.as_posix()]))
+
+    desktop = (Path(os.environ.get("USERPROFILE", Path.home())) / "Desktop").resolve()
+    allowed_shortcuts = {desktop / "pyOS GUI.lnk", desktop / "pyOS CLI.lnk"}
+    external_targets = []
+    for value in manifest["external_files"]:
+        target = Path(value).expanduser().resolve(strict=False)
+        if target not in allowed_shortcuts:
+            raise ValueError("The installation manifest contains an unsafe external path.")
+        if target.is_dir() and not target.is_symlink():
+            raise ValueError("An owned shortcut path has been replaced by a directory.")
+        external_targets.append((target, OWNED_FILE))
+    # Preserve marker and manifest until all payload removal has succeeded.
+    return install_dir, content_targets + external_targets, metadata_targets
+
+
+def _remove_manifest_target(target, install_dir, kind):
+    target = Path(target)
+    if kind not in {OWNED_FILE, OWNED_TREE}:
+        raise ValueError("The manifest contains an invalid owned path type.")
+    if ((hasattr(target, "is_junction") and target.is_junction()) or
+            target.is_symlink()):
+        raise ValueError("An owned path has been replaced by a link or junction.")
+    if target.is_dir():
+        if (kind != OWNED_TREE or target == install_dir or
+                not target.is_relative_to(install_dir)):
+            raise ValueError("The manifest cannot recursively own this directory.")
+        shutil.rmtree(target)
+    elif target.is_file():
+        if kind != OWNED_FILE:
+            raise ValueError("An owned directory has been replaced by a file.")
+        target.unlink()
+    elif target.exists():
+        raise ValueError("An owned path is not a regular file or directory.")
+
+
+def _matching_legacy_config(path, install_dir):
+    """Return true only for a legacy pyOS config for this exact installation."""
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        required = ("install_dir", "data_dir", "downloads_dir")
+        return (
+            isinstance(payload, dict) and payload.get("configured") is True and
+            all(isinstance(payload.get(key), str) and payload[key].strip() for key in required) and
+            Path(payload["install_dir"]).expanduser().resolve() == Path(install_dir).resolve()
+        )
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def uninstall_managed_install(install_dir, config_file=CONFIG_FILE,
+                              legacy_config_file=LEGACY_CONFIG_FILE):
+    """Delete only marker-authorized installation paths, then configuration.
+
+    Unknown files and directories beneath the installation root are deliberately
+    preserved.  Configuration is removed only after every manifest target has
+    been removed successfully.
+    """
+    install_dir, content_targets, metadata_targets = _validated_uninstall_targets(install_dir)
+    for target, kind in content_targets:
+        _remove_manifest_target(target, install_dir, kind)
+    for target, kind in metadata_targets:
+        _remove_manifest_target(target, install_dir, kind)
+    try:
+        install_dir.rmdir()
+    except OSError:
+        # A non-empty directory contains files the installer did not own.
+        pass
+    config_path = Path(config_file).expanduser()
+    # pyos_config deliberately recovers a missing primary from this backup, so
+    # remove the backup first and the primary last after payload success.
+    config_path.with_name(config_path.name + ".bak").unlink(missing_ok=True)
+    legacy_path = Path(legacy_config_file).expanduser()
+    if (legacy_path.resolve(strict=False) != config_path.resolve(strict=False) and
+            _matching_legacy_config(legacy_path, install_dir)):
+        legacy_path.unlink(missing_ok=True)
+    config_path.unlink(missing_ok=True)
+    return {"install_dir": str(install_dir), "removed": len(content_targets) + len(metadata_targets)}
+
+
+def schedule_managed_uninstall(install_dir, config_file=CONFIG_FILE,
+                               legacy_config_file=LEGACY_CONFIG_FILE):
+    """Schedule manifest-only removal when the running interpreter is owned."""
+    if os.name != "nt":
+        raise OSError("Deferred uninstall is only available on Windows.")
+    install_dir, content_targets, metadata_targets = _validated_uninstall_targets(install_dir)
+
+    def quote(value):
+        return "'" + str(value).replace("'", "''") + "'"
+
+    tree_targets = [target for target, kind in content_targets if kind == OWNED_TREE]
+    file_targets = [target for target, kind in content_targets if kind == OWNED_FILE]
+    metadata_files = [target for target, kind in metadata_targets if kind == OWNED_FILE]
+    recursive_values = ",".join(quote(target) for target in tree_targets)
+    payload_file_values = ",".join(quote(target) for target in file_targets)
+    metadata_values = ",".join(quote(target) for target in metadata_files)
+    legacy_path = Path(legacy_config_file).expanduser()
+    remove_legacy = (
+        legacy_path.resolve(strict=False) != Path(config_file).expanduser().resolve(strict=False) and
+        _matching_legacy_config(legacy_path, install_dir)
+    )
+    legacy_script = (
+        f"$legacy={quote(legacy_path)};"
+        "if(Test-Path -LiteralPath $legacy){Remove-Item -LiteralPath $legacy -Force -ErrorAction Stop};"
+        if remove_legacy else ""
+    )
+    script = (
+        "$ErrorActionPreference='Stop';Start-Sleep -Seconds 2;"
+        f"$trees=@({recursive_values});"
+        "foreach($tree in $trees){if(Test-Path -LiteralPath $tree){"
+        "$item=Get-Item -LiteralPath $tree -Force;"
+        "if(-not $item.PSIsContainer -or $item.LinkType){throw 'Owned tree has an unexpected type'};"
+        "Remove-Item -LiteralPath $tree -Recurse -Force -ErrorAction Stop}};"
+        f"$files=@({payload_file_values});"
+        "foreach($file in $files){if(Test-Path -LiteralPath $file){"
+        "$item=Get-Item -LiteralPath $file -Force;"
+        "if($item.PSIsContainer -or $item.LinkType){throw 'Owned file has an unexpected type'};"
+        "Remove-Item -LiteralPath $file -Force -ErrorAction Stop}};"
+        f"$metadata=@({metadata_values});"
+        "foreach($file in $metadata){if(Test-Path -LiteralPath $file){"
+        "$item=Get-Item -LiteralPath $file -Force;"
+        "if($item.PSIsContainer -or $item.LinkType){throw 'Ownership metadata has an unexpected type'};"
+        "Remove-Item -LiteralPath $file -Force -ErrorAction Stop}};"
+        f"$root={quote(install_dir)};"
+        "if((Test-Path -LiteralPath $root)-and -not(Get-ChildItem -LiteralPath $root -Force|Select-Object -First 1)){"
+        "Remove-Item -LiteralPath $root -Force -ErrorAction Stop};"
+        f"$config={quote(Path(config_file).expanduser())};"
+        "$backup=$config+'.bak';"
+        "if(Test-Path -LiteralPath $backup){Remove-Item -LiteralPath $backup -Force -ErrorAction Stop};"
+        f"{legacy_script}"
+        "if(Test-Path -LiteralPath $config){Remove-Item -LiteralPath $config -Force -ErrorAction Stop}"
+    )
+    return subprocess.Popen(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
 
 
 def default_locations():
@@ -70,10 +387,23 @@ class InstallerCore:
         self.install_vlc = install_vlc
         self.install_ollama = install_ollama
         self.create_shortcuts = create_shortcuts
-        self.enabled_apps = list(enabled_apps or (app_id for app_id, _label in OPTIONAL_APPS))
+        self.enabled_apps = list(
+            (app_id for app_id, _label in OPTIONAL_APPS)
+            if enabled_apps is None else enabled_apps
+        )
         self.dry_run = dry_run
         self.log = logger
         self.warnings = []
+        self.installation_id = None
+        self._owned_paths = set(MANIFEST_METADATA_PATHS)
+        self._owned_path_types = {value: OWNED_FILE for value in MANIFEST_METADATA_PATHS}
+        self._external_files = set()
+        self._previous_owned_paths = set()
+        self._previous_owned_path_types = {}
+        self._previous_external_files = set()
+        self._existing_install = False
+        standalone = get_standalone_root(create=False)
+        self._data_owner_kind = "standalone" if self.data_dir == standalone else "data"
 
     @property
     def venv_dir(self):
@@ -89,9 +419,188 @@ class InstallerCore:
         missing = [name for name in APPLICATION_FILES[:5] if not (SOURCE_DIR / name).is_file()]
         if missing:
             raise FileNotFoundError(f"Setup source files are missing: {', '.join(missing)}")
+        _validate_managed_root(self.install_dir, "installation")
+        _validate_managed_root(self.data_dir, "data")
         for path in (self.install_dir, self.data_dir, self.downloads_dir):
             if path.exists() and not path.is_dir():
                 raise ValueError(f"A file already exists at directory location: {path}")
+        locations = {
+            "installation": self.install_dir,
+            "data": self.data_dir,
+            "downloads": self.downloads_dir,
+        }
+        location_items = list(locations.items())
+        for index, (first_name, first) in enumerate(location_items):
+            for second_name, second in location_items[index + 1:]:
+                if paths_overlap(first, second):
+                    raise ValueError(
+                        f"The {first_name} and {second_name} directories must not be the same "
+                        "or contain one another."
+                    )
+
+        if self.install_dir.is_dir() and any(self.install_dir.iterdir()):
+            try:
+                _marker, manifest = load_install_ownership(self.install_dir)
+            except ValueError as error:
+                raise ValueError(
+                    "The installation directory is not empty and is not owned by this pyOS installer."
+                ) from error
+            self._existing_install = True
+            self.installation_id = manifest["installation_id"]
+            self._previous_owned_paths = set(manifest["owned_paths"])
+            self._previous_owned_path_types = dict(manifest["owned_path_types"])
+            self._previous_external_files = {
+                str(Path(value).expanduser().resolve(strict=False))
+                for value in manifest["external_files"]
+            }
+            self._owned_paths.update(manifest["owned_paths"])
+            self._owned_path_types.update(manifest["owned_path_types"])
+            self._external_files.update(manifest["external_files"])
+        else:
+            self._existing_install = False
+            self.installation_id = str(uuid.uuid4())
+
+        if self.data_dir.is_dir() and any(self.data_dir.iterdir()):
+            if not verify_storage_owner(self.data_dir, kind=self._data_owner_kind):
+                raise ValueError(
+                    "The data directory is not empty and has no matching pyOS ownership marker."
+                )
+            try:
+                data_entries = owned_path_entries(
+                    self.data_dir, kind=self._data_owner_kind
+                )
+            except StorageOwnershipError as error:
+                raise ValueError("The data ownership manifest is invalid.") from error
+            entries_by_path = {entry.path: entry for entry in data_entries}
+            drive_b = self.data_dir / "Drive_B"
+            if drive_b.exists() or drive_b.is_symlink():
+                entry = entries_by_path.get(drive_b)
+                if entry is None:
+                    raise ValueError(
+                        "The existing Drive_B directory is not owned by this pyOS data manifest."
+                    )
+                if (entry.kind != STORAGE_OWNED_TREE or drive_b.is_symlink() or
+                        (hasattr(drive_b, "is_junction") and drive_b.is_junction()) or
+                        not drive_b.is_dir()):
+                    raise ValueError("The owned Drive_B tree has an unexpected filesystem type.")
+
+        planned_files = {
+            name for name in APPLICATION_FILES if (SOURCE_DIR / name).exists()
+        } | {"pyOS GUI.cmd", "pyOS CLI.cmd"}
+        for relative in sorted(planned_files):
+            self._assert_install_destination(relative, OWNED_FILE)
+        self._assert_install_destination(".venv", OWNED_TREE)
+
+        if self.create_shortcuts and os.name == "nt":
+            desktop = Path(os.environ.get("USERPROFILE", Path.home())) / "Desktop"
+            for shortcut in (desktop / "pyOS GUI.lnk", desktop / "pyOS CLI.lnk"):
+                self._assert_external_destination(shortcut)
+
+    def _assert_install_destination(self, relative_path, expected_kind):
+        """Refuse an overwrite unless the prior manifest owned this exact type."""
+        normalized = _safe_owned_relative(str(relative_path)).as_posix()
+        target = self.install_dir / _safe_owned_relative(normalized)
+        if not target.parent.resolve(strict=False).is_relative_to(self.install_dir):
+            raise ValueError(f"Installation destination escapes its owned root: {normalized}")
+        previous_kind = self._previous_owned_path_types.get(normalized)
+        if previous_kind is not None and previous_kind != expected_kind:
+            raise ValueError(
+                f"Installation destination changed manifest type: {normalized}"
+            )
+        exists = target.exists() or target.is_symlink()
+        if not exists:
+            return
+        if normalized not in self._previous_owned_paths:
+            raise ValueError(
+                f"Refusing to overwrite an existing item absent from the prior manifest: {normalized}"
+            )
+        if (target.is_symlink() or
+                (hasattr(target, "is_junction") and target.is_junction())):
+            raise ValueError(f"Owned installation destination was replaced by a link: {normalized}")
+        if expected_kind == OWNED_FILE and not target.is_file():
+            raise ValueError(f"Owned installation file was replaced by a directory: {normalized}")
+        if expected_kind == OWNED_TREE and not target.is_dir():
+            raise ValueError(f"Owned installation tree was replaced by a file: {normalized}")
+
+    def _assert_external_destination(self, path):
+        target = Path(path).expanduser().resolve(strict=False)
+        if not (target.exists() or target.is_symlink()):
+            return
+        if str(target) not in self._previous_external_files:
+            raise ValueError(f"Refusing to overwrite an unowned shortcut: {target}")
+        if (target.is_dir() or target.is_symlink() or
+                (hasattr(target, "is_junction") and target.is_junction())):
+            raise ValueError(f"Owned shortcut has an unexpected filesystem type: {target}")
+
+    def _configuration(self):
+        return {
+            "configured": True,
+            "install_dir": str(self.install_dir),
+            "data_dir": str(self.data_dir),
+            "downloads_dir": str(self.downloads_dir),
+            "drive_b_dir": str(self.data_dir / "Drive_B"),
+            "python_executable": str(self.python_executable),
+            "installed_at": datetime.now().isoformat(timespec="seconds"),
+            "installer_version": INSTALL_SCHEMA_VERSION,
+            "enabled_apps": self.enabled_apps,
+        }
+
+    def _write_ownership_metadata(self, configuration=None):
+        if self.dry_run:
+            return
+        if not self.installation_id:
+            raise RuntimeError("Installation ownership was not initialized.")
+        marker = {
+            "product": INSTALL_PRODUCT,
+            "schema_version": INSTALL_SCHEMA_VERSION,
+            "installation_id": self.installation_id,
+        }
+        manifest = {
+            **(configuration or self._configuration()),
+            **marker,
+            "owned_paths": sorted(self._owned_paths),
+            "owned_path_types": {
+                value: self._owned_path_types[value] for value in sorted(self._owned_paths)
+            },
+            "external_files": sorted(self._external_files),
+            "packages": PYTHON_PACKAGES,
+            "optional_packages": OPTIONAL_PYTHON_PACKAGES,
+        }
+        _atomic_write_json(self.install_dir / OWNERSHIP_MARKER, marker)
+        _atomic_write_json(self.install_dir / INSTALL_MANIFEST, manifest)
+
+    def _claim_owned(self, *relative_paths):
+        normalized_paths = [
+            _safe_owned_relative(str(value)).as_posix() for value in relative_paths
+        ]
+        for normalized in normalized_paths:
+            self._assert_install_destination(normalized, OWNED_FILE)
+        for normalized in normalized_paths:
+            existing = self._owned_path_types.get(normalized)
+            if existing not in {None, OWNED_FILE}:
+                raise ValueError(f"Owned tree cannot be reclaimed as a file: {normalized}")
+            self._owned_paths.add(normalized)
+            self._owned_path_types[normalized] = OWNED_FILE
+        self._write_ownership_metadata()
+
+    def _claim_owned_tree(self, relative_path):
+        normalized = _safe_owned_relative(str(relative_path)).as_posix()
+        if normalized not in RECURSIVE_OWNED_PATHS:
+            raise ValueError(f"Refusing to claim an unsafe recursive tree: {normalized}")
+        self._assert_install_destination(normalized, OWNED_TREE)
+        existing = self._owned_path_types.get(normalized)
+        if existing not in {None, OWNED_TREE}:
+            raise ValueError(f"Owned file cannot be reclaimed as a tree: {normalized}")
+        self._owned_paths.add(normalized)
+        self._owned_path_types[normalized] = OWNED_TREE
+        self._write_ownership_metadata()
+
+    def _claim_external(self, *paths):
+        resolved = [Path(path).expanduser().resolve(strict=False) for path in paths]
+        for target in resolved:
+            self._assert_external_destination(target)
+        self._external_files.update(str(target) for target in resolved)
+        self._write_ownership_metadata()
 
     def run_command(self, command, label):
         self.log(label)
@@ -118,12 +627,40 @@ class InstallerCore:
         self.log(f"Configuring downloads directory: {self.downloads_dir}")
         if not self.dry_run:
             self.install_dir.mkdir(parents=True, exist_ok=True)
+            if not self._existing_install and any(self.install_dir.iterdir()):
+                raise ValueError(
+                    "The new installation directory became non-empty before ownership was established."
+                )
             self.data_dir.mkdir(parents=True, exist_ok=True)
             self.downloads_dir.mkdir(parents=True, exist_ok=True)
-            (self.data_dir / "Drive_B").mkdir(parents=True, exist_ok=True)
+            ensure_storage_owner(
+                self.data_dir, kind=self._data_owner_kind, require_empty_new=True
+            )
+            drive_b = self.data_dir / "Drive_B"
+            current_entries = {
+                entry.path: entry for entry in owned_path_entries(
+                    self.data_dir, kind=self._data_owner_kind
+                )
+            }
+            if drive_b.exists() or drive_b.is_symlink():
+                existing_entry = current_entries.get(drive_b)
+                if (existing_entry is None or
+                        existing_entry.kind != STORAGE_OWNED_TREE or
+                        drive_b.is_symlink() or
+                        (hasattr(drive_b, "is_junction") and drive_b.is_junction()) or
+                        not drive_b.is_dir()):
+                    raise ValueError(
+                        "Refusing to claim or replace an existing unowned Drive_B item."
+                    )
+            register_owned_path(
+                drive_b, root=self.data_dir, kind=STORAGE_OWNED_TREE
+            )
+            drive_b.mkdir(parents=True, exist_ok=True)
+            self._write_ownership_metadata()
 
     def copy_application(self):
         self.log("Copying pyOS application files")
+        self._claim_owned(*(name for name in APPLICATION_FILES if (SOURCE_DIR / name).exists()))
         for name in APPLICATION_FILES:
             source = SOURCE_DIR / name
             if not source.exists():
@@ -131,11 +668,14 @@ class InstallerCore:
             destination = self.install_dir / name
             self.log(f"  {name}")
             if not self.dry_run and source.resolve() != destination.resolve():
+                self._assert_install_destination(name, OWNED_FILE)
                 shutil.copy2(source, destination)
 
     def create_environment(self):
         self.log(f"Creating isolated Python environment: {self.venv_dir}")
+        self._claim_owned_tree(".venv")
         if not self.dry_run:
+            self._assert_install_destination(".venv", OWNED_TREE)
             venv.EnvBuilder(with_pip=True, clear=False).create(self.venv_dir)
         self.run_command(
             [self.python_executable, "-m", "pip", "install", "--upgrade", "pip"],
@@ -261,9 +801,12 @@ class InstallerCore:
         self.log("Creating pyOS launchers")
         gui_launcher = self.install_dir / "pyOS GUI.cmd"
         cli_launcher = self.install_dir / "pyOS CLI.cmd"
+        self._claim_owned(gui_launcher.name, cli_launcher.name)
         gui_command = f'@echo off\r\n"{self.python_executable}" "{self.install_dir / "pyOSgui.py"}"\r\n'
         cli_command = f'@echo off\r\n"{self.python_executable}" "{self.install_dir / "pyOScli.py"}"\r\n'
         if not self.dry_run:
+            self._assert_install_destination(gui_launcher.name, OWNED_FILE)
+            self._assert_install_destination(cli_launcher.name, OWNED_FILE)
             gui_launcher.write_text(gui_command, encoding="utf-8")
             cli_launcher.write_text(cli_command, encoding="utf-8")
         if self.create_shortcuts and os.name == "nt":
@@ -271,6 +814,7 @@ class InstallerCore:
 
     def create_desktop_shortcuts(self, gui_launcher, cli_launcher):
         desktop = Path(os.environ.get("USERPROFILE", Path.home())) / "Desktop"
+        self._claim_external(desktop / "pyOS GUI.lnk", desktop / "pyOS CLI.lnk")
         script = (
             "$shell = New-Object -ComObject WScript.Shell;"
             f"$s=$shell.CreateShortcut('{desktop / 'pyOS GUI.lnk'}');"
@@ -284,27 +828,13 @@ class InstallerCore:
         )
 
     def write_configuration(self):
-        config = {
-            "configured": True,
-            "install_dir": str(self.install_dir),
-            "data_dir": str(self.data_dir),
-            "downloads_dir": str(self.downloads_dir),
-            "drive_b_dir": str(self.data_dir / "Drive_B"),
-            "python_executable": str(self.python_executable),
-            "installed_at": datetime.now().isoformat(timespec="seconds"),
-            "installer_version": 1,
-            "enabled_apps": self.enabled_apps,
-        }
+        config = self._configuration()
         self.log(f"Writing shared configuration: {CONFIG_FILE}")
         if not self.dry_run:
+            # Ownership metadata must be durable before a shared configuration
+            # advertises the installation as complete.
+            self._write_ownership_metadata(config)
             save_config(config)
-            (self.install_dir / "install_manifest.json").write_text(
-                json.dumps({
-                    **config,
-                    "packages": PYTHON_PACKAGES,
-                    "optional_packages": OPTIONAL_PYTHON_PACKAGES,
-                }, indent=2), encoding="utf-8"
-            )
 
     def install(self):
         self.validate()
@@ -568,9 +1098,10 @@ class SetupWizard:
         """Remove installed program files and configuration while preserving user data."""
         config = self.existing_config or {}
         install_dir = Path(config.get("install_dir", "")).expanduser().resolve()
-        home = Path.home().resolve()
-        if (not install_dir.is_dir() or install_dir in {Path(install_dir.anchor), home} or
-                home.is_relative_to(install_dir)):
+        try:
+            _safe_install_root(install_dir)
+            load_install_ownership(install_dir)
+        except ValueError:
             messagebox.showerror("Uninstall pyOS", "The configured installation directory is unsafe to remove.")
             return
         if not messagebox.askyesno(
@@ -580,30 +1111,17 @@ class SetupWizard:
             icon=messagebox.WARNING,
         ):
             return
-        desktop = Path(os.environ.get("USERPROFILE", home)) / "Desktop"
-        for shortcut in (desktop / "pyOS GUI.lnk", desktop / "pyOS CLI.lnk"):
-            try:
-                shortcut.unlink()
-            except OSError:
-                pass
         try:
-            CONFIG_FILE.unlink(missing_ok=True)
-            if SOURCE_DIR.resolve().is_relative_to(install_dir):
-                command = (
-                    f"Start-Sleep -Seconds 2; Remove-Item -LiteralPath '{str(install_dir).replace(chr(39), chr(39)*2)}' "
-                    "-Recurse -Force"
-                )
-                subprocess.Popen(
-                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
+            runtime = Path(sys.executable).resolve()
+            if os.name == "nt" and runtime.is_relative_to(install_dir):
+                schedule_managed_uninstall(install_dir)
                 self.root.destroy()
             else:
-                shutil.rmtree(install_dir)
+                uninstall_managed_install(install_dir)
                 self.existing_config = None
                 messagebox.showinfo("Uninstall pyOS", "pyOS was uninstalled. User data was preserved.")
                 self.root.destroy()
-        except OSError as error:
+        except (OSError, ValueError) as error:
             messagebox.showerror("Uninstall pyOS", f"Uninstall failed:\n{error}")
 
     def browse_directory(self, variable):
@@ -616,6 +1134,16 @@ class SetupWizard:
         if not all(value.strip() for value in values):
             messagebox.showerror("pyOS Setup", "All locations are required.")
             return False
+        paths = [Path(value).expanduser().resolve() for value in values]
+        for index, first in enumerate(paths):
+            for second in paths[index + 1:]:
+                if paths_overlap(first, second):
+                    messagebox.showerror(
+                        "pyOS Setup",
+                        "Installation, data, and downloads locations must not be the same "
+                        "or contain one another.",
+                    )
+                    return False
         return True
 
     def next_page(self):

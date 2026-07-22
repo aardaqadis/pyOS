@@ -1,44 +1,19 @@
+[CmdletBinding()]
+param(
+    [string]$Version = "2.0.0.0",
+    [string]$ProductVersion = "2.0",
+    [string]$IconPath = "pyos2.0.png",
+    [string]$CompanyName = "pyOS",
+    [string]$FileDescription = "pyOS Desktop Environment",
+    [string]$OutputName = "pyOS",
+    [string]$FactoryNamespace = "pyOS-Release-2.0-Factory",
+    [Alias("Python")]
+    [string]$PythonPath
+)
+
 $ErrorActionPreference = "Stop"
+$BuildScript = Join-Path $PSScriptRoot "exe_tools\Build-pyOSExe.ps1"
 
-$ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Python = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
-
-if (-not (Test-Path -LiteralPath $Python)) {
-    throw "Project Python was not found at $Python. Run pyOS Setup first."
-}
-
-Set-Location -LiteralPath $ProjectRoot
-
-& $Python -m PyInstaller `
-    --noconfirm `
-    --clean `
-    --onefile `
-    --windowed `
-    --name pyOS `
-    --icon "pyos2.0.png" `
-    --add-data "pyOSgui.py;." `
-    --add-data "pyOScli.py;." `
-    --add-data "pyos_config.py;." `
-    --add-data "pyos_auth.py;." `
-    --add-data "pyos_updater.py;." `
-    --add-data "setup.py;." `
-    --add-data "README.md;." `
-    --add-data "LICENSE.md;." `
-    --add-data "pyos2.0.png;." `
-    --hidden-import chess `
-    --hidden-import vlc `
-    --collect-all fido2 `
-    --collect-all PIL `
-    --collect-all mido `
-    --collect-all paramiko `
-    --collect-all pygame `
-    --collect-all psutil `
-    --collect-all pythonmonkey `
-    --collect-all tkinterweb `
-    "pyOSgui.py"
-
-if ($LASTEXITCODE -ne 0) {
-    throw "pyOS executable build failed with exit code $LASTEXITCODE."
-}
-
-Write-Host "Built executable: $(Join-Path $ProjectRoot 'dist\pyOS.exe')"
+# Keep this legacy entry point as a parameter-forwarding compatibility wrapper.
+# All packaging behavior belongs to Build-pyOSExe.ps1 and pyOS.spec.
+& $BuildScript @PSBoundParameters

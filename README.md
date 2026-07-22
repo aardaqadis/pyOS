@@ -26,6 +26,22 @@ The wizard lets you choose:
 - Whether to create desktop shortcuts
 
 Setup creates an isolated virtual environment and installs the Python packages required by pyOS GUI and CLI.
+Source Setup uses the supported dependency ranges declared in `setup.py`, so separate Setup runs can select newer
+compatible packages. The `requirements.lock`, `requirements-dev.lock`, and `requirements-build.lock` files are the
+pinned CI and release-build inputs; use those locks when an exactly repeatable environment is required.
+
+### Development checks
+
+Install the locked development dependencies, then run the test and lint suites from the project root:
+
+```powershell
+python -m pip install -r requirements-dev.lock
+python -m pytest
+python -m ruff check .
+```
+
+Pytest discovers the maintained suite under `tests/`. Generated caches, local environments, and build outputs are
+excluded from both test and lint discovery.
 
 ### Standalone Windows Executable and Disk Usage
 
@@ -36,6 +52,15 @@ Build a factory-isolated release from the project root with:
 
 ```powershell
 .\exe_tools\Build-pyOSExe.ps1
+```
+
+Build dependencies are fixed in `requirements-build.lock`. The build script prefers the project `.venv`, falls
+back to the active `python` command, and also accepts an explicit interpreter:
+
+```powershell
+python -m pip install -r requirements-build.lock
+$Python = (Get-Command python -CommandType Application | Select-Object -First 1).Source
+.\exe_tools\Build-pyOSExe.ps1 -PythonPath $Python
 ```
 
 The result is written to `dist\pyOS.exe`. Release builds use their own
@@ -65,7 +90,7 @@ Approximate sizes for the current Windows build are:
 
 | Item | Size | Needed by an end user? |
 | --- | ---: | --- |
-| `dist\pyOS.exe` | 42.37 MB | Yes, for standalone distribution |
+| `dist\pyOS.exe` | 58.27 MiB | Yes, for standalone distribution |
 | Core source and resource files | 714 KB | No, unless developing or rebuilding |
 | `.venv` development environment | 88.07 MB | No |
 | `build` intermediate files | 53.70 MB | No |
@@ -76,9 +101,34 @@ distribution, only `dist\pyOS.exe` is required. Keep the source tree when develo
 source-based updates.
 
 pyOS checks GitHub for Stable releases or Unstable commits only after the user chooses an update channel, and
-always asks before downloading and installing. Source installations can apply GitHub source archives directly.
-A packaged executable can replace itself only when the corresponding GitHub release publishes a `pyOS.exe`
-asset; otherwise pyOS leaves the executable unchanged and explains that no executable update is available.
+always asks before downloading and installing. Updates must resolve to an immutable full commit ID and publish
+trusted SHA-256 metadata. Source updates are staged under a cross-process lock and rolled back if any overlay
+step fails. A packaged Windows executable is additionally accepted only when its digest and Authenticode
+signature validate; otherwise pyOS leaves the executable unchanged.
+
+Release builders must embed the official commit-to-source-digest bindings and Authenticode signer thumbprint in
+`pyos_updater.py`. Both trust sets are empty in an unconfigured source checkout, so automatic installation fails
+closed until release trust is deliberately provisioned. Interrupted source transactions are durably journaled
+and recovered at the next GUI or Command Center startup.
+
+Signed Windows releases are produced only for numeric `v` tags such as `v2.0.0`. Configure a protected GitHub
+Actions environment named `release`, restrict it to release tags and trusted reviewers, and add both required
+environment secrets:
+
+- `PYOS_SIGNING_PFX_BASE64`: the complete code-signing PFX encoded as base64
+- `PYOS_SIGNING_PFX_PASSWORD`: the PFX import password
+
+The release job fails if either secret is absent or the PFX does not contain exactly one private code-signing
+certificate. It derives and embeds that certificate's SHA-1 thumbprint only in the runner's ephemeral updater
+source, builds with the locked dependency set, signs and verifies the executable, uploads the signed executable
+and post-signing SHA-256 manifest, then creates the GitHub release. `GH_TOKEN` is the short-lived token supplied
+by GitHub Actions; no long-lived personal access token is required.
+
+This Windows tag workflow deliberately does not publish a `pyos-source.zip` asset or populate
+`TRUSTED_SOURCE_RELEASE_BINDINGS`, so automatic source overlays remain disabled. Enabling them requires a
+separate, reviewed publication process that creates a canonical source archive first and pre-provisions its
+immutable commit-to-digest binding in an already trusted build. Publishing an unbound archive would make it
+appear updateable while every secure installation must reject it.
 
 ### Unattended Setup
 
@@ -122,15 +172,21 @@ Authentication still occurs before the requested application opens.
 
 ## Authentication
 
-On first use, pyOS asks you to create a username and password. The account is stored permanently in the configured shared data directory (or in your home directory when running without setup). Passwords are stored as salted PBKDF2-SHA256 hashes, not as plain text.
+On first use, pyOS asks you to create a username and password. The account is stored permanently in the configured shared data directory (or below the dedicated `~/.pyos` root when running without setup). Passwords are stored as salted PBKDF2-SHA256 hashes, not as plain text.
 
 - The desktop starts locked and cannot be used until the correct credentials are entered.
 - Use **Settings > Security** or the desktop context menu to lock the desktop again.
 - The CLI requests credentials immediately before it sends the first command. Authentication remains valid for that CLI session.
-- Use **Settings > Lock CLI** to require the password before the next command.
+- Use **Settings > Lock CLI** to show a full-window modal lock immediately. Explicit locking clears any remembered session and requires fresh authentication before any CLI control can be used.
 - Username and password changes are available from the desktop Security settings and the CLI Settings menu. The current password is required.
 - On supported Windows systems, **Settings > Security** can register a Windows Hello platform passkey. The lock screen then offers passwordless **Use Passkey** authentication while retaining the password as a fallback.
 - Passkey registration and removal require the current password. pyOS stores the public credential; Windows Hello retains the private key.
+
+Administrator and standard-user roles are cooperative pyOS UI policy. Global operations such as Setup,
+updates, and removing all pyOS data require recent administrator authentication, but roles do not isolate
+mutually hostile users at the host operating-system boundary. Python tools and custom apps run with the
+permissions of the signed-in OS account; use separate OS accounts or an OS-protected service where hard
+isolation is required.
 
 ## Desktop Basics
 
@@ -158,14 +214,15 @@ Restart and shutdown actions require confirmation. **Shut Down pyOS** closes the
 
 ### Uninstall pyOS Data
 
-Select **Settings > Security > Uninstall pyOS** to reset and remove pyOS data without removing the program or its Python dependencies. The operation requires the current account password followed by typing `UNINSTALL` exactly.
+Select **Settings > Security > Uninstall pyOS** to reset and remove pyOS data without removing the program or its Python dependencies. The operation requires fresh administrator authentication followed by typing `UNINSTALL` exactly.
 
 It permanently removes:
 
 - The pyOS account, password hash, registered passkey metadata, GUI and CLI settings
 - App Maker applications and modding backups
-- Drive A, Drive B, and the directories of all custom drives registered by Virtual Drive Manager
-- Other contents of a dedicated pyOS data directory
+- The current session's temporary Drive A
+- Manifest-listed pyOS data, including Drive B
+- Registered custom-drive directories only when their pyOS ownership markers validate
 - The shared pyOS installation-location configuration
 
 It preserves:
@@ -174,7 +231,7 @@ It preserves:
 - The configured Downloads directory and its files
 - Unrelated files when pyOS data was configured directly in a shared location such as the home directory
 
-For safety, pyOS refuses to recursively delete filesystem roots, the user home directory, the installation directory, the configured Downloads directory, or a directory containing one of those locations. After uninstalling data, pyOS closes. Running it again starts first-use account and setup behavior.
+For safety, pyOS removes only manifest-listed paths or roots with matching pyOS ownership markers, refuses unsafe roots and escaping manifest entries, and deletes the primary configuration last. Unknown files are preserved. After uninstalling data, pyOS closes. Running it again starts first-use account and setup behavior.
 
 ## Desktop Menu
 
@@ -292,12 +349,12 @@ Changes to pyOS source generally require restarting the desktop. Source mods exe
 
 #### App Maker
 
-Select **App Maker** from the Modding Environment to create applications that run in embedded pyOS windows.
+Select **App Maker** from the Modding Environment to create applications that launch in dedicated child processes.
 
 - Start from a working Python template.
 - Create, edit, rename, validate, run, and delete apps.
 - Show every saved app as an individual desktop launcher; launchers update immediately after saving, renaming, or deleting an app.
-- Run an app immediately with **Run Inside pyOS**.
+- Run an app immediately with **Run Isolated**.
 - Store custom apps in the shared pyOS data directory under `apps`.
 - Back up overwritten custom apps automatically.
 
@@ -310,7 +367,7 @@ def build(app, window):
     tk.Label(window.content, text="Hello from pyOS").pack(pady=20)
 ```
 
-The runtime supplies `tk`, `ttk`, and `messagebox`. The `app` argument is the active `DesktopGUI`, and `window.content` is the app's parent frame. App Maker code is unrestricted Python and runs inside the desktop process; a faulty or malicious app can access files, network resources, credentials available to the process, or destabilize pyOS.
+The runtime supplies `tk`, `ttk`, and `messagebox`. The `app` argument is a deliberately limited host exposing theme preferences, `create_window()`, and `show_notification()`; `window.content` is the app's parent frame. The separate process prevents a crash or blocking event loop from freezing the desktop, but it is not an OS sandbox. App Maker code remains unrestricted Python with the host user's file and network permissions, so only run code you trust.
 
 ### Weather
 
@@ -376,7 +433,9 @@ Messenger is LAN-only: discovery uses local broadcasts and messages use direct T
 
 ### SSH Client
 
-Open **SSH Client** from the desktop, Applications menu, context menu, or with `--app ssh`.
+Open **SSH Client** from the desktop, Applications menu, context menu, or with `--app ssh`. Setup installs the
+fixed Paramiko 5 line; the client refuses to run with Paramiko 4.0.0 or older because those releases are affected
+by CVE-2026-44405.
 
 - Connect to SSH servers with a password, private key and optional passphrase, or an SSH agent.
 - Use the embedded interactive command terminal without leaving the pyOS desktop.
@@ -462,7 +521,7 @@ Custom drive definitions are stored as `virtual_drives.json` beside the GUI sett
 The shared setup configuration is stored in:
 
 ```text
-~/.pyos_install.json
+~/.pyos/install.json
 ```
 
 ## Command Center
@@ -502,8 +561,8 @@ play <file>               Play audio or video
 
 ### Desktop Applications
 
-The Command Center's **Apps** menu and CLI commands can launch every pyOS desktop
-application directly. Run `apps` to list them, or use commands such as
+The Command Center's **Apps** menu and CLI commands can launch enabled pyOS desktop
+applications directly. Run `apps` to list them, or use commands such as
 `calculator`, `messenger`, `ssh`, `games`, `ide`, `notepad`, `images`,
 `desktop_browser`, and `desktop_media`. The GUI also accepts `--app weather`,
 `--app news`, `--app modding`, `--app virtual-drives`, and `--app pyai`.

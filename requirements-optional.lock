@@ -1,0 +1,4 @@
+# Optional setup.py dependency.  It is separate because Setup intentionally
+# allows installation to continue when a compatible native wheel is absent.
+miniupnpc==2.3.3
+

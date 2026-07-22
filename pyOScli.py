@@ -3,6 +3,7 @@ from tkinter import ttk, scrolledtext, messagebox, filedialog, simpledialog
 import os
 import subprocess
 import threading
+import queue
 from pathlib import Path
 from datetime import datetime
 import json
@@ -11,23 +12,68 @@ import shutil
 import tempfile
 import sys
 import hashlib
+import errno
 import shlex
+import signal
 import webbrowser
 import urllib.error
 import urllib.parse
 import urllib.request
+import time
+from dataclasses import dataclass, field
+from collections import deque
 
 from tkinter import colorchooser
 
 from pyos_config import (
+    ConfigurationError,
+    JSONPersistenceError,
+    StorageOwnershipError,
+    atomic_write_json,
     get_cli_settings_path,
-    get_downloads_dir,
     get_drive_b_dir,
     get_gui_settings_path,
-    get_profile_dir,
+    load_config,
     relaunch_in_configured_environment,
 )
-from pyos_auth import authenticate, change_credentials_dialog, has_account
+from pyos_auth import (
+    CredentialStoreError,
+    authenticate,
+    change_credentials_dialog,
+    clear_remembered_session,
+    has_account,
+)
+from pyos_updater import recover_source_update
+
+
+class CommandCancelled(RuntimeError):
+    """Raised internally when a lock or shutdown invalidates queued work."""
+
+
+@dataclass
+class CommandTask:
+    """Enqueue-time path/auth context plus a cooperative cancel flag.
+
+    A ``cd`` command may update its own path before committing that value to the
+    UI; commands already waiting behind it retain their independent snapshots.
+    """
+
+    command: str
+    working_directory: str
+    drive: str
+    auth_generation: int
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+
+@dataclass
+class AuxiliaryTask:
+    """Bounded non-command work such as a Browser Inspector fetch."""
+
+    work: object
+    on_success: object
+    on_error: object
+    auth_generation: int
+    cancel_event: threading.Event = field(default_factory=threading.Event)
 
 def check_psutil():
     """Dynamically check if psutil is available"""
@@ -40,7 +86,7 @@ def check_psutil():
 class ThemeSettings:
     """Handle theme and display settings"""
     def __init__(self):
-        self.settings_file = str(get_cli_settings_path())
+        self.settings_file = Path(get_cli_settings_path())
         self.defaults = {
             "console_bg": "#000000",
             "console_fg": "#ffffff",
@@ -57,25 +103,54 @@ class ThemeSettings:
         self.settings = self.load_settings()
     
     def load_settings(self):
-        """Load settings from file"""
-        if os.path.exists(self.settings_file):
+        """Load validated settings, recovering only from a validated backup."""
+        if self.settings_file.exists():
             try:
-                with open(self.settings_file, 'r') as f:
-                    loaded = json.load(f)
-                    if loaded.get("style_version") != self.defaults["style_version"]:
-                        return self.defaults.copy()
-                    return {**self.defaults, **loaded}
-            except:
-                return self.defaults.copy()
+                loaded = json.loads(self.settings_file.read_text(encoding="utf-8"))
+                return self._validate_settings(loaded)
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as error:
+                backup = self.settings_file.with_name(self.settings_file.name + ".bak")
+                try:
+                    loaded = json.loads(backup.read_text(encoding="utf-8"))
+                    recovered = self._validate_settings(loaded)
+                except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as backup_error:
+                    raise JSONPersistenceError(
+                        f"CLI settings and their backup are invalid: {self.settings_file}"
+                    ) from backup_error
+                atomic_write_json(self.settings_file, recovered, mode=0o600)
+                return recovered
         return self.defaults.copy()
+
+    def _validate_settings(self, loaded):
+        if not isinstance(loaded, dict):
+            raise ValueError("CLI settings must be a JSON object")
+        if loaded.get("style_version") != self.defaults["style_version"]:
+            # A previous schema is not corrupt, but its values are not trusted in
+            # the current UI.  Keep the documented monochrome defaults.
+            return self.defaults.copy()
+        result = self.defaults.copy()
+        for key in ("console_bg", "console_fg", "gui_bg", "gui_fg", "list_bg", "list_fg"):
+            value = loaded.get(key, result[key])
+            if not isinstance(value, str) or not value or len(value) > 64:
+                raise ValueError(f"Invalid CLI colour setting: {key}")
+            result[key] = value
+        for key in ("console_font", "gui_font"):
+            value = loaded.get(key, result[key])
+            if not isinstance(value, str) or not value.strip() or len(value) > 100:
+                raise ValueError(f"Invalid CLI font setting: {key}")
+            result[key] = value
+        for key in ("console_fontsize", "gui_fontsize"):
+            value = loaded.get(key, result[key])
+            if isinstance(value, bool) or not isinstance(value, int) or not 8 <= value <= 72:
+                raise ValueError(f"Invalid CLI font size setting: {key}")
+            result[key] = value
+        result["style_version"] = self.defaults["style_version"]
+        return result
     
     def save_settings(self):
-        """Save settings to file"""
-        try:
-            with open(self.settings_file, 'w') as f:
-                json.dump(self.settings, f, indent=2)
-        except Exception as e:
-            print(f"Could not save settings: {e}")
+        """Validate and atomically persist settings under the storage lock."""
+        self.settings = self._validate_settings(self.settings)
+        atomic_write_json(self.settings_file, self.settings, mode=0o600, backup=True)
     
     def reset_to_defaults(self):
         """Reset all settings to defaults"""
@@ -86,11 +161,18 @@ class VirtualDrive:
     def __init__(self, name, is_temporary=False, custom_path=None):
         self.name = name
         self.is_temporary = is_temporary
+        self._owns_temporary_path = False
+        self._temporary_directory = None
         
         if custom_path is not None:
             self.path = str(Path(custom_path))
         elif is_temporary:
-            self.path = os.path.join(tempfile.gettempdir(), f"pyOS_Drive_{name}")
+            self._temporary_directory = tempfile.TemporaryDirectory(
+                prefix=f"pyOS_Drive_{name}_",
+                ignore_cleanup_errors=False,
+            )
+            self.path = self._temporary_directory.name
+            self._owns_temporary_path = True
         else:
             self.path = os.path.join(os.path.expanduser("~"), f".pyOS_Drive_{name}")
         
@@ -99,17 +181,105 @@ class VirtualDrive:
     def get_path(self):
         return self.path
     
-    def get_usage(self):
+    def get_usage(self, cancel_event=None):
         total = 0
         for dirpath, dirnames, filenames in os.walk(self.path):
+            if cancel_event is not None and cancel_event.is_set():
+                raise CommandCancelled()
             for filename in filenames:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise CommandCancelled()
                 filepath = os.path.join(dirpath, filename)
                 total += os.path.getsize(filepath)
         return total
 
+    def cleanup(self):
+        """Remove a session-owned temporary drive without following replacement links."""
+        if not self.is_temporary or not self._owns_temporary_path:
+            return True
+        try:
+            self._temporary_directory.cleanup()
+            self._owns_temporary_path = False
+            self._temporary_directory = None
+            return True
+        except OSError:
+            # A later shutdown/finalizer attempt can retry cleanup.
+            return False
+
 class PythonOS:
+    COMMAND_QUEUE_LIMIT = 8
+    AUXILIARY_QUEUE_LIMIT = 8
+    AUXILIARY_WORKERS = 2
+    UI_QUEUE_LIMIT = 1024
+    SHUTDOWN_WAIT_SECONDS = 3.0
+    # Central policy keeps optional-app and mutation decisions out of the
+    # legacy conditional dispatcher.  Unknown commands are external shell
+    # commands and therefore conservatively treated as mutations.
+    COMMAND_POLICIES = {
+        "play": {"optional_app": "media"},
+        "media": {"optional_app": "media"},
+        "browser": {"optional_app": "browser"},
+        "browse": {"optional_app": "browser"},
+        "inspect": {"optional_app": "browser"},
+        "savepage": {"optional_app": "browser", "mutates": True},
+        "download_page": {"optional_app": "browser", "mutates": True},
+        "desktop_browser": {"optional_app": "browser"},
+        "desktop_media": {"optional_app": "media"},
+        "games": {"optional_app": "games"}, "snake": {"optional_app": "games"},
+        "sudoku": {"optional_app": "games"}, "chess": {"optional_app": "games"},
+        "messenger": {"optional_app": "messenger"}, "ide": {"optional_app": "ide"},
+        "weather": {"optional_app": "weather"}, "news": {"optional_app": "news"},
+        "pyai": {"optional_app": "pyai"}, "modding": {"optional_app": "modding"},
+        "mkdir": {"mutates": True}, "del": {"mutates": True}, "rm": {"mutates": True},
+        "copy": {"mutates": True}, "cp": {"mutates": True},
+        "move": {"mutates": True}, "mv": {"mutates": True},
+        "write": {"mutates": True}, "nano": {"mutates": True},
+        "append": {"mutates": True}, "rename": {"mutates": True},
+        "touch": {"mutates": True}, "archive": {"mutates": True},
+        "extract": {"mutates": True}, "download": {"mutates": True},
+        "monochrome": {"mutates": True}, "color": {"mutates": True},
+        "font": {"mutates": True}, "fontsize": {"mutates": True},
+    }
+    BUILTIN_COMMANDS = {
+        "cd", "drives", "driveinfo", "drive_info", "open", "start", "explorer", "files",
+        "play", "media", "apps", "games", "snake", "sudoku", "chess", "messenger",
+        "calculator", "calc", "images", "imageviewer", "notepad", "editor", "ide",
+        "filemanager", "desktop_browser", "desktop_media", "pyos_settings", "dispenser",
+        "browser", "browse", "inspect", "savepage", "download_page", "history", "hash",
+        "date", "time", "whoami", "gui_settings", "desktop_settings", "monochrome", "exit",
+        "quit", "cls", "clear", "dir", "ls", "tree", "mkdir", "del", "rm", "copy", "cp",
+        "move", "mv", "pwd", "echo", "type", "cat", "write", "nano", "append", "rename",
+        "info", "lines", "wc", "grep", "search_text", "touch", "head", "tail", "archive",
+        "extract", "files_only", "dirs_only", "hexdump", "xxd", "ipconfig", "ifconfig",
+        "netstat", "ping", "network", "download", "sysinfo", "diskspace", "tasklist", "ps",
+        "search", "find", "theme", "settings", "color", "font", "fontsize", "theme_info",
+        "deskgui", "help", "commands", "weather", "news", "pyai", "modding",
+    }
+
     def __init__(self, root):
         self.root = root
+        self._ui_thread_id = threading.get_ident()
+        self._ui_events = queue.Queue(maxsize=self.UI_QUEUE_LIMIT)
+        self._command_tasks = queue.Queue(maxsize=self.COMMAND_QUEUE_LIMIT)
+        self._auxiliary_tasks = queue.Queue(maxsize=self.AUXILIARY_QUEUE_LIMIT)
+        self._command_stop = threading.Event()
+        self._auxiliary_stop = threading.Event()
+        self._command_active = threading.Event()
+        self._active_command_lock = threading.Lock()
+        self._active_command_task = None
+        self._active_auxiliary_lock = threading.Lock()
+        self._active_auxiliary_tasks = {}
+        self._worker_local = threading.local()
+        self._state_lock = threading.RLock()
+        self._mutation_lock = threading.RLock()
+        self._children_lock = threading.Lock()
+        self._child_processes = set()
+        self._cleanup_thread = None
+        self._closing = False
+        self._locked = False
+        self._auth_generation = 0
+        self._lock_overlay = None
+        self._ui_after = None
         self.root.title("Python OS - Monochrome Command Center")
         self.root.geometry("1200x800")
         
@@ -130,9 +300,14 @@ class PythonOS:
         self.history_index = -1
         self.authenticated = False
         self.authenticated_username = None
+        configured_apps = load_config().get("enabled_apps")
+        self.enabled_apps = (
+            {str(app_id).casefold() for app_id in configured_apps}
+            if isinstance(configured_apps, list) else None
+        )
         
         # Virtual Drives
-        self.drive_a = VirtualDrive("A", custom_path=get_profile_dir() / "Drive_A")
+        self.drive_a = VirtualDrive("A", is_temporary=True)
         self.drive_b = VirtualDrive("B", is_temporary=False, custom_path=get_drive_b_dir())  # Permanent storage
         self.drives = {
             "C": str(Path.home()),
@@ -143,6 +318,23 @@ class PythonOS:
         self.current_drive = "C"
         
         self.setup_ui()
+        self._command_worker = threading.Thread(
+            target=self._command_worker_loop,
+            name="pyOS-command-worker",
+            daemon=True,
+        )
+        self._command_worker.start()
+        self._auxiliary_workers = []
+        for index in range(self.AUXILIARY_WORKERS):
+            worker = threading.Thread(
+                target=self._auxiliary_worker_loop,
+                name=f"pyOS-auxiliary-worker-{index + 1}",
+                daemon=True,
+            )
+            worker.start()
+            self._auxiliary_workers.append(worker)
+        self._ui_after = self.root.after(25, self._drain_ui_events)
+        self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
     
     def setup_ui(self):
         style = ttk.Style(self.root)
@@ -156,6 +348,7 @@ class PythonOS:
 
         # Top menu bar
         menubar = tk.Menu(self.root)
+        self.menubar = menubar
         self.root.config(menu=menubar)
         
         file_menu = tk.Menu(menubar, tearoff=0)
@@ -163,7 +356,7 @@ class PythonOS:
         file_menu.add_command(label="Open Directory", command=self.open_directory)
         file_menu.add_command(label="Clear Console", command=self.clear_console)
         file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.root.quit)
+        file_menu.add_command(label="Exit", command=self.shutdown)
         
         drive_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Drives", menu=drive_menu)
@@ -191,13 +384,20 @@ class PythonOS:
             ("Media Player", "media"),
             ("Python IDE", "ide"),
             ("Internet Browser", "browser"),
+            ("Weather", "weather"),
+            ("News", "news"),
+            ("pyAI", "pyai"),
+            ("Modding Tools", "modding"),
             ("Dispenser", "dispenser"),
         ):
+            if not self.is_app_enabled(app_name):
+                continue
             apps_menu.add_command(
                 label=label,
                 command=lambda name=app_name: self.open_desktop_app(name),
             )
-        apps_menu.add_command(label="Browser Inspector", command=self.open_browser_inspector)
+        if self.is_app_enabled("browser"):
+            apps_menu.add_command(label="Browser Inspector", command=self.open_browser_inspector)
         apps_menu.add_command(label="Open Current Folder", command=lambda: self._open_explorer(self.current_directory))
         
         network_menu = tk.Menu(menubar, tearoff=0)
@@ -299,14 +499,455 @@ class PythonOS:
         self.log_message("Type 'help' for commands\n")
         self.log_message("pyOS - v1.0.1a\n\n")
         self.command_input.focus()
+
+    def _on_ui_thread(self):
+        return threading.get_ident() == self._ui_thread_id
+
+    def _post_ui(self, callback, *args, **kwargs):
+        """Run a callback on Tk's owning thread without calling Tk from a worker."""
+        if self._closing:
+            return False
+        if self._on_ui_thread():
+            callback(*args, **kwargs)
+            return True
+        while not self._closing:
+            try:
+                self._ui_events.put((callback, args, kwargs), timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _post_command_ui(self, callback, *args, **kwargs):
+        """Post a command result that expires on lock/account generation change."""
+        task = self._current_command_task()
+        if task is None:
+            return self._post_ui(callback, *args, **kwargs)
+        if not self._task_is_active(task):
+            return False
+        return self._post_ui(
+            self._run_command_ui_if_current,
+            task.auth_generation,
+            callback,
+            args,
+            kwargs,
+        )
+
+    def _run_command_ui_if_current(self, auth_generation, callback, args, kwargs):
+        if (self._closing or self._locked or not self.authenticated
+                or auth_generation != self._auth_generation):
+            return
+        callback(*args, **kwargs)
+
+    def _drain_ui_events(self):
+        """Apply a bounded batch of worker results on Tk's event loop."""
+        self._ui_after = None
+        for _ in range(100):
+            try:
+                callback, args, kwargs = self._ui_events.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback(*args, **kwargs)
+            except Exception as error:
+                if not self._closing:
+                    print(f"Could not apply CLI worker result: {error}", file=sys.stderr)
+            finally:
+                self._ui_events.task_done()
+        if not self._closing:
+            self._ui_after = self.root.after(25, self._drain_ui_events)
+
+    def _command_worker_loop(self):
+        """Serialize commands from the bounded queue to protect shared CLI state."""
+        while not self._command_stop.is_set():
+            try:
+                task = self._command_tasks.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                if task is None:
+                    return
+                if not self._task_is_active(task):
+                    continue
+                with self._active_command_lock:
+                    self._active_command_task = task
+                self._command_active.set()
+                self._worker_local.command_task = task
+                self._run_command(task.command)
+            except CommandCancelled:
+                pass
+            finally:
+                self._worker_local.command_task = None
+                with self._active_command_lock:
+                    if self._active_command_task is task:
+                        self._active_command_task = None
+                self._command_active.clear()
+                self._command_tasks.task_done()
+
+    def _auxiliary_worker_loop(self):
+        """Run a fixed number of cancellable auxiliary jobs."""
+        while not self._auxiliary_stop.is_set():
+            try:
+                task = self._auxiliary_tasks.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                if task is None:
+                    return
+                if not self._auxiliary_task_is_active(task):
+                    continue
+                with self._active_auxiliary_lock:
+                    self._active_auxiliary_tasks[id(task)] = task
+                try:
+                    result = task.work(task.cancel_event)
+                except CommandCancelled:
+                    continue
+                except Exception as error:
+                    if self._auxiliary_task_is_active(task):
+                        self._post_ui(self._finish_auxiliary_task, task, False, error)
+                else:
+                    if self._auxiliary_task_is_active(task):
+                        self._post_ui(self._finish_auxiliary_task, task, True, result)
+            finally:
+                if task is not None:
+                    with self._active_auxiliary_lock:
+                        self._active_auxiliary_tasks.pop(id(task), None)
+                self._auxiliary_tasks.task_done()
+
+    def _finish_auxiliary_task(self, task, succeeded, value):
+        if not self._auxiliary_task_is_active(task):
+            return
+        callback = task.on_success if succeeded else task.on_error
+        callback(value)
+
+    def _submit_auxiliary(self, work, on_success, on_error):
+        """Queue bounded auxiliary work without creating per-click threads."""
+        if self._closing or self._locked or not self.authenticated:
+            return None
+        task = AuxiliaryTask(work, on_success, on_error, self._auth_generation)
+        try:
+            self._auxiliary_tasks.put_nowait(task)
+        except queue.Full:
+            return None
+        return task
+
+    def _current_command_task(self):
+        return getattr(self._worker_local, "command_task", None)
+
+    def _task_is_active(self, task):
+        return bool(
+            task is not None
+            and not task.cancel_event.is_set()
+            and not self._closing
+            and not self._locked
+            and self.authenticated
+            and task.auth_generation == self._auth_generation
+        )
+
+    def _auxiliary_task_is_active(self, task):
+        return bool(
+            task is not None
+            and not task.cancel_event.is_set()
+            and not self._closing
+            and not self._locked
+            and self.authenticated
+            and task.auth_generation == self._auth_generation
+        )
+
+    def _require_active_task(self, task=None):
+        task = task or self._current_command_task()
+        if task is not None and not self._task_is_active(task):
+            raise CommandCancelled()
+        if self._closing or self._locked or not self.authenticated:
+            raise CommandCancelled()
+        return task
+
+    def _working_directory(self):
+        task = self._current_command_task()
+        return task.working_directory if task is not None else self.current_directory
+
+    def _working_drive(self):
+        task = self._current_command_task()
+        return task.drive if task is not None else self.current_drive
+
+    def _perform_mutation(self, action, task=None):
+        """Make the lock boundary atomic with respect to a filesystem mutation."""
+        with self._mutation_lock:
+            self._require_active_task(task)
+            return action()
+
+    def _cancel_active_work(self):
+        with self._active_command_lock:
+            if self._active_command_task is not None:
+                self._active_command_task.cancel_event.set()
+        self._cancel_auxiliary_work()
+        self._terminate_children()
+
+    def _cancel_auxiliary_work(self):
+        with self._active_auxiliary_lock:
+            for active in self._active_auxiliary_tasks.values():
+                active.cancel_event.set()
+        while True:
+            try:
+                queued = self._auxiliary_tasks.get_nowait()
+            except queue.Empty:
+                break
+            else:
+                if queued is not None:
+                    queued.cancel_event.set()
+                self._auxiliary_tasks.task_done()
+
+    def _register_child(self, process):
+        with self._children_lock:
+            self._child_processes.add(process)
+        return process
+
+    def _spawn_process(self, args, **kwargs):
+        with self._mutation_lock:
+            self._require_active_task()
+            if os.name == "nt":
+                kwargs.setdefault(
+                    "creationflags", getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                )
+            else:
+                kwargs.setdefault("start_new_session", True)
+            return self._register_child(subprocess.Popen(args, **kwargs))
+
+    @staticmethod
+    def _stop_process_tree(process, *, force=False):
+        if process.poll() is not None:
+            return
+        if os.name != "nt":
+            try:
+                group = os.getpgid(process.pid)
+                os.killpg(group, signal.SIGKILL if force else signal.SIGTERM)
+                return
+            except (OSError, ProcessLookupError):
+                pass
+        if force and os.name == "nt":
+            try:
+                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                killer = subprocess.Popen(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=flags,
+                )
+                killer.wait(timeout=1)
+                return
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        try:
+            process.kill() if force else process.terminate()
+        except OSError:
+            pass
+
+    def _run_tracked_capture(self, args, *, cwd=None, timeout=15, shell=False):
+        """Run a cancellable child process registered with CLI lifecycle."""
+        task = self._current_command_task()
+        with self._mutation_lock:
+            self._require_active_task(task)
+            process = self._spawn_process(
+                args,
+                cwd=cwd,
+                shell=shell,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                self._require_active_task(task)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._stop_process_tree(process)
+                    try:
+                        process.wait(timeout=0.5)
+                    except (OSError, subprocess.TimeoutExpired):
+                        self._stop_process_tree(process, force=True)
+                    raise subprocess.TimeoutExpired(args, timeout)
+                try:
+                    stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+                    return process.returncode, stdout, stderr
+                except subprocess.TimeoutExpired:
+                    continue
+        except CommandCancelled:
+            if process.poll() is None:
+                self._stop_process_tree(process)
+                try:
+                    process.wait(timeout=0.5)
+                except (OSError, subprocess.TimeoutExpired):
+                    self._stop_process_tree(process, force=True)
+            raise
+        finally:
+            self._reap_children()
+
+    def _reap_children(self):
+        with self._children_lock:
+            finished = {process for process in self._child_processes if process.poll() is not None}
+            self._child_processes.difference_update(finished)
+
+    def _terminate_children(self):
+        with self._children_lock:
+            children = tuple(self._child_processes)
+        for process in children:
+            if process.poll() is None:
+                self._stop_process_tree(process)
+        deadline = time.monotonic() + 0.75
+        for process in children:
+            if process.poll() is not None:
+                continue
+            try:
+                process.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except (OSError, subprocess.TimeoutExpired):
+                self._stop_process_tree(process, force=True)
+        self._reap_children()
+
+    def _discard_queued_commands(self):
+        while True:
+            try:
+                task = self._command_tasks.get_nowait()
+            except queue.Empty:
+                return
+            else:
+                if task is not None:
+                    task.cancel_event.set()
+                self._command_tasks.task_done()
+
+    @staticmethod
+    def _optional_app_id(app_name):
+        return {
+            "browser": "browser",
+            "desktop_browser": "browser",
+            "media": "media",
+            "desktop_media": "media",
+            "messenger": "messenger",
+            "games": "games",
+            "snake": "games",
+            "sudoku": "games",
+            "chess": "games",
+            "ide": "ide",
+            "pyai": "pyai",
+            "weather": "weather",
+            "news": "news",
+            "modding": "modding",
+        }.get(str(app_name).casefold())
+
+    def is_app_enabled(self, app_name):
+        optional_id = self._optional_app_id(app_name)
+        return optional_id is None or self.enabled_apps is None or optional_id in self.enabled_apps
+
+    def _optional_command_enabled(self, command_name):
+        required = self.COMMAND_POLICIES.get(
+            str(command_name).casefold(), {}
+        ).get("optional_app")
+        return required is None or self.is_app_enabled(required)
+
+    def _command_policy(self, command_name):
+        name = str(command_name).casefold()
+        policy = dict(self.COMMAND_POLICIES.get(name, {}))
+        if name not in self.BUILTIN_COMMANDS:
+            policy["mutates"] = True
+            policy["external"] = True
+        return policy
+
+    def _commit_task_directory(self, task, directory, drive=None):
+        self._require_active_task(task)
+        task.working_directory = os.path.abspath(directory)
+        if drive is not None:
+            task.drive = drive
+        self._post_ui(
+            self._apply_task_directory,
+            task.working_directory,
+            task.drive,
+            task.auth_generation,
+        )
+
+    def _apply_task_directory(self, directory, drive, auth_generation):
+        if self._closing or self._locked or auth_generation != self._auth_generation:
+            return
+        self.current_directory = directory
+        self.current_drive = drive
+        self._update_directory_widgets()
+
+    def shutdown(self):
+        """Cancel and join active work before session storage can be removed."""
+        if self._closing:
+            return
+        with self._state_lock:
+            self._closing = True
+            self._auth_generation += 1
+            self._command_stop.set()
+            self._auxiliary_stop.set()
+            self._discard_queued_commands()
+            self._cancel_active_work()
+        try:
+            self._command_tasks.put_nowait(None)
+        except queue.Full:
+            pass
+        for _ in self._auxiliary_workers:
+            try:
+                self._auxiliary_tasks.put_nowait(None)
+            except queue.Full:
+                break
+        if self._ui_after is not None:
+            try:
+                self.root.after_cancel(self._ui_after)
+            except tk.TclError:
+                pass
+            self._ui_after = None
+        if self._lock_overlay is not None:
+            try:
+                self._lock_overlay.grab_release()
+            except tk.TclError:
+                pass
+        deadline = time.monotonic() + self.SHUTDOWN_WAIT_SECONDS
+        workers = [self._command_worker, *self._auxiliary_workers]
+        for worker in workers:
+            if worker is threading.current_thread():
+                continue
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        survivors = [worker for worker in workers if worker.is_alive()]
+        if not survivors:
+            self.drive_a.cleanup()
+        else:
+            # Never delete Drive A under a worker still using its queued path.
+            # The coordinator waits off the Tk thread and performs the cleanup
+            # only after every tracked worker has actually stopped.
+            def finish_cleanup():
+                for worker in survivors:
+                    worker.join()
+                self.drive_a.cleanup()
+
+            self._cleanup_thread = threading.Thread(
+                target=finish_cleanup,
+                name="pyOS-drive-a-cleanup",
+                # Keep the process alive long enough to honour Drive A's
+                # cleanup contract after the bounded Tk-thread wait expires.
+                daemon=False,
+            )
+            self._cleanup_thread.start()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
     
     def update_time(self):
         """Update time display"""
+        if self._closing:
+            return
+        self._reap_children()
         self.time_var.set(datetime.now().strftime("%H:%M:%S"))
         self.root.after(1000, self.update_time)
     
     def open_theme_settings(self):
         """Open theme settings dialog"""
+        if not self._on_ui_thread():
+            self._post_command_ui(self.open_theme_settings)
+            return
+        if self._locked or self._closing:
+            return
         settings_window = tk.Toplevel(self.root)
         settings_window.title("Theme Settings")
         settings_window.geometry("500x600")
@@ -383,6 +1024,11 @@ class PythonOS:
     
     def apply_theme_changes(self):
         """Apply theme changes to UI"""
+        if not self._on_ui_thread():
+            self._post_command_ui(self.apply_theme_changes)
+            return
+        if self._closing or self._locked:
+            return
         self.console.config(bg=self.theme.settings["console_bg"], 
                            fg=self.theme.settings["console_fg"],
                            font=(self.theme.settings["console_font"], self.theme.settings["console_fontsize"]))
@@ -393,20 +1039,48 @@ class PythonOS:
     
     def save_theme_settings(self):
         """Save theme settings"""
-        self.theme.save_settings()
+        try:
+            self.theme.save_settings()
+        except (ConfigurationError, JSONPersistenceError, StorageOwnershipError, OSError) as error:
+            messagebox.showerror(
+                "CLI Settings Recovery Required",
+                f"pyOS could not safely save CLI settings:\n\n{error}",
+                parent=self.root,
+            )
+            return
         self.log_message("Settings saved!\n")
     
     def reset_theme(self):
         """Reset theme to defaults"""
-        self.theme.reset_to_defaults()
+        try:
+            self.theme.reset_to_defaults()
+        except (ConfigurationError, JSONPersistenceError, StorageOwnershipError, OSError) as error:
+            messagebox.showerror(
+                "CLI Settings Recovery Required",
+                f"pyOS could not safely reset CLI settings:\n\n{error}",
+                parent=self.root,
+            )
+            return
         self.apply_theme_changes()
         self.log_message("Theme reset to defaults!\n")
 
     def ensure_authenticated(self):
         """Authenticate once for the current CLI session."""
+        if self._closing:
+            return False
+        if self._locked:
+            return self.unlock_cli()
         if self.authenticated:
             return True
-        username = authenticate(self.root, cancellable=True)
+        try:
+            username = authenticate(self.root, cancellable=True, allow_remembered=False)
+        except (CredentialStoreError, ConfigurationError, JSONPersistenceError, StorageOwnershipError) as error:
+            messagebox.showerror(
+                "pyOS Account Recovery Required",
+                f"pyOS detected invalid account state and failed closed:\n\n{error}",
+                parent=self.root,
+            )
+            return False
         if not username:
             return False
         self.authenticated = True
@@ -416,17 +1090,129 @@ class PythonOS:
         return True
 
     def lock_cli(self):
-        """Require authentication again before the next command."""
+        """Cover the entire CLI and require a fresh authentication to resume."""
+        if not self._on_ui_thread():
+            self._post_ui(self.lock_cli)
+            return
+        if self._closing or self._locked:
+            return
+        with self._state_lock:
+            self._locked = True
+            self._auth_generation += 1
+            self._discard_queued_commands()
+            self._cancel_active_work()
+        remembered_clear_error = None
+        try:
+            clear_remembered_session()
+        except Exception as error:
+            # Locking must fail closed even if persistent state cannot be updated.
+            remembered_clear_error = str(error)
         self.authenticated = False
         self.authenticated_username = None
         self.user_var.set("User: Locked")
-        self.log_message("CLI locked. The next command requires authentication.\n")
+        self.input_var.set("")
+        self.log_message("CLI locked. Fresh authentication is required to continue.\n")
+        for child in list(self.root.winfo_children()):
+            if isinstance(child, tk.Toplevel):
+                child.destroy()
+        self.root.config(menu="")
+
+        overlay = tk.Frame(self.root, bg="#000000", bd=0, takefocus=True)
+        overlay.place(x=0, y=0, relwidth=1, relheight=1)
+        card = tk.Frame(overlay, bg="#ffffff", bd=3, relief=tk.RAISED, padx=35, pady=30)
+        card.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+        tk.Label(
+            card, text="PYTHON OS COMMAND CENTER", bg="#ffffff", fg="#000000",
+            font=("Courier New", 15, "bold"),
+        ).pack(pady=(0, 18))
+        tk.Label(
+            card, text="CLI LOCKED", bg="#ffffff", fg="#000000",
+            font=("Courier New", 22, "bold"),
+        ).pack(pady=(0, 8))
+        lock_message = "Authenticate again to use files, menus, or commands."
+        if remembered_clear_error:
+            lock_message += "\nRemembered sign-in could not be cleared; this unlock will still require credentials."
+        tk.Label(
+            card, text=lock_message,
+            bg="#ffffff", fg="#000000", font=("Courier New", 10),
+            justify=tk.CENTER, wraplength=520,
+        ).pack(pady=(0, 20))
+        unlock_button = ttk.Button(card, text="Unlock", command=self.unlock_cli)
+        unlock_button.pack(ipadx=18, ipady=5)
+        self._lock_overlay = overlay
+        overlay.bind("<Return>", lambda event: self.unlock_cli())
+        overlay.bind("<Escape>", lambda event: "break")
+        overlay.lift()
+        overlay.focus_set()
+        try:
+            overlay.grab_set()
+        except tk.TclError:
+            pass
+
+    def unlock_cli(self):
+        """Unlock only after an interactive, non-remembered authentication."""
+        if not self._on_ui_thread():
+            self._post_ui(self.unlock_cli)
+            return False
+        if self._closing:
+            return False
+        if not self._locked:
+            return self.authenticated
+        overlay = self._lock_overlay
+        if overlay is not None:
+            try:
+                overlay.grab_release()
+            except tk.TclError:
+                pass
+        try:
+            username = authenticate(self.root, cancellable=True, allow_remembered=False)
+        except (CredentialStoreError, ConfigurationError, JSONPersistenceError, StorageOwnershipError) as error:
+            messagebox.showerror(
+                "pyOS Account Recovery Required",
+                f"pyOS detected invalid account state and kept the CLI locked:\n\n{error}",
+                parent=self.root,
+            )
+            username = None
+        if not username:
+            if overlay is not None and overlay.winfo_exists():
+                overlay.lift()
+                overlay.focus_set()
+                try:
+                    overlay.grab_set()
+                except tk.TclError:
+                    pass
+            return False
+        self.authenticated = True
+        self.authenticated_username = username
+        self._locked = False
+        self.user_var.set(f"User: {username}")
+        if overlay is not None:
+            try:
+                overlay.grab_release()
+            except tk.TclError:
+                pass
+            overlay.destroy()
+        self._lock_overlay = None
+        self.root.config(menu=self.menubar)
+        self.log_message(f"Authenticated as {username}.\n")
+        self.command_input.focus_set()
+        return True
 
     def change_cli_account(self):
         """Create or change the persistent pyOS account."""
-        if has_account() and not self.ensure_authenticated():
+        if self._locked or self._closing:
             return
-        username = change_credentials_dialog(self.root)
+        try:
+            if has_account() and not self.ensure_authenticated():
+                return
+            username = change_credentials_dialog(self.root)
+        except (CredentialStoreError, ConfigurationError, JSONPersistenceError, StorageOwnershipError) as error:
+            messagebox.showerror(
+                "pyOS Account Recovery Required",
+                f"pyOS detected invalid account state and made no changes:\n\n{error}",
+                parent=self.root,
+            )
+            return
         if username:
             self.authenticated = True
             self.authenticated_username = username
@@ -449,15 +1235,30 @@ class PythonOS:
     
     def switch_drive(self, drive):
         """Switch to different drive"""
+        if self._locked or self._closing:
+            return
         if drive in self.drives:
+            task = self._current_command_task()
+            if task is not None:
+                self._commit_task_directory(task, self.drives[drive], drive)
+                self.log_message(f"Switched to Drive {drive}:\n")
+                return
             self.current_drive = drive
             self.current_directory = self.drives[drive]
-            self.drive_var.set(f"Drive: {drive}:")
-            self.path_var.set(self.format_display_path(self.current_directory))
-            self.refresh_files()
+            self._post_ui(self._update_directory_widgets)
             self.log_message(f"Switched to Drive {drive}:\n")
         else:
             self.log_message(f"Drive {drive}: not found\n")
+
+    def _update_directory_widgets(self):
+        if not self._on_ui_thread():
+            self._post_ui(self._update_directory_widgets)
+            return
+        if self._closing:
+            return
+        self.drive_var.set(f"Drive: {self.current_drive}:")
+        self.path_var.set(self.format_display_path(self.current_directory))
+        self.refresh_files()
     
     def show_drive_info(self):
         """Show drive information"""
@@ -467,13 +1268,14 @@ class PythonOS:
             try:
                 if os.path.exists(drive_path):
                     if drive_letter == "A":
-                        size = self.drive_a.get_usage()
-                        drive_type = "Temporary (RAM)"
-                        info += f"Drive {drive_letter}: (Temp)\n"
+                        task = self._current_command_task()
+                        size = self.drive_a.get_usage(task.cancel_event if task else None)
+                        info += f"Drive {drive_letter}: (Session temporary)\n"
                         info += f"  Location: {drive_path}\n"
                         info += f"  Used: {size / (1024*1024):.2f} MB\n"
                     elif drive_letter == "B":
-                        size = self.drive_b.get_usage()
+                        task = self._current_command_task()
+                        size = self.drive_b.get_usage(task.cancel_event if task else None)
                         drive_type = "Permanent (Disk)"
                         info += f"Drive {drive_letter}: (Permanent)\n"
                         info += f"  Location: {drive_path}\n"
@@ -554,6 +1356,11 @@ class PythonOS:
     
     def refresh_files(self):
         """Refresh file list based on current directory"""
+        if not self._on_ui_thread():
+            self._post_command_ui(self.refresh_files)
+            return
+        if self._closing or self._locked:
+            return
         self.file_listbox.delete(0, tk.END)
         
         try:
@@ -572,6 +1379,8 @@ class PythonOS:
     
     def open_file_or_folder(self, event):
         """Open selected file or folder"""
+        if self._locked or self._closing:
+            return
         selection = self.file_listbox.curselection()
         if not selection:
             return
@@ -591,9 +1400,9 @@ class PythonOS:
                     if os.name == 'nt':
                         os.startfile(full_path)
                     elif sys.platform == "darwin":
-                        subprocess.Popen(["open", full_path])
+                        self._spawn_process(["open", full_path])
                     else:
-                        subprocess.Popen(["xdg-open", full_path])
+                        self._spawn_process(["xdg-open", full_path])
                     self.log_message(f"Opening: {full_path}\n")
                 except Exception as e:
                     self.log_message(f"Error opening file: {e}\n")
@@ -603,6 +1412,8 @@ class PythonOS:
     
     def delete_file(self):
         """Delete selected file or folder"""
+        if self._locked or self._closing:
+            return
         selection = self.file_listbox.curselection()
         if not selection:
             return
@@ -626,6 +1437,8 @@ class PythonOS:
     
     def open_directory(self):
         """Open directory browser dialog"""
+        if self._locked or self._closing:
+            return
         directory = filedialog.askdirectory()
         if directory:
             self.current_directory = directory
@@ -634,25 +1447,39 @@ class PythonOS:
     
     def execute_command(self):
         """Execute command from input"""
+        if self._locked or self._closing:
+            return
         command = self.input_var.get().strip()
         if not command:
             return
         if not self.ensure_authenticated():
             return
+        task = CommandTask(
+            command=command,
+            working_directory=os.path.abspath(self.current_directory),
+            drive=self.current_drive,
+            auth_generation=self._auth_generation,
+        )
+        try:
+            self._command_tasks.put_nowait(task)
+        except queue.Full:
+            self.log_message(
+                f"Command queue is full ({self.COMMAND_QUEUE_LIMIT} waiting). "
+                "Wait for a command to finish and try again.\n"
+            )
+            return
         
-        self.log_message(f"{self.format_display_path(self.current_directory)}> {command}\n")
+        self.log_message(f"{self.format_display_path(task.working_directory)}> {command}\n")
         self.command_history.append(command)
+        if len(self.command_history) > 1000:
+            del self.command_history[:-1000]
         self.history_index = len(self.command_history)
         self.input_var.set("")
-        
-        # Run command in thread to prevent GUI freeze
-        thread = threading.Thread(target=self._run_command, args=(command,))
-        thread.daemon = True
-        thread.start()
     
     def _run_command(self, command):
         """Execute command and display output"""
         try:
+            task = self._require_active_task()
             try:
                 parsed = shlex.split(command, posix=os.name != "nt")
             except ValueError as error:
@@ -660,38 +1487,48 @@ class PythonOS:
                 return
             command_name = parsed[0].lower() if parsed else ""
             command_args = parsed[1:]
+            policy = self._command_policy(command_name)
+            optional_app = policy.get("optional_app")
+            if optional_app and not self.is_app_enabled(optional_app):
+                self.log_message(
+                    f"pyOS {optional_app} is disabled in Setup and cannot be used.\n"
+                )
+                return
 
             # Built-in commands
             if command.lower().startswith("cd "):
                 path = command[3:].strip().strip('"')
                 if path == "..":
-                    self.current_directory = os.path.dirname(self.current_directory)
+                    self._commit_task_directory(
+                        task, os.path.dirname(task.working_directory), task.drive
+                    )
                 elif path.upper().startswith("A:") or path.upper().startswith("B:") or path.upper().startswith("C:"):
                     drive = path[0].upper()
                     if drive in self.drives:
-                        self.switch_drive(drive)
+                        destination = self.drives[drive]
                         if len(path) > 2:
                             subpath = path[2:].lstrip("\\")
                             if subpath:
                                 full_path = os.path.join(self.drives[drive], subpath)
                                 if os.path.isdir(full_path):
-                                    self.current_directory = full_path
-                                    self.path_var.set(self.format_display_path(self.current_directory))
+                                    destination = full_path
+                                else:
+                                    self.log_message(f"The path does not exist: {path}\n")
+                                    return
+                        self._commit_task_directory(task, destination, drive)
+                        self.log_message(f"Switched to Drive {drive}:\n")
                     return
-                elif os.path.isdir(path):
-                    self.current_directory = os.path.abspath(path)
-                elif os.path.isdir(os.path.join(self.current_directory, path)):
-                    self.current_directory = os.path.abspath(os.path.join(self.current_directory, path))
                 else:
-                    self.log_message(f"The path does not exist: {path}\n")
-                
-                self.path_var.set(self.format_display_path(self.current_directory))
-                self.root.after(100, self.refresh_files)
+                    candidate = path if os.path.isabs(path) else os.path.join(task.working_directory, path)
+                    if os.path.isdir(candidate):
+                        self._commit_task_directory(task, candidate, task.drive)
+                    else:
+                        self.log_message(f"The path does not exist: {path}\n")
             
             elif command.lower() == "drives":
                 output = f"Available Drives:\n"
                 output += f"C: - User Home Directory\n"
-                output += f"A: - Temporary Storage (RAM)\n"
+                output += f"A: - Session-temporary storage (cleared on exit)\n"
                 output += f"B: - Permanent Storage\n"
                 self.log_message(output + "\n")
 
@@ -709,7 +1546,7 @@ class PythonOS:
                     self._open_path(" ".join(command_args))
 
             elif command_name in {"explorer", "files"}:
-                target = " ".join(command_args) if command_args else self.current_directory
+                target = " ".join(command_args) if command_args else self._working_directory()
                 self._open_explorer(self._resolve_path(target))
 
             elif command_name in {"play", "media"}:
@@ -722,7 +1559,7 @@ class PythonOS:
                 "apps", "games", "snake", "sudoku", "chess", "messenger", "calculator",
                 "calc", "images", "imageviewer", "notepad", "editor", "ide",
                 "filemanager", "desktop_browser", "desktop_media", "pyos_settings",
-                "dispenser",
+                "dispenser", "weather", "news", "pyai", "modding",
             }:
                 aliases = {
                     "calc": "calculator", "imageviewer": "images", "filemanager": "files",
@@ -730,19 +1567,30 @@ class PythonOS:
                     "pyos_settings": "settings",
                 }
                 if command_name == "apps":
-                    self.log_message(
-                        "Desktop apps: filemanager, games, snake, sudoku, chess, messenger, "
-                        "calculator, images, notepad, editor, desktop_media, ide, "
-                        "desktop_browser, dispenser, pyos_settings\n"
-                    )
+                    commands = [
+                        ("filemanager", "files"), ("games", "games"),
+                        ("snake", "snake"), ("sudoku", "sudoku"), ("chess", "chess"),
+                        ("messenger", "messenger"), ("calculator", "calculator"),
+                        ("images", "images"), ("notepad", "notepad"),
+                        ("editor", "editor"), ("desktop_media", "media"),
+                        ("ide", "ide"), ("desktop_browser", "browser"),
+                        ("dispenser", "dispenser"), ("pyos_settings", "settings"),
+                        ("weather", "weather"), ("news", "news"),
+                        ("pyai", "pyai"), ("modding", "modding"),
+                    ]
+                    available = [label for label, app_id in commands if self.is_app_enabled(app_id)]
+                    self.log_message("Desktop apps: " + ", ".join(available) + "\n")
                 else:
                     app_name = aliases.get(command_name, command_name)
-                    self.root.after(0, lambda name=app_name: self.open_desktop_app(name))
+                    self._post_command_ui(self.open_desktop_app, app_name)
 
             elif command_name == "browser":
                 url = " ".join(command_args) if command_args else "https://www.google.com"
-                self.root.after(0, lambda value=url: self.open_browser_inspector(value))
-                self.log_message(f"Opened browser inspector: {url}\n")
+                if not self.is_app_enabled("browser"):
+                    self.log_message("pyOS browser is disabled in Setup and cannot be launched.\n")
+                else:
+                    self._post_command_ui(self.open_browser_inspector, url)
+                    self.log_message(f"Opened browser inspector: {url}\n")
 
             elif command_name == "browse":
                 if not command_args:
@@ -751,7 +1599,7 @@ class PythonOS:
                     url = " ".join(command_args)
                     if "://" not in url:
                         url = "https://" + url
-                    webbrowser.open(url)
+                    self._perform_mutation(lambda: webbrowser.open(url))
                     self.log_message(f"Opened browser: {url}\n")
 
             elif command_name == "inspect":
@@ -791,13 +1639,15 @@ class PythonOS:
                 self._show_gui_settings()
 
             elif command_name == "monochrome":
-                self.theme.settings = self.theme.defaults.copy()
-                self.theme.save_settings()
-                self.root.after(0, self.apply_theme_changes)
+                def restore_monochrome():
+                    self.theme.settings = self.theme.defaults.copy()
+                    self.theme.save_settings()
+                self._perform_mutation(restore_monochrome)
+                self._post_command_ui(self.apply_theme_changes)
                 self.log_message("Monochrome theme restored.\n")
 
             elif command_name in {"exit", "quit"}:
-                self.root.after(0, self.root.quit)
+                self._post_command_ui(self.shutdown)
             
             elif command.lower() == "cls" or command.lower() == "clear":
                 self.clear_console()
@@ -810,21 +1660,18 @@ class PythonOS:
             
             elif command.lower().startswith("mkdir "):
                 dirname = command[6:].strip().strip('"')
-                path = os.path.join(self.current_directory, dirname)
-                os.makedirs(path, exist_ok=True)
+                path = os.path.join(self._working_directory(), dirname)
+                self._perform_mutation(lambda: os.makedirs(path, exist_ok=True))
                 self.log_message(f"Directory created: {dirname}\n")
-                self.root.after(100, self.refresh_files)
+                self.refresh_files()
             
             elif command.lower().startswith("del ") or command.lower().startswith("rm "):
                 filename = command.split(maxsplit=1)[1].strip().strip('"')
-                path = os.path.join(self.current_directory, filename)
+                path = os.path.join(self._working_directory(), filename)
                 if os.path.exists(path):
-                    if os.path.isdir(path):
-                        shutil.rmtree(path)
-                    else:
-                        os.remove(path)
+                    self._remove_path_cancellable(path)
                     self.log_message(f"Deleted: {filename}\n")
-                    self.root.after(100, self.refresh_files)
+                    self.refresh_files()
                 else:
                     self.log_message(f"File not found: {filename}\n")
             
@@ -833,25 +1680,25 @@ class PythonOS:
                 if len(parts) >= 3:
                     src = parts[1].strip('"')
                     dst = parts[2].strip('"')
-                    src_path = os.path.join(self.current_directory, src)
-                    dst_path = os.path.join(self.current_directory, dst)
-                    shutil.copy2(src_path, dst_path)
+                    src_path = os.path.join(self._working_directory(), src)
+                    dst_path = os.path.join(self._working_directory(), dst)
+                    self._copy_file_cancellable(src_path, dst_path)
                     self.log_message(f"Copied {src} to {dst}\n")
-                    self.root.after(100, self.refresh_files)
+                    self.refresh_files()
             
             elif command.lower().startswith("move ") or command.lower().startswith("mv "):
                 parts = command.split(maxsplit=2)
                 if len(parts) >= 3:
                     src = parts[1].strip('"')
                     dst = parts[2].strip('"')
-                    src_path = os.path.join(self.current_directory, src)
-                    dst_path = os.path.join(self.current_directory, dst)
-                    shutil.move(src_path, dst_path)
+                    src_path = os.path.join(self._working_directory(), src)
+                    dst_path = os.path.join(self._working_directory(), dst)
+                    self._move_path_cancellable(src_path, dst_path)
                     self.log_message(f"Moved {src} to {dst}\n")
-                    self.root.after(100, self.refresh_files)
+                    self.refresh_files()
             
             elif command.lower() == "pwd":
-                self.log_message(f"{self.current_directory}\n")
+                self.log_message(f"{self._working_directory()}\n")
             
             elif command.lower().startswith("echo "):
                 text = command[5:].strip()
@@ -859,34 +1706,38 @@ class PythonOS:
             
             elif command.lower().startswith("type ") or command.lower().startswith("cat "):
                 filename = command.split(maxsplit=1)[1].strip().strip('"')
-                path = os.path.join(self.current_directory, filename)
+                path = os.path.join(self._working_directory(), filename)
                 if os.path.exists(path) and os.path.isfile(path):
                     with open(path, 'r', errors='ignore') as f:
-                        self.log_message(f.read() + "\n")
+                        contents = f.read(1_000_001)
+                    self._require_active_task()
+                    if len(contents) > 1_000_000:
+                        contents = contents[:1_000_000] + "\n[Output truncated at 1,000,000 characters]"
+                    self.log_message(contents + "\n")
                 else:
                     self.log_message(f"File not found: {filename}\n")
             
             elif command.lower().startswith("write ") or command.lower().startswith("nano "):
                 filename = command.split(maxsplit=1)[1].strip().strip('"')
-                path = os.path.join(self.current_directory, filename)
-                self._open_write_dialog(filename, path)
+                path = os.path.join(self._working_directory(), filename)
+                self._open_write_dialog(filename, path, task.auth_generation)
              
             elif command.lower().startswith("append "):
                 filename = command.split(maxsplit=1)[1].strip().strip('"')
-                path = os.path.join(self.current_directory, filename)
-                self._open_append_dialog(filename, path)
+                path = os.path.join(self._working_directory(), filename)
+                self._open_append_dialog(filename, path, task.auth_generation)
             
             elif command.lower().startswith("rename "):
                 parts = command.split(maxsplit=2)
                 if len(parts) >= 3:
                     old_name = parts[1].strip('"')
                     new_name = parts[2].strip('"')
-                    old_path = os.path.join(self.current_directory, old_name)
-                    new_path = os.path.join(self.current_directory, new_name)
+                    old_path = os.path.join(self._working_directory(), old_name)
+                    new_path = os.path.join(self._working_directory(), new_name)
                     try:
-                        os.rename(old_path, new_path)
+                        self._perform_mutation(lambda: os.rename(old_path, new_path))
                         self.log_message(f"Renamed: {old_name} → {new_name}\n")
-                        self.root.after(100, self.refresh_files)
+                        self.refresh_files()
                     except Exception as e:
                         self.log_message(f"Error renaming file: {e}\n")
                 else:
@@ -894,12 +1745,12 @@ class PythonOS:
             
             elif command.lower().startswith("info "):
                 filename = command.split(maxsplit=1)[1].strip().strip('"')
-                path = os.path.join(self.current_directory, filename)
+                path = os.path.join(self._working_directory(), filename)
                 self._show_file_info(path)
             
             elif command.lower().startswith("lines ") or command.lower().startswith("wc "):
                 filename = command.split(maxsplit=1)[1].strip().strip('"')
-                path = os.path.join(self.current_directory, filename)
+                path = os.path.join(self._working_directory(), filename)
                 self._count_lines(path)
             
             elif command.lower().startswith("grep ") or command.lower().startswith("search_text "):
@@ -907,22 +1758,26 @@ class PythonOS:
                 if len(parts) >= 3:
                     pattern = parts[1].strip('"')
                     filename = parts[2].strip('"')
-                    path = os.path.join(self.current_directory, filename)
+                    path = os.path.join(self._working_directory(), filename)
                     self._search_text_in_file(pattern, path)
                 else:
                     self.log_message("Usage: grep <pattern> <filename>\n")
             
             elif command.lower().startswith("touch "):
                 filename = command.split(maxsplit=1)[1].strip().strip('"')
-                path = os.path.join(self.current_directory, filename)
+                path = os.path.join(self._working_directory(), filename)
                 try:
-                    if not os.path.exists(path):
-                        open(path, 'a').close()
-                        self.log_message(f"File created: {filename}\n")
-                    else:
-                        os.utime(path, None)
-                        self.log_message(f"File touched (timestamp updated): {filename}\n")
-                    self.root.after(100, self.refresh_files)
+                    existed = os.path.exists(path)
+                    def touch_path():
+                        if existed:
+                            os.utime(path, None)
+                        else:
+                            Path(path).touch()
+                    self._perform_mutation(touch_path)
+                    self.log_message(
+                        f"File {'touched (timestamp updated)' if existed else 'created'}: {filename}\n"
+                    )
+                    self.refresh_files()
                 except Exception as e:
                     self.log_message(f"Error: {e}\n")
             
@@ -935,7 +1790,7 @@ class PythonOS:
                         lines = int(parts[2])
                     except ValueError:
                         pass
-                path = os.path.join(self.current_directory, filename)
+                path = os.path.join(self._working_directory(), filename)
                 self._show_head(path, lines)
             
             elif command.lower().startswith("tail "):
@@ -947,18 +1802,18 @@ class PythonOS:
                         lines = int(parts[2])
                     except ValueError:
                         pass
-                path = os.path.join(self.current_directory, filename)
+                path = os.path.join(self._working_directory(), filename)
                 self._show_tail(path, lines)
             
             elif command.lower().startswith("archive "):
                 filename = command.split(maxsplit=1)[1].strip().strip('"')
-                path = os.path.join(self.current_directory, filename)
-                self._create_zip_archive(path)
+                path = os.path.join(self._working_directory(), filename)
+                self._perform_mutation(lambda: self._create_zip_archive(path))
             
             elif command.lower().startswith("extract "):
                 filename = command.split(maxsplit=1)[1].strip().strip('"')
-                path = os.path.join(self.current_directory, filename)
-                self._extract_zip(path)
+                path = os.path.join(self._working_directory(), filename)
+                self._perform_mutation(lambda: self._extract_zip(path))
             
             elif command.lower() == "files_only":
                 self._list_files_only()
@@ -968,7 +1823,7 @@ class PythonOS:
             
             elif command.lower().startswith("hexdump ") or command.lower().startswith("xxd "):
                 filename = command.split(maxsplit=1)[1].strip().strip('"')
-                path = os.path.join(self.current_directory, filename)
+                path = os.path.join(self._working_directory(), filename)
                 self._show_hexdump(path)
             
             elif command.lower() == "ipconfig" or command.lower() == "ifconfig":
@@ -1010,16 +1865,19 @@ class PythonOS:
                     color_type = parts[1].lower()
                     color_value = parts[2]
                     if color_type == "console_bg":
-                        self.theme.settings["console_bg"] = color_value
+                        setting_key = "console_bg"
                     elif color_type == "console_fg":
-                        self.theme.settings["console_fg"] = color_value
+                        setting_key = "console_fg"
                     elif color_type == "list_bg":
-                        self.theme.settings["list_bg"] = color_value
+                        setting_key = "list_bg"
                     elif color_type == "list_fg":
-                        self.theme.settings["list_fg"] = color_value
+                        setting_key = "list_fg"
                     else:
                         self.log_message("Usage: color [console_bg|console_fg|list_bg|list_fg] #HEXCOLOR\n")
                         return
+                    self._perform_mutation(
+                        lambda: self.theme.settings.__setitem__(setting_key, color_value)
+                    )
                     self.apply_theme_changes()
                     self.log_message(f"Color {color_type} changed to {color_value}\n")
                 else:
@@ -1027,7 +1885,9 @@ class PythonOS:
             
             elif command.lower().startswith("font "):
                 font_name = command[5:].strip()
-                self.theme.settings["console_font"] = font_name
+                self._perform_mutation(
+                    lambda: self.theme.settings.__setitem__("console_font", font_name)
+                )
                 self.apply_theme_changes()
                 self.log_message(f"Font changed to {font_name}\n")
             
@@ -1035,7 +1895,9 @@ class PythonOS:
                 try:
                     size = int(command.split(maxsplit=1)[1])
                     if 8 <= size <= 24:
-                        self.theme.settings["console_fontsize"] = size
+                        self._perform_mutation(
+                            lambda: self.theme.settings.__setitem__("console_fontsize", size)
+                        )
                         self.apply_theme_changes()
                         self.log_message(f"Font size changed to {size}\n")
                     else:
@@ -1061,26 +1923,29 @@ class PythonOS:
             
             else:
                 # System command
+                if not policy.get("external"):
+                    self.log_message(f"Invalid or incomplete usage for: {command_name}\n")
+                    return
                 try:
-                    result = subprocess.run(
+                    returncode, stdout, stderr = self._run_tracked_capture(
                         command,
                         shell=True,
-                        cwd=self.current_directory,
-                        capture_output=True,
-                        text=True,
+                        cwd=self._working_directory(),
                         timeout=15
                     )
-                    if result.stdout:
-                        self.log_message(result.stdout)
-                    if result.stderr:
-                        self.log_message(result.stderr)
-                    if not result.stdout and not result.stderr:
+                    if stdout:
+                        self.log_message(stdout)
+                    if stderr:
+                        self.log_message(stderr)
+                    if not stdout and not stderr:
                         self.log_message("Command executed successfully.\n")
                 except subprocess.TimeoutExpired:
                     self.log_message("Command timed out after 15 seconds.\n")
                 except Exception as e:
                     self.log_message(f"Error: {str(e)}\n")
         
+        except CommandCancelled:
+            raise
         except Exception as e:
             self.log_message(f"Error: {str(e)}\n")
     
@@ -1093,7 +1958,78 @@ class PythonOS:
             return os.path.normpath(os.path.join(drive_root, remainder))
         if os.path.isabs(value):
             return os.path.normpath(value)
-        return os.path.normpath(os.path.join(self.current_directory, value))
+        return os.path.normpath(os.path.join(self._working_directory(), value))
+
+    def _copy_file_cancellable(self, source, destination):
+        source = Path(source)
+        destination = Path(destination)
+        if not source.is_file():
+            raise OSError(f"Source is not a file: {source}")
+        if destination.is_dir():
+            destination /= source.name
+        self._perform_mutation(lambda: destination.parent.mkdir(parents=True, exist_ok=True))
+        with self._mutation_lock:
+            self._require_active_task()
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{destination.name}.", suffix=".copy", dir=str(destination.parent)
+            )
+        temporary = Path(temporary_name)
+        try:
+            with source.open("rb") as input_stream, os.fdopen(descriptor, "wb") as output_stream:
+                while True:
+                    self._require_active_task()
+                    block = input_stream.read(1024 * 1024)
+                    if not block:
+                        break
+                    self._perform_mutation(lambda current=block: output_stream.write(current))
+                def sync_copy():
+                    output_stream.flush()
+                    os.fsync(output_stream.fileno())
+                self._perform_mutation(sync_copy)
+            self._perform_mutation(lambda: shutil.copystat(source, temporary))
+            self._perform_mutation(lambda: os.replace(temporary, destination))
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _move_path_cancellable(self, source, destination):
+        source = Path(source)
+        destination = Path(destination)
+        target = destination / source.name if destination.is_dir() else destination
+        try:
+            self._perform_mutation(lambda: os.replace(source, target))
+            return
+        except OSError as error:
+            if error.errno != errno.EXDEV or not source.is_file():
+                raise
+        self._copy_file_cancellable(source, target)
+        self._perform_mutation(source.unlink)
+
+    def _remove_path_cancellable(self, path):
+        path = Path(path)
+        is_junction = hasattr(path, "is_junction") and path.is_junction()
+        if is_junction:
+            self._perform_mutation(path.rmdir)
+            return
+        if not path.is_dir() or path.is_symlink():
+            self._perform_mutation(path.unlink)
+            return
+        for root, directories, files in os.walk(path, topdown=False, followlinks=False):
+            self._require_active_task()
+            root_path = Path(root)
+            for name in files:
+                self._perform_mutation((root_path / name).unlink)
+            for name in directories:
+                child = root_path / name
+                if hasattr(child, "is_junction") and child.is_junction():
+                    self._perform_mutation(child.rmdir)
+                elif child.is_symlink():
+                    self._perform_mutation(child.unlink)
+                else:
+                    self._perform_mutation(child.rmdir)
+        self._perform_mutation(path.rmdir)
 
     def _open_path(self, value):
         path = self._resolve_path(value)
@@ -1102,11 +2038,11 @@ class PythonOS:
             return
         try:
             if os.name == "nt":
-                os.startfile(path)
+                self._perform_mutation(lambda: os.startfile(path))
             elif sys.platform == "darwin":
-                subprocess.Popen(["open", path])
+                self._spawn_process(["open", path])
             else:
-                subprocess.Popen(["xdg-open", path])
+                self._spawn_process(["xdg-open", path])
             self.log_message(f"Opened: {path}\n")
         except OSError as error:
             self.log_message(f"Could not open path: {error}\n")
@@ -1118,16 +2054,19 @@ class PythonOS:
             return
         try:
             if os.name == "nt":
-                subprocess.Popen(["explorer", path])
+                self._spawn_process(["explorer", path])
             elif sys.platform == "darwin":
-                subprocess.Popen(["open", path])
+                self._spawn_process(["open", path])
             else:
-                subprocess.Popen(["xdg-open", path])
+                self._spawn_process(["xdg-open", path])
             self.log_message(f"Opened File Explorer: {path}\n")
         except OSError as error:
             self.log_message(f"Could not open File Explorer: {error}\n")
 
     def _play_media(self, value):
+        if not self.is_app_enabled("media"):
+            self.log_message("pyOS media is disabled in Setup and cannot be used.\n")
+            return
         path = self._resolve_path(value)
         if not os.path.isfile(path):
             self.log_message(f"Media file not found: {value}\n")
@@ -1140,9 +2079,9 @@ class PythonOS:
         player = next((candidate for candidate in candidates if candidate and os.path.isfile(candidate)), None)
         try:
             if player:
-                subprocess.Popen([player, path])
+                self._spawn_process([player, path])
             elif os.name == "nt":
-                os.startfile(path)
+                self._perform_mutation(lambda: os.startfile(path))
             else:
                 self._open_path(path)
             self.log_message(f"Playing: {path}\n")
@@ -1161,6 +2100,7 @@ class PythonOS:
         try:
             with open(path, "rb") as source:
                 for block in iter(lambda: source.read(1024 * 1024), b""):
+                    self._require_active_task()
                     digest.update(block)
             self.log_message(f"{algorithm.upper()}  {digest.hexdigest()}  {os.path.basename(path)}\n")
         except OSError as error:
@@ -1177,10 +2117,17 @@ class PythonOS:
         }
         try:
             loaded = json.loads(self.gui_settings_file.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                defaults.update({key: loaded[key] for key in defaults if key in loaded})
-        except (OSError, ValueError, TypeError):
+            if not isinstance(loaded, dict):
+                raise ValueError("Desktop settings must be a JSON object")
+            defaults.update({key: loaded[key] for key in defaults if key in loaded})
+        except FileNotFoundError:
             pass
+        except (OSError, UnicodeError, ValueError, TypeError) as error:
+            self.log_message(
+                "Desktop settings recovery is required; invalid state was not ignored: "
+                f"{error}\nFile: {self.gui_settings_file}\n"
+            )
+            return
         self.log_message("\nDESKTOP GUI SETTINGS\n")
         self.log_message("-" * 32 + "\n")
         for key, value in defaults.items():
@@ -1191,14 +2138,14 @@ class PythonOS:
         """Ping a host"""
         try:
             self.log_message(f"Pinging {host}...\n")
-            result = subprocess.run(
-                f"ping -n 4 {host}" if os.name == 'nt' else f"ping -c 4 {host}",
-                shell=True,
-                capture_output=True,
-                text=True,
+            args = ["ping", "-n" if os.name == "nt" else "-c", "4", host]
+            _returncode, stdout, stderr = self._run_tracked_capture(
+                args,
                 timeout=10
             )
-            self.log_message(result.stdout)
+            self.log_message(stdout or stderr)
+        except CommandCancelled:
+            raise
         except Exception as e:
             self.log_message(f"Ping failed: {e}\n")
     
@@ -1264,6 +2211,7 @@ class PythonOS:
             self.log_message("-" * 55 + "\n")
             
             for proc in psutil.process_iter(['pid', 'name', 'memory_info']):
+                self._require_active_task()
                 try:
                     memory_mb = proc.info['memory_info'].rss / (1024 * 1024)
                     self.log_message(f"{proc.info['pid']:<10} {proc.info['name']:<30} {memory_mb:<15.2f}\n")
@@ -1277,14 +2225,27 @@ class PythonOS:
         url = url.strip().strip('"')
         return url if "://" in url else "https://" + url
 
-    def _fetch_page(self, url):
+    def _fetch_page(self, url, cancel_event=None):
         """Fetch a web page and return its final URL, headers, bytes, and decoded source."""
         url = self._normalize_url(url)
         request = urllib.request.Request(url, headers={"User-Agent": "pyOS Browser Inspector/1.0"})
         with urllib.request.urlopen(request, timeout=15) as response:
-            data = response.read(10 * 1024 * 1024 + 1)
-            if len(data) > 10 * 1024 * 1024:
-                raise ValueError("Page exceeds the 10 MB inspection limit")
+            chunks = []
+            received = 0
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise CommandCancelled()
+                task = self._current_command_task()
+                if task is not None:
+                    self._require_active_task(task)
+                chunk = response.read(min(64 * 1024, 10 * 1024 * 1024 + 1 - received))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                received += len(chunk)
+                if received > 10 * 1024 * 1024:
+                    raise ValueError("Page exceeds the 10 MB inspection limit")
+            data = b"".join(chunks)
             encoding = response.headers.get_content_charset() or "utf-8"
             source = data.decode(encoding, errors="replace")
             headers = dict(response.headers.items())
@@ -1292,6 +2253,14 @@ class PythonOS:
 
     def open_browser_inspector(self, initial_url="https://www.google.com"):
         """Open a monochrome browser source inspector and page downloader."""
+        if not self._on_ui_thread():
+            self._post_command_ui(self.open_browser_inspector, initial_url)
+            return
+        if self._locked or self._closing or not self.authenticated:
+            return
+        if not self.is_app_enabled("browser"):
+            self.log_message("pyOS browser is disabled in Setup and cannot be launched.\n")
+            return
         window = tk.Toplevel(self.root)
         window.title("pyOS Browser Inspector")
         window.geometry("900x650")
@@ -1316,6 +2285,7 @@ class PythonOS:
         status_var = tk.StringVar(value="Ready")
         ttk.Label(window, textvariable=status_var, anchor=tk.W).pack(fill=tk.X, padx=8, pady=(0, 6))
         cache = {"url": "", "data": None}
+        request_state = {"generation": 0, "task": None, "closed": False}
 
         def replace_text(widget, text):
             widget.configure(state=tk.NORMAL)
@@ -1323,7 +2293,23 @@ class PythonOS:
             widget.insert("1.0", text)
             widget.configure(state=tk.DISABLED)
 
-        def display_result(result):
+        def request_is_current(generation):
+            try:
+                exists = bool(window.winfo_exists())
+            except tk.TclError:
+                exists = False
+            return bool(
+                not request_state["closed"]
+                and generation == request_state["generation"]
+                and not self._closing
+                and not self._locked
+                and self.authenticated
+                and exists
+            )
+
+        def display_result(generation, result):
+            if not request_is_current(generation):
+                return
             final_url, status, headers, data, source = result
             cache.update(url=final_url, data=data)
             url_var.set(final_url)
@@ -1333,7 +2319,22 @@ class PythonOS:
             replace_text(headers_view, "\n".join(metadata))
             status_var.set(f"Loaded {len(data):,} bytes | HTTP {status}")
 
+        def display_error(generation, error):
+            if request_is_current(generation):
+                status_var.set(f"Load failed: {error}")
+
         def fetch():
+            if self._locked or self._closing or not self.authenticated:
+                return
+            if not self.is_app_enabled("browser"):
+                status_var.set("Browser is disabled in Setup.")
+                return
+            previous = request_state["task"]
+            if previous is not None:
+                previous.cancel_event.set()
+            request_state["generation"] += 1
+            generation = request_state["generation"]
+            cache.update(url="", data=None)
             status_var.set("Loading...")
             source_view.configure(state=tk.NORMAL)
             source_view.delete("1.0", tk.END)
@@ -1341,17 +2342,22 @@ class PythonOS:
             source_view.configure(state=tk.DISABLED)
             requested_url = url_var.get()
 
-            def worker():
-                try:
-                    result = self._fetch_page(requested_url)
-                    self.root.after(0, lambda: display_result(result))
-                except (urllib.error.URLError, OSError, ValueError) as error:
-                    message = str(error)
-                    self.root.after(0, lambda: status_var.set(f"Load failed: {message}"))
-
-            threading.Thread(target=worker, daemon=True).start()
+            submitted = self._submit_auxiliary(
+                lambda cancel: self._fetch_page(requested_url, cancel),
+                lambda result, current=generation: display_result(current, result),
+                lambda error, current=generation: display_error(current, error),
+            )
+            if submitted is None:
+                status_var.set("Browser work queue is full; wait and try again.")
+                return
+            request_state["task"] = submitted
 
         def save_cached_page():
+            if self._locked or self._closing or not self.authenticated:
+                return
+            if not self.is_app_enabled("browser"):
+                status_var.set("Browser is disabled in Setup.")
+                return
             if cache["data"] is None:
                 status_var.set("Load a page before saving it.")
                 return
@@ -1367,19 +2373,42 @@ class PythonOS:
             if not destination:
                 return
             try:
-                Path(destination).write_bytes(cache["data"])
+                self._atomic_replace_bytes(destination, cache["data"])
                 status_var.set(f"Saved: {destination}")
                 self.refresh_files()
             except OSError as error:
                 status_var.set(f"Save failed: {error}")
 
+        def open_external():
+            if self._locked or self._closing or not self.authenticated:
+                return
+            if not self.is_app_enabled("browser"):
+                status_var.set("Browser is disabled in Setup.")
+                return
+            webbrowser.open(self._normalize_url(url_var.get()))
+
+        def close_window():
+            request_state["closed"] = True
+            request_state["generation"] += 1
+            active = request_state["task"]
+            if active is not None:
+                active.cancel_event.set()
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+
         ttk.Button(toolbar, text="Inspect", command=fetch).pack(side=tk.LEFT, padx=3)
         ttk.Button(toolbar, text="Save Page", command=save_cached_page).pack(side=tk.LEFT, padx=3)
-        ttk.Button(toolbar, text="Open External", command=lambda: webbrowser.open(url_var.get())).pack(side=tk.LEFT, padx=3)
+        ttk.Button(toolbar, text="Open External", command=open_external).pack(side=tk.LEFT, padx=3)
         url_entry.bind("<Return>", lambda event: fetch())
+        window.protocol("WM_DELETE_WINDOW", close_window)
         fetch()
 
     def _inspect_page(self, url):
+        if not self.is_app_enabled("browser"):
+            self.log_message("pyOS browser is disabled in Setup and cannot be used.\n")
+            return
         try:
             final_url, status, headers, data, source = self._fetch_page(url)
             self.log_message(f"\nPAGE INSPECTION\n{'-' * 48}\n")
@@ -1394,38 +2423,104 @@ class PythonOS:
             self.log_message(f"Page inspection failed: {error}\n")
 
     def _save_page(self, url, filename=None):
+        if not self.is_app_enabled("browser"):
+            self.log_message("pyOS browser is disabled in Setup and cannot be used.\n")
+            return
         try:
             final_url, status, headers, data, source = self._fetch_page(url)
             if not filename:
                 filename = Path(urllib.parse.urlparse(final_url).path).name or "index.html"
             destination = self._resolve_path(filename)
-            Path(destination).write_bytes(data)
+            self._atomic_replace_bytes(destination, data)
             self.log_message(f"Saved page: {destination} ({len(data):,} bytes, HTTP {status})\n")
-            self.root.after(100, self.refresh_files)
+            self.refresh_files()
+        except CommandCancelled:
+            raise
         except (urllib.error.URLError, OSError, ValueError) as error:
             self.log_message(f"Page download failed: {error}\n")
 
+    def _atomic_replace_bytes(self, destination, data):
+        """Write bytes to a unique temporary file, then replace under the lock boundary."""
+        destination = Path(destination)
+        self._perform_mutation(lambda: destination.parent.mkdir(parents=True, exist_ok=True))
+        with self._mutation_lock:
+            self._require_active_task()
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{destination.name}.", suffix=".tmp", dir=str(destination.parent)
+            )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                view = memoryview(data)
+                for offset in range(0, len(view), 64 * 1024):
+                    task = self._current_command_task()
+                    if task is not None:
+                        self._require_active_task(task)
+                    block = view[offset:offset + 64 * 1024]
+                    self._perform_mutation(lambda current=block: stream.write(current))
+                def sync_stream():
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                self._perform_mutation(sync_stream)
+            self._perform_mutation(lambda: os.replace(temporary, destination))
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     def _download(self, url):
         """Download file from URL"""
+        temporary = None
         try:
-            import urllib.request
-            filename = url.split('/')[-1]
-            filepath = str(get_downloads_dir() / filename)
-            
+            filename = Path(urllib.parse.urlparse(url).path).name or "download.bin"
+            filepath = Path(self._working_directory()) / filename
+            self._perform_mutation(lambda: filepath.parent.mkdir(parents=True, exist_ok=True))
+            with self._mutation_lock:
+                self._require_active_task()
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=f".{filepath.name}.", suffix=".download", dir=str(filepath.parent)
+                )
+            temporary = Path(temporary_name)
             self.log_message(f"Downloading {url}...\n")
-            urllib.request.urlretrieve(url, filepath)
+            request = urllib.request.Request(url, headers={"User-Agent": "pyOS Command Center/1.0"})
+            received = 0
+            with os.fdopen(descriptor, "wb") as target, urllib.request.urlopen(request, timeout=15) as response:
+                while True:
+                    self._require_active_task()
+                    block = response.read(64 * 1024)
+                    if not block:
+                        break
+                    received += len(block)
+                    if received > 256 * 1024 * 1024:
+                        raise ValueError("Download exceeds the 256 MB command limit")
+                    self._perform_mutation(lambda current=block: target.write(current))
+                def sync_target():
+                    target.flush()
+                    os.fsync(target.fileno())
+                self._perform_mutation(sync_target)
+            self._perform_mutation(lambda: os.replace(temporary, filepath))
+            temporary = None
             self.log_message(f"Downloaded to: {filepath}\n")
-            self.root.after(100, self.refresh_files)
+            self.refresh_files()
+        except CommandCancelled:
+            raise
         except Exception as e:
             self.log_message(f"Download failed: {e}\n")
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
     
     def _show_diskspace(self):
         """Show disk space usage"""
         info = "\n=== DISK SPACE ===\n\n"
         
         try:
-            total, used, free = shutil.disk_usage(self.current_directory)
-            info += f"Drive: {self.current_drive}:\n"
+            total, used, free = shutil.disk_usage(self._working_directory())
+            info += f"Drive: {self._working_drive()}:\n"
             info += f"Total: {total / (1024**3):.2f} GB\n"
             info += f"Used: {used / (1024**3):.2f} GB\n"
             info += f"Free: {free / (1024**3):.2f} GB\n"
@@ -1441,7 +2536,8 @@ class PythonOS:
             self.log_message(f"\nSearching for '{pattern}'...\n\n")
             found = 0
             
-            for root, dirs, files in os.walk(self.current_directory):
+            for root, dirs, files in os.walk(self._working_directory()):
+                self._require_active_task()
                 for file in files:
                     if pattern.lower() in file.lower():
                         filepath = os.path.join(root, file)
@@ -1489,33 +2585,44 @@ class PythonOS:
         except Exception as e:
             self.log_message(f"Error getting file info: {e}\n")
      
-    def _open_write_dialog(self, filename, path):
+    def _open_write_dialog(self, filename, path, auth_generation):
         """Open write dialog on main thread (fixes threading issue)"""
         def show_dialog():
+            if (self._locked or self._closing or not self.authenticated
+                    or auth_generation != self._auth_generation):
+                return
             content = tk.simpledialog.askstring("Write File", f"Enter content for {filename}:")
             if content is not None:
                 try:
-                    with open(path, 'w') as f:
-                        f.write(content)
+                    if auth_generation != self._auth_generation:
+                        return
+                    self._atomic_replace_bytes(path, content.encode("utf-8"))
                     self.log_message(f"File created: {filename}\n")
-                    self.root.after(100, self.refresh_files)
+                    self.refresh_files()
                 except Exception as e:
                     self.log_message(f"Error writing file: {e}\n")
-        self.root.after(0, show_dialog)
+        self._post_ui(show_dialog)
      
-    def _open_append_dialog(self, filename, path):
+    def _open_append_dialog(self, filename, path, auth_generation):
         """Open append dialog on main thread (fixes threading issue)"""
         def show_dialog():
+            if (self._locked or self._closing or not self.authenticated
+                    or auth_generation != self._auth_generation):
+                return
             content = tk.simpledialog.askstring("Append to File", f"Enter content to append to {filename}:")
             if content is not None:
                 try:
-                    with open(path, 'a') as f:
-                        f.write(content + "\n")
+                    if auth_generation != self._auth_generation:
+                        return
+                    def append_content():
+                        with Path(path).open("a", encoding="utf-8") as stream:
+                            stream.write(content + "\n")
+                    self._perform_mutation(append_content)
                     self.log_message(f"Content appended to: {filename}\n")
-                    self.root.after(100, self.refresh_files)
+                    self.refresh_files()
                 except Exception as e:
                     self.log_message(f"Error appending to file: {e}\n")
-        self.root.after(0, show_dialog)
+        self._post_ui(show_dialog)
      
     def _count_lines(self, filepath):
         """Count lines in a file"""
@@ -1525,9 +2632,12 @@ class PythonOS:
                 return
             
             with open(filepath, 'r', errors='ignore') as f:
-                lines = len(f.readlines())
-                words = sum(len(line.split()) for line in open(filepath, 'r', errors='ignore'))
-                chars = sum(len(line) for line in open(filepath, 'r', errors='ignore'))
+                lines = words = chars = 0
+                for line in f:
+                    self._require_active_task()
+                    lines += 1
+                    words += len(line.split())
+                    chars += len(line)
             
             self.log_message(f"\n=== FILE STATISTICS: {os.path.basename(filepath)} ===\n\n")
             self.log_message(f"Lines: {lines:,}\n")
@@ -1548,6 +2658,7 @@ class PythonOS:
             
             with open(filepath, 'r', errors='ignore') as f:
                 for line_num, line in enumerate(f, 1):
+                    self._require_active_task()
                     if pattern.lower() in line.lower():
                         self.log_message(f"Line {line_num}: {line.rstrip()}\n")
                         found += 1
@@ -1570,6 +2681,7 @@ class PythonOS:
             
             with open(filepath, 'r', errors='ignore') as f:
                 for i, line in enumerate(f):
+                    self._require_active_task()
                     if i >= num_lines:
                         break
                     self.log_message(line)
@@ -1588,10 +2700,12 @@ class PythonOS:
             self.log_message(f"\n=== LAST {num_lines} LINES: {os.path.basename(filepath)} ===\n\n")
             
             with open(filepath, 'r', errors='ignore') as f:
-                lines = f.readlines()
-            
-            start = max(0, len(lines) - num_lines)
-            for line in lines[start:]:
+                lines = deque(maxlen=max(0, num_lines))
+                for line in f:
+                    self._require_active_task()
+                    lines.append(line)
+
+            for line in lines:
                 self.log_message(line)
             
             self.log_message("\n")
@@ -1608,7 +2722,7 @@ class PythonOS:
                 return
             
             archive_name = os.path.basename(filepath) + ".zip"
-            archive_path = os.path.join(self.current_directory, archive_name)
+            archive_path = os.path.join(self._working_directory(), archive_name)
             
             self.log_message(f"Creating archive: {archive_name}...\n")
             
@@ -1624,7 +2738,7 @@ class PythonOS:
             
             size = os.path.getsize(archive_path) / 1024
             self.log_message(f"Archive created: {archive_name} ({size:.2f} KB)\n")
-            self.root.after(100, self.refresh_files)
+            self.refresh_files()
         except Exception as e:
             self.log_message(f"Error creating archive: {e}\n")
     
@@ -1637,7 +2751,7 @@ class PythonOS:
                 self.log_message(f"Invalid zip file: {filepath}\n")
                 return
             
-            extract_dir = os.path.join(self.current_directory, os.path.basename(filepath)[:-4])
+            extract_dir = os.path.join(self._working_directory(), os.path.basename(filepath)[:-4])
             os.makedirs(extract_dir, exist_ok=True)
             
             self.log_message(f"Extracting: {os.path.basename(filepath)}...\n")
@@ -1646,7 +2760,7 @@ class PythonOS:
                 zipf.extractall(extract_dir)
             
             self.log_message(f"Extracted to: {os.path.basename(extract_dir)}\n")
-            self.root.after(100, self.refresh_files)
+            self.refresh_files()
         except Exception as e:
             self.log_message(f"Error extracting archive: {e}\n")
     
@@ -1654,14 +2768,15 @@ class PythonOS:
         """List only files in current directory"""
         try:
             self.log_message("\n=== FILES ONLY ===\n\n")
-            files = [f for f in os.listdir(self.current_directory) if os.path.isfile(os.path.join(self.current_directory, f))]
+            working_directory = self._working_directory()
+            files = [f for f in os.listdir(working_directory) if os.path.isfile(os.path.join(working_directory, f))]
             
             if not files:
                 self.log_message("No files found\n")
                 return
             
             for f in sorted(files):
-                path = os.path.join(self.current_directory, f)
+                path = os.path.join(working_directory, f)
                 size = os.path.getsize(path)
                 self.log_message(f"  {f} ({size:,} bytes)\n")
             
@@ -1673,14 +2788,15 @@ class PythonOS:
         """List only directories in current directory"""
         try:
             self.log_message("\n=== DIRECTORIES ONLY ===\n\n")
-            dirs = [d for d in os.listdir(self.current_directory) if os.path.isdir(os.path.join(self.current_directory, d))]
+            working_directory = self._working_directory()
+            dirs = [d for d in os.listdir(working_directory) if os.path.isdir(os.path.join(working_directory, d))]
             
             if not dirs:
                 self.log_message("No directories found\n")
                 return
             
             for d in sorted(dirs):
-                path = os.path.join(self.current_directory, d)
+                path = os.path.join(working_directory, d)
                 file_count = len(os.listdir(path))
                 self.log_message(f"  {d}/ ({file_count} items)\n")
             
@@ -1717,7 +2833,7 @@ class PythonOS:
         """Show directory tree"""
         try:
             self.log_message("\n")
-            self._tree_walk(self.current_directory, "")
+            self._tree_walk(self._working_directory(), "")
         except Exception as e:
             self.log_message(f"Error: {e}\n")
     
@@ -1731,6 +2847,7 @@ class PythonOS:
             dirs = [item for item in items if os.path.isdir(os.path.join(path, item))]
             
             for i, d in enumerate(dirs[:10]):
+                self._require_active_task()
                 is_last = (i == len(dirs) - 1)
                 self.log_message(f"{prefix}{'└── ' if is_last else '├── '}{d}/\n")
                 new_prefix = prefix + ("    " if is_last else "│   ")
@@ -1741,11 +2858,13 @@ class PythonOS:
     def _list_directory(self):
         """List files and directories"""
         try:
-            items = sorted(os.listdir(self.current_directory))
+            working_directory = self._working_directory()
+            items = sorted(os.listdir(working_directory))
             output = "\n Directory listing:\n\n"
             
             for item in items:
-                full_path = os.path.join(self.current_directory, item)
+                self._require_active_task()
+                full_path = os.path.join(working_directory, item)
                 if os.path.isdir(full_path):
                     output += f"  [DIR]  {item}\n"
                 else:
@@ -1758,6 +2877,11 @@ class PythonOS:
     
     def log_message(self, message):
         """Add message to console"""
+        if not self._on_ui_thread():
+            self._post_command_ui(self.log_message, message)
+            return
+        if self._closing:
+            return
         self.console.config(state='normal')
         self.console.insert(tk.END, message)
         self.console.see(tk.END)
@@ -1765,6 +2889,11 @@ class PythonOS:
     
     def clear_console(self):
         """Clear console output"""
+        if not self._on_ui_thread():
+            self._post_command_ui(self.clear_console)
+            return
+        if self._closing or self._locked:
+            return
         self.console.config(state='normal')
         self.console.delete(1.0, tk.END)
         self.console.config(state='disabled')
@@ -1790,21 +2919,37 @@ class PythonOS:
     
     def open_desktop_gui(self):
         """Open the desktop GUI version"""
+        if not self._on_ui_thread():
+            self._post_command_ui(self.open_desktop_gui)
+            return
+        if self._locked or self._closing:
+            return
         script_dir = os.path.dirname(os.path.abspath(__file__))
         gui_path = os.path.join(script_dir, "pyOSgui.py")
         
         try:
-            subprocess.Popen([sys.executable, gui_path])
+            self._spawn_process([sys.executable, gui_path])
             self.log_message("Desktop GUI opening in new window...\n")
         except Exception as e:
             self.log_message(f"Error opening desktop GUI: {e}\n")
 
     def open_desktop_app(self, app_name):
         """Open one pyOS desktop application directly from the command center."""
+        if not self._on_ui_thread():
+            self._post_command_ui(self.open_desktop_app, app_name)
+            return
+        if self._locked or self._closing:
+            return
+        if not self.is_app_enabled(app_name):
+            optional_id = self._optional_app_id(app_name)
+            self.log_message(
+                f"pyOS {optional_id or app_name} is disabled in Setup and cannot be launched.\n"
+            )
+            return
         script_dir = os.path.dirname(os.path.abspath(__file__))
         gui_path = os.path.join(script_dir, "pyOSgui.py")
         try:
-            subprocess.Popen([sys.executable, gui_path, "--app", app_name])
+            self._spawn_process([sys.executable, gui_path, "--app", app_name])
             self.log_message(f"Opening pyOS {app_name.replace('-', ' ')}...\n")
         except Exception as error:
             self.log_message(f"Could not open pyOS {app_name}: {error}\n")
@@ -1846,7 +2991,7 @@ FILE OPERATIONS:
   search / find <pattern> - Search for files
 
 DRIVES:
-  A: - Temporary Storage (RAM-like, cleared on exit)
+  A: - Session-temporary storage (cleared on exit)
   B: - Permanent Storage (persistent files)
   C: - User Home Directory
 
@@ -1994,12 +3139,80 @@ Built with Python & Tkinter
         messagebox.showinfo("About Python OS", about)
 
 
-if __name__ == "__main__":
-    relaunch_in_configured_environment(__file__)
+def main():
+    try:
+        relaunch_in_configured_environment(__file__)
+    except ConfigurationError as error:
+        failure_root = tk.Tk()
+        failure_root.withdraw()
+        messagebox.showerror(
+            "pyOS Configuration Recovery Required",
+            f"pyOS refused to use invalid configuration state:\n\n{error}",
+            parent=failure_root,
+        )
+        failure_root.destroy()
+        return
     root = tk.Tk()
-    username = authenticate(root, cancellable=False, allow_remembered=True)
-    app = PythonOS(root)
+    root.withdraw()
+    try:
+        config = load_config()
+        recovered_update = recover_source_update(config["install_dir"], config["data_dir"])
+    except (ConfigurationError, OSError, ValueError) as error:
+        messagebox.showerror(
+            "pyOS Update Recovery Required",
+            f"pyOS could not safely recover an interrupted source update:\n\n{error}",
+            parent=root,
+        )
+        root.destroy()
+        return
+    if recovered_update:
+        messagebox.showinfo(
+            "pyOS Update Recovered",
+            "An interrupted source update was rolled back before Command Center continued.",
+            parent=root,
+        )
+    try:
+        username = authenticate(root, cancellable=False, allow_remembered=True)
+    except (CredentialStoreError, ConfigurationError) as error:
+        messagebox.showerror(
+            "pyOS Account Recovery Required",
+            f"pyOS detected invalid account state and failed closed:\n\n{error}",
+            parent=root,
+        )
+        root.destroy()
+        return
+    if not username:
+        # Authentication may deliberately fail closed after reporting corrupt
+        # state.  Never turn that sentinel into an authenticated None session.
+        root.destroy()
+        return
+    try:
+        app = PythonOS(root)
+    except (
+        CredentialStoreError,
+        ConfigurationError,
+        JSONPersistenceError,
+        StorageOwnershipError,
+        OSError,
+        ValueError,
+        tk.TclError,
+    ) as error:
+        messagebox.showerror(
+            "pyOS State Recovery Required",
+            f"pyOS refused to start with invalid or inaccessible state:\n\n{error}",
+            parent=root,
+        )
+        root.destroy()
+        return
     app.authenticated = True
     app.authenticated_username = username
     app.user_var.set(f"User: {username}")
-    root.mainloop()
+    root.deiconify()
+    try:
+        root.mainloop()
+    finally:
+        app.shutdown()
+
+
+if __name__ == "__main__":
+    main()

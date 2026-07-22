@@ -1,36 +1,64 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('pyOSgui.py', '.'), ('pyOScli.py', '.'), ('pyos_config.py', '.'), ('pyos_auth.py', '.'), ('pyos_updater.py', '.'), ('setup.py', '.'), ('README.md', '.'), ('LICENSE.md', '.'), ('pyos2.0.png', '.')]
+
+project_root = Path(SPECPATH).resolve()
+
+
+def project_file(relative_path):
+    return str(project_root / relative_path)
+
+
+icon_path = os.environ.get("PYOS_BUILD_ICON", project_file("pyos2.0.png"))
+output_name = os.environ.get("PYOS_BUILD_OUTPUT_NAME", "pyOS")
+runtime_hook = os.environ.get(
+    "PYOS_BUILD_RUNTIME_HOOK", project_file("exe_tools/factory_runtime.py")
+)
+version_file = os.environ.get(
+    "PYOS_BUILD_VERSION_FILE", project_file("exe_tools/version_info.txt")
+)
+
+datas = [
+    (project_file("pyOSgui.py"), "."),
+    (project_file("pyOScli.py"), "."),
+    (project_file("pyos_config.py"), "."),
+    (project_file("pyos_auth.py"), "."),
+    (project_file("pyos_updater.py"), "."),
+    (project_file("setup.py"), "."),
+    (project_file("README.md"), "."),
+    (project_file("LICENSE.md"), "."),
+    (icon_path, "."),
+]
 binaries = []
-hiddenimports = ['chess', 'vlc']
-tmp_ret = collect_all('fido2')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('PIL')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('mido')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('paramiko')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('pygame')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('psutil')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('pythonmonkey')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('tkinterweb')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+hiddenimports = ["chess", "vlc"]
+for package in (
+    "fido2",
+    "PIL",
+    "mido",
+    "paramiko",
+    "pygame",
+    "psutil",
+    "pythonmonkey",
+    "tkinterweb",
+):
+    package_datas, package_binaries, package_imports = collect_all(package)
+    datas += package_datas
+    binaries += package_binaries
+    hiddenimports += package_imports
 
 
 a = Analysis(
-    ['pyOSgui.py'],
-    pathex=[],
+    [project_file("pyOSgui.py")],
+    pathex=[str(project_root)],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[runtime_hook],
     excludes=[],
     noarchive=False,
     optimize=0,
@@ -43,7 +71,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='pyOS',
+    name=output_name,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -56,5 +84,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['pyos2.0.png'],
+    icon=[icon_path],
+    version=version_file if os.name == "nt" else None,
 )

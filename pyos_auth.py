@@ -3,15 +3,23 @@
 import hashlib
 import hmac
 import json
-import os
 import secrets
 import base64
 import sys
+import re
+import unicodedata
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 from pathlib import Path
 
-from pyos_config import get_data_dir, load_config, set_active_user
+import pyos_config as storage
+from pyos_config import (
+    get_data_dir,
+    get_standalone_root,
+    load_config,
+    register_owned_path,
+    set_active_user,
+)
 
 
 PBKDF2_ITERATIONS = 600_000
@@ -22,11 +30,29 @@ PASSKEY_ORIGIN = "https://pyos.local"
 _active_username = None
 
 
+class CredentialStoreError(RuntimeError):
+    """Raised when an existing credential store cannot be trusted."""
+
+
+def _username_display(username):
+    """Return the canonical display form stored in the database."""
+    return unicodedata.normalize("NFKC", str(username).strip())
+
+
+def _username_key(username):
+    """Return the Unicode-normalized, case-insensitive identity key."""
+    return _username_display(username).casefold()
+
+
 def credentials_path():
     """Return the permanent credential-store location."""
-    if load_config().get("configured"):
-        return get_data_dir() / "credentials.json"
-    return Path.home() / ".pyos_credentials.json"
+    load_config()  # A malformed configuration must fail before choosing a store.
+    root = get_data_dir()
+    path = root / "credentials.json"
+    for owned in (path, path.with_name(path.name + ".bak"),
+                  path.with_name("remembered_session.json")):
+        register_owned_path(owned, root)
+    return path
 
 
 def remembered_session_path():
@@ -34,31 +60,36 @@ def remembered_session_path():
 
 
 def clear_remembered_session():
-    try:
-        remembered_session_path().unlink()
-    except OSError:
-        pass
-    database = _load_database()
-    changed = False
-    for account in database["accounts"]:
-        changed = bool(account.pop("remember_token_hash", None)) or changed
-    if changed:
-        _save_database(database)
+    path = credentials_path()
+    with storage._path_lock(path):
+        database = _load_database_unlocked(path)
+        changed = False
+        for account in database["accounts"]:
+            changed = bool(account.pop("remember_token_hash", None)) or changed
+        if changed:
+            _save_database_unlocked(path, database, current=database)
+    session_path = remembered_session_path()
+    with storage._path_lock(session_path):
+        try:
+            session_path.unlink()
+        except OSError:
+            pass
 
 
 def create_remembered_session():
-    data = load_credentials(_active_username)
-    if not data:
-        return
-    token = secrets.token_urlsafe(48)
-    data["remember_token_hash"] = hashlib.sha256(token.encode()).hexdigest()
-    _save_account(data)
-    path = remembered_session_path()
-    path.write_text(json.dumps({"username": data["username"], "token": token}), encoding="utf-8")
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    path = credentials_path()
+    with storage._path_lock(path):
+        database = _load_database_unlocked(path)
+        data = _find_account(database, _active_username)
+        if not data:
+            return
+        token = secrets.token_urlsafe(48)
+        data["remember_token_hash"] = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        _save_database_unlocked(path, database, current=database)
+        username = data["username"]
+    storage.atomic_write_json(
+        remembered_session_path(), {"username": username, "token": token}, mode=0o600
+    )
 
 
 def remembered_username():
@@ -70,7 +101,7 @@ def remembered_username():
             return None
         actual = hashlib.sha256(str(session["token"]).encode()).hexdigest()
         if (hmac.compare_digest(actual, expected) and
-                hmac.compare_digest(str(session["username"]).casefold(), data["username"].casefold())):
+                _username_key(session["username"]) == _username_key(data["username"])):
             return data["username"]
     except (OSError, ValueError, TypeError, KeyError):
         pass
@@ -78,7 +109,7 @@ def remembered_username():
 
 
 def validate_account(username, password):
-    username = username.strip()
+    username = _username_display(username)
     if not 3 <= len(username) <= 32:
         return "Username must contain between 3 and 32 characters."
     if any(character in username for character in "\r\n\t"):
@@ -97,7 +128,10 @@ def _valid_account(data):
         required = {"username", "salt", "password_hash", "iterations", "algorithm"}
         if not required.issubset(data) or data["algorithm"] != "pbkdf2-sha256":
             return None
-        if not isinstance(data["username"], str) or not 3 <= len(data["username"]) <= 32:
+        if not isinstance(data["username"], str):
+            return None
+        username = _username_display(data["username"])
+        if not 3 <= len(username) <= 32 or any(character in username for character in "\r\n\t"):
             return None
         iterations = int(data["iterations"])
         if not MIN_ITERATIONS <= iterations <= MAX_ITERATIONS:
@@ -106,40 +140,183 @@ def _valid_account(data):
         password_hash = bytes.fromhex(data["password_hash"])
         if len(salt) != 32 or len(password_hash) != 32:
             return None
-        data = dict(data)
-        data["role"] = "admin" if data.get("role") == "admin" else "standard"
-        data["profile_id"] = str(data.get("profile_id") or hashlib.sha256(
-            data["username"].casefold().encode("utf-8")
+        account = dict(data)
+        account["username"] = username
+        if "role" in account and account["role"] not in {"admin", "standard"}:
+            return None
+        account["role"] = account.get("role") or "standard"
+        profile_id = str(account.get("profile_id") or hashlib.sha256(
+            _username_key(username).encode("utf-8")
         ).hexdigest()[:24])
-        return data
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", profile_id):
+            return None
+        account["profile_id"] = profile_id
+        remember_hash = account.get("remember_token_hash")
+        if remember_hash is not None and (
+                not isinstance(remember_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", remember_hash)):
+            return None
+        if "passkey_user_id" in account:
+            value = account["passkey_user_id"]
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", value):
+                return None
+        if "passkeys" in account:
+            if not isinstance(account["passkeys"], list):
+                return None
+            for passkey in account["passkeys"]:
+                if not isinstance(passkey, dict) or not isinstance(passkey.get("credential_data"), str):
+                    return None
+                try:
+                    base64.b64decode(passkey["credential_data"], validate=True)
+                except (ValueError, TypeError):
+                    return None
+        return account
     except (ValueError, TypeError):
         return None
 
 
-def _load_database():
-    """Load the account database and migrate the former single-account record."""
-    try:
-        raw = json.loads(credentials_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return {"version": 2, "accounts": []}
+def _validate_database(raw):
+    """Validate a database as a whole; never silently discard bad accounts."""
+    migrated = False
     if isinstance(raw, dict) and isinstance(raw.get("accounts"), list):
-        accounts = [account for item in raw["accounts"] if (account := _valid_account(item))]
-        return {"version": 2, "accounts": accounts}
-    legacy = _valid_account(raw)
-    if legacy:
+        if raw.get("version", 2) != 2:
+            raise CredentialStoreError("Unsupported credential database version.")
+        accounts = []
+        for item in raw["accounts"]:
+            account = _valid_account(item)
+            if account is None or item.get("role") not in {"admin", "standard"}:
+                raise CredentialStoreError("Credential database contains an invalid account.")
+            accounts.append(account)
+        database = {"version": 2, "accounts": accounts}
+        migrated = database != raw
+    else:
+        legacy = _valid_account(raw)
+        if legacy is None:
+            raise CredentialStoreError("Credential database has an invalid format.")
         legacy["role"] = "admin"
         database = {"version": 2, "accounts": [legacy]}
-        _save_database(database)
+        migrated = True
+    keys = [_username_key(account["username"]) for account in database["accounts"]]
+    if len(keys) != len(set(keys)):
+        raise CredentialStoreError("Credential database contains duplicate usernames.")
+    # An empty database is valid only as an in-memory value returned when no
+    # credential file or backup has ever existed.  If this representation is
+    # found on disk, treating it as first-run would let corruption/account
+    # deletion reopen administrator enrollment.
+    if not database["accounts"]:
+        raise CredentialStoreError("Credential database contains no accounts.")
+    if not any(account["role"] == "admin" for account in database["accounts"]):
+        raise CredentialStoreError("Credential database has no administrator account.")
+    return database, migrated
+
+
+def _read_database(path):
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as error:
+        raise CredentialStoreError(f"Credential database is unreadable: {path}") from error
+    return _validate_database(raw)
+
+
+def _legacy_database_sources(target):
+    if not storage.MIGRATE_LEGACY_STATE:
+        return []
+    candidates = [
+        get_standalone_root(create=False) / "credentials.json",
+        Path(storage.LEGACY_HOME) / ".pyos_credentials.json",
+    ]
+    resolved_target = Path(target).resolve(strict=False)
+    unique = []
+    for candidate in candidates:
+        if candidate.resolve(strict=False) != resolved_target and candidate not in unique:
+            unique.append(candidate)
+    return unique
+
+
+def _migrate_legacy_database_unlocked(target):
+    for source in _legacy_database_sources(target):
+        if not source.exists():
+            continue
+        try:
+            database, _migrated = _read_database(source)
+        except CredentialStoreError as primary_error:
+            source_backup = source.with_name(source.name + ".bak")
+            if not source_backup.exists():
+                raise CredentialStoreError(
+                    f"Legacy credential database is malformed: {source}"
+                ) from primary_error
+            try:
+                database, _migrated = _read_database(source_backup)
+            except CredentialStoreError as backup_error:
+                raise CredentialStoreError(
+                    f"Legacy credential database and backup are malformed: {source}"
+                ) from backup_error
+        _save_database_unlocked(target, database)
+        for session_source in (
+            source.with_name("remembered_session.json"),
+            Path(storage.LEGACY_HOME) / "remembered_session.json",
+        ):
+            session_target = Path(target).with_name("remembered_session.json")
+            if session_source.is_file() and not session_target.exists():
+                try:
+                    with storage._path_lock(session_target):
+                        storage._atomic_write_bytes_unlocked(
+                            session_target, session_source.read_bytes(), mode=0o600
+                        )
+                except OSError:
+                    pass
+                break
         return database
-    return {"version": 2, "accounts": []}
+    return None
+
+
+def _load_database_unlocked(path):
+    path = Path(path)
+    backup = path.with_name(path.name + ".bak")
+    if not path.exists():
+        if backup.exists():
+            try:
+                database, _migrated = _read_database(backup)
+            except CredentialStoreError as error:
+                raise CredentialStoreError(
+                    f"Credential backup is malformed: {backup}"
+                ) from error
+            storage._atomic_write_json_unlocked(path, database, mode=0o600)
+            return database
+        migrated = _migrate_legacy_database_unlocked(path)
+        return migrated if migrated is not None else {"version": 2, "accounts": []}
+    try:
+        database, migrated = _read_database(path)
+    except CredentialStoreError as primary_error:
+        if not backup.exists():
+            raise CredentialStoreError(
+                f"Credential database is malformed and no valid backup is available: {path}"
+            ) from primary_error
+        try:
+            database, _migrated = _read_database(backup)
+        except CredentialStoreError as backup_error:
+            raise CredentialStoreError(
+                f"Credential database and backup are malformed: {path}"
+            ) from backup_error
+        storage._atomic_write_json_unlocked(path, database, mode=0o600)
+        return database
+    if migrated:
+        _save_database_unlocked(path, database, current=database)
+    return database
+
+
+def _load_database():
+    """Load or safely migrate the account database under an inter-process lock."""
+    path = credentials_path()
+    with storage._path_lock(path):
+        return _load_database_unlocked(path)
 
 
 def load_credentials(username=None):
     accounts = _load_database()["accounts"]
     selected = username or _active_username
     if selected:
-        return next((item for item in accounts if hmac.compare_digest(
-            item["username"].casefold(), str(selected).strip().casefold())), None)
+        key = _username_key(selected)
+        return next((item for item in accounts if _username_key(item["username"]) == key), None)
     return accounts[0] if len(accounts) == 1 else None
 
 
@@ -165,28 +342,70 @@ def is_admin(username=None):
     return get_role(username) == "admin"
 
 
+def _save_database_unlocked(path, data, current=None):
+    database, _migrated = _validate_database(data)
+    path = Path(path)
+    backup = Path(path).with_name(Path(path).name + ".bak")
+    previous = None
+    if path.exists():
+        try:
+            previous, _ = _read_database(path)
+        except CredentialStoreError:
+            previous = None
+    if previous is None and current is not None:
+        previous, _ = _validate_database(current)
+    if previous is not None:
+        storage._atomic_write_json_unlocked(backup, previous, mode=0o600)
+    elif not backup.exists():
+        storage._atomic_write_json_unlocked(backup, database, mode=0o600)
+    storage._atomic_write_json_unlocked(path, database, mode=0o600)
+    return database
+
+
 def _save_database(data):
     path = credentials_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    try:
-        os.chmod(temporary, 0o600)
-    except OSError:
-        pass
-    temporary.replace(path)
+    with storage._path_lock(path):
+        current = _load_database_unlocked(path)
+        _save_database_unlocked(path, data, current=current)
+
+
+def _find_account(database, username):
+    if username is None:
+        return None
+    key = _username_key(username)
+    return next((account for account in database["accounts"]
+                 if _username_key(account["username"]) == key), None)
 
 
 def _save_account(data):
-    database = _load_database()
-    key = data["username"].casefold()
-    for index, account in enumerate(database["accounts"]):
-        if account["username"].casefold() == key:
-            database["accounts"][index] = data
-            break
-    else:
-        database["accounts"].append(data)
-    _save_database(database)
+    path = credentials_path()
+    with storage._path_lock(path):
+        database = _load_database_unlocked(path)
+        key = _username_key(data["username"])
+        for index, account in enumerate(database["accounts"]):
+            if _username_key(account["username"]) == key:
+                database["accounts"][index] = data
+                break
+        else:
+            database["accounts"].append(data)
+        _save_database_unlocked(path, database, current=database)
+
+
+def _update_account(username, updater):
+    """Apply an account mutation while holding the database lock."""
+    path = credentials_path()
+    with storage._path_lock(path):
+        database = _load_database_unlocked(path)
+        account = _find_account(database, username)
+        if account is None:
+            raise CredentialStoreError("The account no longer exists.")
+        updated = updater(dict(account))
+        if not isinstance(updated, dict) or _username_key(updated.get("username", "")) != _username_key(
+                account["username"]):
+            raise CredentialStoreError("Account update attempted to change its identity.")
+        database["accounts"][database["accounts"].index(account)] = updated
+        _save_database_unlocked(path, database, current=database)
+        return updated
 
 
 def _write_account(username, password, preserve_passkeys=False, role="standard", profile_id=None):
@@ -197,7 +416,7 @@ def _write_account(username, password, preserve_passkeys=False, role="standard",
     previous = load_credentials(_active_username) if preserve_passkeys else None
     data = {
         "version": 1,
-        "username": username.strip(),
+        "username": _username_display(username),
         "algorithm": "pbkdf2-sha256",
         "iterations": PBKDF2_ITERATIONS,
         "salt": salt.hex(),
@@ -216,21 +435,41 @@ def create_account(username, password, role=None):
     error = validate_account(username, password)
     if error:
         raise ValueError(error)
-    accounts = list_accounts()
-    if any(item["username"].casefold() == username.strip().casefold() for item in accounts):
-        raise ValueError("That username already exists.")
-    if accounts and not is_admin():
-        raise PermissionError("Only an administrator can create another account.")
-    assigned_role = "admin" if not accounts else (role or "standard")
-    return _write_account(username, password, role=assigned_role)
+    username = _username_display(username)
+    path = credentials_path()
+    with storage._path_lock(path):
+        database = _load_database_unlocked(path)
+        if _find_account(database, username):
+            raise ValueError("That username already exists.")
+        if database["accounts"]:
+            active = _find_account(database, _active_username)
+            if not active or active["role"] != "admin":
+                raise PermissionError("Only an administrator can create another account.")
+        assigned_role = "admin" if not database["accounts"] else (role or "standard")
+        salt = secrets.token_bytes(32)
+        password_hash = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS
+        )
+        data = {
+            "version": 1, "username": username, "algorithm": "pbkdf2-sha256",
+            "iterations": PBKDF2_ITERATIONS, "salt": salt.hex(),
+            "password_hash": password_hash.hex(),
+            "role": "admin" if assigned_role == "admin" else "standard",
+            "profile_id": secrets.token_hex(12),
+        }
+        database["accounts"].append(data)
+        _save_database_unlocked(path, database, current=database)
+    return username
 
 
 def verify_credentials(username, password):
     credentials = load_credentials(username)
-    if not credentials or not hmac.compare_digest(
-        username.strip().casefold(), credentials["username"].casefold()
-    ):
+    if not credentials or _username_key(username) != _username_key(credentials["username"]):
         return False
+    return _password_matches(credentials, password)
+
+
+def _password_matches(credentials, password):
     try:
         actual = hashlib.pbkdf2_hmac(
             "sha256",
@@ -251,50 +490,61 @@ def change_account(current_password, new_username, new_password):
     if error:
         raise ValueError(error)
     old_username = username
-    if new_username.strip().casefold() != old_username.casefold() and any(
-            item["username"].casefold() == new_username.strip().casefold()
-            for item in list_accounts()):
-        raise ValueError("That username already exists.")
-    role = get_role(old_username) or "standard"
-    previous = load_credentials(old_username)
-    database = _load_database()
-    database["accounts"] = [item for item in database["accounts"]
-                            if item["username"].casefold() != old_username.casefold()]
-    _save_database(database)
-    result = _write_account(
-        new_username, new_password, role=role,
-        profile_id=previous.get("profile_id") if previous else None,
-    )
-    updated = load_credentials(result)
-    if previous and updated:
-        updated["passkeys"] = previous.get("passkeys", [])
-        updated["passkey_user_id"] = previous.get("passkey_user_id", secrets.token_hex(32))
-        _save_account(updated)
+    new_username = _username_display(new_username)
+    path = credentials_path()
+    with storage._path_lock(path):
+        database = _load_database_unlocked(path)
+        previous = _find_account(database, old_username)
+        if previous is None or not _password_matches(previous, current_password):
+            raise ValueError("Current password is incorrect.")
+        collision = _find_account(database, new_username)
+        if collision is not None and collision is not previous:
+            raise ValueError("That username already exists.")
+        salt = secrets.token_bytes(32)
+        updated = dict(previous)
+        updated.update({
+            "username": new_username,
+            "salt": salt.hex(),
+            "password_hash": hashlib.pbkdf2_hmac(
+                "sha256", new_password.encode("utf-8"), salt, PBKDF2_ITERATIONS
+            ).hex(),
+            "iterations": PBKDF2_ITERATIONS,
+            "algorithm": "pbkdf2-sha256",
+        })
+        database["accounts"][database["accounts"].index(previous)] = updated
+        _save_database_unlocked(path, database, current=database)
+    result = updated["username"]
     _set_authenticated_user(result)
     return result
 
 
 def _set_authenticated_user(username):
     global _active_username
-    _active_username = username
     account = load_credentials(username)
-    set_active_user(username, account.get("profile_id") if account else None)
+    if account is None:
+        raise CredentialStoreError("The authenticated account no longer exists.")
+    _active_username = account["username"]
+    set_active_user(account["username"], account.get("profile_id"))
 
 
 def delete_account(username):
     if not is_admin():
         raise PermissionError("Only an administrator can delete accounts.")
-    if username.casefold() == (_active_username or "").casefold():
+    if _username_key(username) == _username_key(_active_username or ""):
         raise ValueError("You cannot delete the account currently signed in.")
-    database = _load_database()
-    target = next((item for item in database["accounts"]
-                   if item["username"].casefold() == username.casefold()), None)
-    if not target:
-        raise ValueError("Account not found.")
-    if target["role"] == "admin" and sum(a["role"] == "admin" for a in database["accounts"]) <= 1:
-        raise ValueError("The last administrator cannot be deleted.")
-    database["accounts"].remove(target)
-    _save_database(database)
+    path = credentials_path()
+    with storage._path_lock(path):
+        database = _load_database_unlocked(path)
+        active = _find_account(database, _active_username)
+        if not active or active["role"] != "admin":
+            raise PermissionError("Only an administrator can delete accounts.")
+        target = _find_account(database, username)
+        if not target:
+            raise ValueError("Account not found.")
+        if target["role"] == "admin" and sum(a["role"] == "admin" for a in database["accounts"]) <= 1:
+            raise ValueError("The last administrator cannot be deleted.")
+        database["accounts"].remove(target)
+        _save_database_unlocked(path, database, current=database)
 
 
 def set_account_role(username, role):
@@ -302,16 +552,20 @@ def set_account_role(username, role):
         raise PermissionError("Only an administrator can change roles.")
     if role not in {"admin", "standard"}:
         raise ValueError("Invalid account role.")
-    database = _load_database()
-    target = next((item for item in database["accounts"]
-                   if item["username"].casefold() == username.casefold()), None)
-    if not target:
-        raise ValueError("Account not found.")
-    if target["role"] == "admin" and role == "standard" and sum(
-            a["role"] == "admin" for a in database["accounts"]) <= 1:
-        raise ValueError("At least one administrator is required.")
-    target["role"] = role
-    _save_database(database)
+    path = credentials_path()
+    with storage._path_lock(path):
+        database = _load_database_unlocked(path)
+        active = _find_account(database, _active_username)
+        if not active or active["role"] != "admin":
+            raise PermissionError("Only an administrator can change roles.")
+        target = _find_account(database, username)
+        if not target:
+            raise ValueError("Account not found.")
+        if target["role"] == "admin" and role == "standard" and sum(
+                a["role"] == "admin" for a in database["accounts"]) <= 1:
+            raise ValueError("At least one administrator is required.")
+        target["role"] = role
+        _save_database_unlocked(path, database, current=database)
 
 
 def has_passkey(username=None):
@@ -382,12 +636,18 @@ def register_passkey(parent):
     if credential is None:
         raise RuntimeError("Windows Hello did not return a usable credential.")
     encoded = base64.b64encode(bytes(credential)).decode("ascii")
-    passkeys = list(data.get("passkeys", []))
-    passkeys.append({"credential_data": encoded, "provider": "Windows Hello"})
-    data["passkeys"] = passkeys
-    data["passkey_user_id"] = user_id_hex
-    _save_account(data)
-    return len(passkeys)
+    def add_to_current(current):
+        current_user_id = current.get("passkey_user_id")
+        if current_user_id not in {None, user_id_hex}:
+            raise CredentialStoreError("Passkey state changed; please register again.")
+        passkeys = list(current.get("passkeys", []))
+        passkeys.append({"credential_data": encoded, "provider": "Windows Hello"})
+        current["passkeys"] = passkeys
+        current["passkey_user_id"] = user_id_hex
+        return current
+
+    updated = _update_account(data["username"], add_to_current)
+    return len(updated["passkeys"])
 
 
 def register_passkey_dialog(parent):
@@ -429,12 +689,15 @@ def authenticate_passkey(parent, username=None):
 
 def remove_passkeys(password):
     """Remove passkey public credentials from pyOS after password verification."""
-    data = load_credentials()
-    if not data or not verify_credentials(data["username"], password):
-        raise ValueError("Current password is incorrect.")
-    data.pop("passkeys", None)
-    data.pop("passkey_user_id", None)
-    _save_account(data)
+    path = credentials_path()
+    with storage._path_lock(path):
+        database = _load_database_unlocked(path)
+        data = _find_account(database, _active_username)
+        if not data or not _password_matches(data, password):
+            raise ValueError("Current password is incorrect.")
+        data.pop("passkeys", None)
+        data.pop("passkey_user_id", None)
+        _save_database_unlocked(path, database, current=database)
 
 
 def remove_passkeys_dialog(parent):
@@ -448,12 +711,31 @@ def remove_passkeys_dialog(parent):
     return True
 
 
+def _show_storage_recovery_error(parent, error):
+    """Explain fail-closed authentication storage errors to GUI users."""
+    messagebox.showerror(
+        "pyOS Storage Recovery Required",
+        "pyOS could not safely read its account or installation data and has "
+        "kept the desktop locked. Restore a known-good .bak file or repair the "
+        "reported file before trying again.\n\n"
+        f"Details: {error}",
+        parent=parent,
+    )
+
+
 class _AccountDialog:
     def __init__(self, parent, mode, cancellable=True):
         self.parent = parent
         self.mode = mode
         self.cancellable = cancellable
         self.result = None
+        # Read the store before creating a Toplevel.  If validation fails,
+        # authenticate() can report recovery guidance without leaking a blank,
+        # grabbed modal window.
+        accounts = list_accounts()
+        passkey_available = mode == "login" and any(
+            has_passkey(item["username"]) for item in accounts
+        )
         titles = {"create": "Create pyOS Account", "login": "pyOS Locked", "change": "Change pyOS Account"}
         self.window = tk.Toplevel(parent)
         self.window.title(titles[mode])
@@ -473,7 +755,6 @@ class _AccountDialog:
             row=0, column=0, columnspan=2, pady=(0, 14)
         )
 
-        accounts = list_accounts()
         self.username = tk.StringVar(value=get_username() or (
             accounts[0]["username"] if accounts else ""
         ))
@@ -535,7 +816,7 @@ class _AccountDialog:
             ttk.Button(buttons, text="Cancel", command=self.cancel).pack(side=tk.RIGHT, padx=(6, 0))
         action = {"create": "Create Account", "login": "Unlock", "change": "Save Account"}[mode]
         ttk.Button(buttons, text=action, command=self.submit).pack(side=tk.RIGHT)
-        if mode == "login" and any(has_passkey(item["username"]) for item in accounts):
+        if passkey_available:
             ttk.Button(buttons, text="Use Passkey", command=self.submit_passkey).pack(
                 side=tk.LEFT, padx=(0, 12)
             )
@@ -569,6 +850,11 @@ class _AccountDialog:
                 self.result = change_account(
                     self.password.get(), self.username.get(), self.new_password.get()
                 )
+        except (CredentialStoreError, storage.ConfigurationError) as error:
+            self.result = None
+            _show_storage_recovery_error(self.window, error)
+            self.window.destroy()
+            return "break"
         except (OSError, ValueError) as error:
             self.error.set(str(error))
             self.password.set("")
@@ -586,6 +872,11 @@ class _AccountDialog:
             self.result = authenticate_passkey(self.window, self.username.get())
             _set_authenticated_user(self.result)
             create_remembered_session() if self.remember_me.get() else clear_remembered_session()
+        except (CredentialStoreError, storage.ConfigurationError) as error:
+            self.result = None
+            _show_storage_recovery_error(self.window, error)
+            self.window.destroy()
+            return
         except Exception as error:
             self.result = None
             self.error.set(f"Passkey failed: {error}")
@@ -606,20 +897,28 @@ class _AccountDialog:
 
 def authenticate(parent, cancellable=True, allow_remembered=True):
     """Create an account when needed, otherwise request credentials."""
-    if allow_remembered:
-        remembered = remembered_username()
-        if remembered:
-            _set_authenticated_user(remembered)
-            return remembered
-    mode = "login" if has_account() else "create"
-    return _AccountDialog(parent, mode, cancellable).run()
+    try:
+        if allow_remembered:
+            remembered = remembered_username()
+            if remembered:
+                _set_authenticated_user(remembered)
+                return remembered
+        mode = "login" if has_account() else "create"
+        return _AccountDialog(parent, mode, cancellable).run()
+    except (CredentialStoreError, storage.ConfigurationError) as error:
+        _show_storage_recovery_error(parent, error)
+        return None
 
 
 def change_credentials_dialog(parent):
     """Require the current password, then replace username and password."""
-    if not has_account():
-        return _AccountDialog(parent, "create", True).run()
-    return _AccountDialog(parent, "change", True).run()
+    try:
+        if not has_account():
+            return _AccountDialog(parent, "create", True).run()
+        return _AccountDialog(parent, "change", True).run()
+    except (CredentialStoreError, storage.ConfigurationError) as error:
+        _show_storage_recovery_error(parent, error)
+        return None
 
 
 def manage_accounts_dialog(parent):
@@ -643,7 +942,7 @@ def manage_accounts_dialog(parent):
         accounts_box.delete(0, tk.END)
         for index, account in enumerate(list_accounts()):
             accounts_box.insert(tk.END, f"{account['username']}  —  {account['role'].title()}")
-            if select_name and account["username"].casefold() == select_name.casefold():
+            if select_name and _username_key(account["username"]) == _username_key(select_name):
                 accounts_box.selection_set(index)
 
     def selected():

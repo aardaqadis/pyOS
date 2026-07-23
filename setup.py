@@ -22,7 +22,10 @@ from pyos_config import (
 )
 
 
-SOURCE_DIR = Path(__file__).resolve().parent
+SOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+FROZEN_SETUP = bool(getattr(sys, "frozen", False))
+PACKAGED_RUNTIME_DIR = SOURCE_DIR / "runtime"
+PACKAGED_RUNTIME_FILES = ("pyOS.exe", "pyOS-cli.exe")
 APPLICATION_FILES = (
     "pyOSgui.py", "pyOScli.py", "pyos_config.py", "pyos_auth.py", "pyos_updater.py",
     "setup.py", "README.md", "pyos2.0.png"
@@ -61,7 +64,7 @@ INSTALL_MANIFEST = "install_manifest.json"
 MANIFEST_METADATA_PATHS = {OWNERSHIP_MARKER, INSTALL_MANIFEST}
 OWNED_FILE = "file"
 OWNED_TREE = "tree"
-RECURSIVE_OWNED_PATHS = {".venv"}
+RECURSIVE_OWNED_PATHS = {".venv", "sounds"}
 WINDOWS_RESERVED_NAMES = {
     "con", "prn", "aux", "nul", *(f"com{number}" for number in range(1, 10)),
     *(f"lpt{number}" for number in range(1, 10)),
@@ -420,6 +423,15 @@ class InstallerCore:
         missing = [name for name in APPLICATION_FILES[:5] if not (SOURCE_DIR / name).is_file()]
         if missing:
             raise FileNotFoundError(f"Setup source files are missing: {', '.join(missing)}")
+        if FROZEN_SETUP:
+            missing_runtime = [
+                name for name in PACKAGED_RUNTIME_FILES
+                if not (PACKAGED_RUNTIME_DIR / name).is_file()
+            ]
+            if missing_runtime:
+                raise FileNotFoundError(
+                    "Setup runtime files are missing: " + ", ".join(missing_runtime)
+                )
         _validate_managed_root(self.install_dir, "installation")
         _validate_managed_root(self.data_dir, "data")
         for path in (self.install_dir, self.data_dir, self.downloads_dir):
@@ -488,11 +500,14 @@ class InstallerCore:
         planned_files = {
             name for name in APPLICATION_FILES if (SOURCE_DIR / name).exists()
         } | {"pyOS GUI.cmd", "pyOS CLI.cmd"}
+        if FROZEN_SETUP:
+            planned_files.update(PACKAGED_RUNTIME_FILES)
         for relative in sorted(planned_files):
             self._assert_install_destination(relative, OWNED_FILE)
         for relative in APPLICATION_TREES:
             self._assert_install_destination(relative, OWNED_TREE)
-        self._assert_install_destination(".venv", OWNED_TREE)
+        if not FROZEN_SETUP:
+            self._assert_install_destination(".venv", OWNED_TREE)
 
         if self.create_shortcuts and os.name == "nt":
             desktop = Path(os.environ.get("USERPROFILE", Path.home())) / "Desktop"
@@ -686,6 +701,17 @@ class InstallerCore:
                 shutil.copytree(source, destination, dirs_exist_ok=True)
 
     def create_environment(self):
+        if FROZEN_SETUP:
+            self.log("Installing bundled pyOS runtime")
+            self._claim_owned(*PACKAGED_RUNTIME_FILES)
+            for name in PACKAGED_RUNTIME_FILES:
+                source = PACKAGED_RUNTIME_DIR / name
+                destination = self.install_dir / name
+                self.log(f"  {name}")
+                if not self.dry_run:
+                    self._assert_install_destination(name, OWNED_FILE)
+                    shutil.copy2(source, destination)
+            return
         self.log(f"Creating isolated Python environment: {self.venv_dir}")
         self._claim_owned_tree(".venv")
         if not self.dry_run:
@@ -816,8 +842,12 @@ class InstallerCore:
         gui_launcher = self.install_dir / "pyOS GUI.cmd"
         cli_launcher = self.install_dir / "pyOS CLI.cmd"
         self._claim_owned(gui_launcher.name, cli_launcher.name)
-        gui_command = f'@echo off\r\n"{self.python_executable}" "{self.install_dir / "pyOSgui.py"}"\r\n'
-        cli_command = f'@echo off\r\n"{self.python_executable}" "{self.install_dir / "pyOScli.py"}"\r\n'
+        if FROZEN_SETUP:
+            gui_command = f'@echo off\r\n"{self.install_dir / "pyOS.exe"}"\r\n'
+            cli_command = f'@echo off\r\n"{self.install_dir / "pyOS-cli.exe"}"\r\n'
+        else:
+            gui_command = f'@echo off\r\n"{self.python_executable}" "{self.install_dir / "pyOSgui.py"}"\r\n'
+            cli_command = f'@echo off\r\n"{self.python_executable}" "{self.install_dir / "pyOScli.py"}"\r\n'
         if not self.dry_run:
             self._assert_install_destination(gui_launcher.name, OWNED_FILE)
             self._assert_install_destination(cli_launcher.name, OWNED_FILE)

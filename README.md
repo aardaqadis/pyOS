@@ -45,63 +45,18 @@ GitHub Actions runs these unit checks on Windows, macOS, and Ubuntu. The audio t
 Pytest discovers the maintained suite under `tests/`. Generated caches, local environments, and build outputs are
 excluded from both test and lint discovery.
 
-### Standalone Windows Executable and Disk Usage
+### Single-file Windows setup
 
-pyOS can also be packaged as a single Windows executable. The executable contains the Python runtime and the
-GUI dependencies, so a recipient does not need the project virtual environment or build directory.
-
-Build a factory-isolated release from the project root with:
-
-```powershell
-.\exe_tools\Build-pyOSExe.ps1
-```
-
-Build dependencies are fixed in `requirements-build.lock`. The build script prefers the project `.venv`, falls
-back to the active `python` command, and also accepts an explicit interpreter:
+Build the distributable installer from the project root:
 
 ```powershell
 python -m pip install -r requirements-build.lock
-$Python = (Get-Command python -CommandType Application | Select-Object -First 1).Source
-.\exe_tools\Build-pyOSExe.ps1 -PythonPath $Python
+.\build_pyos.ps1
 ```
 
-The result is written to `dist\pyOS.exe`. Release builds use their own
-`%LOCALAPPDATA%\pyOS-Release-2.0-Factory` profile, so developer accounts and preferences are not loaded or
-packaged. Building does not delete or replace the Python source files. PyInstaller intermediates are reproducible
-and excluded from Git.
+The public build command compiles the GUI and CLI runtimes, embeds them together with all required pyOS source and resource files, and writes only `dist\pyOS-Setup.exe` plus its SHA-256 manifest. End users can run the setup executable without installing Python; source-mode `python setup.py` remains available for development and other supported platforms.
 
-Verify the executable's PE structure, SHA-256 hash, version resources, signature state, and packaged-file privacy:
-
-```powershell
-.\exe_tools\Test-pyOSExe.ps1
-```
-
-To rebuild with a different icon or Windows version metadata:
-
-```powershell
-.\exe_tools\Set-pyOSExeResources.ps1 `
-  -IconPath pyos2.0.png `
-  -Version 2.0.0.0 `
-  -ProductVersion 2.0
-```
-
-`Reset-pyOSFactory.ps1`, `Start-pyOSExe.ps1`, and `Clear-pyOSBuild.ps1` provide confirmed factory reset,
-launch, and cleanup operations. Reset and cleanup support `-WhatIf`; destructive actions request confirmation.
-
-Approximate sizes for the current Windows build are:
-
-| Item | Size | Needed by an end user? |
-| --- | ---: | --- |
-| `dist\pyOS.exe` | 58.27 MiB | Yes, for standalone distribution |
-| Core source and resource files | 714 KB | No, unless developing or rebuilding |
-| `.venv` development environment | 88.07 MB | No |
-| `build` intermediate files | 53.70 MB | No |
-| Complete development project | 188.07 MB | No |
-
-These figures are a snapshot and will change as applications and dependencies are added. For ordinary Windows
-distribution, only `dist\pyOS.exe` is required. Keep the source tree when developing, rebuilding, or installing
-source-based updates.
-
+The build prefers `.venv`, falls back to `python`, and accepts `-PythonPath` for an explicit interpreter. PyInstaller intermediates remain under `build\` and are excluded from Git.
 pyOS checks GitHub for Stable releases or Unstable commits only after the user chooses an update channel, and
 always asks before downloading and installing. Updates must resolve to an immutable full commit ID and publish
 trusted SHA-256 metadata. Source updates are staged under a cross-process lock and rolled back if any overlay

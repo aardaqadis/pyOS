@@ -19,3 +19,4 @@ dist/
 *.log
 *.tmp
 *.bak
+*.sha256

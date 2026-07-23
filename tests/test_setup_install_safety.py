@@ -16,6 +16,25 @@ class SetupInstallSafetyTests(unittest.TestCase):
                     if package.casefold().startswith("paramiko")]
         self.assertEqual(paramiko, ["paramiko>=5.0,<6.0"])
 
+    def test_frozen_setup_uses_bundled_runtimes_without_a_venv(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            for name in setup.PACKAGED_RUNTIME_FILES:
+                (runtime / name).write_bytes(b"MZ")
+            installer = setup.InstallerCore(
+                root / "install", root / "data", root / "downloads",
+                install_vlc=False, install_ollama=False, create_shortcuts=False,
+                dry_run=True, logger=lambda _message: None,
+            )
+            with mock.patch.object(setup, "FROZEN_SETUP", True), mock.patch.object(
+                setup, "PACKAGED_RUNTIME_DIR", runtime
+            ):
+                installer.validate()
+                installer.create_environment()
+                self.assertTrue(set(setup.PACKAGED_RUNTIME_FILES).issubset(installer._owned_paths))
+                self.assertNotIn(".venv", installer._owned_paths)
     def test_explicit_empty_optional_app_selection_stays_empty(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

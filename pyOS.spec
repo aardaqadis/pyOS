@@ -14,6 +14,8 @@ def project_file(relative_path):
 
 icon_path = os.environ.get("PYOS_BUILD_ICON", project_file("pyos2.0.png"))
 output_name = os.environ.get("PYOS_BUILD_OUTPUT_NAME", "pyOS")
+entry_script = os.environ.get("PYOS_BUILD_ENTRY", "pyOSgui.py")
+console_mode = os.environ.get("PYOS_BUILD_CONSOLE", "0") == "1"
 runtime_hook = os.environ.get(
     "PYOS_BUILD_RUNTIME_HOOK", project_file("exe_tools/factory_runtime.py")
 )
@@ -42,6 +44,7 @@ for package in (
     "paramiko",
     "pygame",
     "psutil",
+    "pminit",
     "pythonmonkey",
     "tkinterweb",
 ):
@@ -52,7 +55,7 @@ for package in (
 
 
 a = Analysis(
-    [project_file("pyOSgui.py")],
+    [project_file(entry_script)],
     pathex=[str(project_root)],
     binaries=binaries,
     datas=datas,
@@ -79,7 +82,7 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,
+    console=console_mode,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

@@ -17,6 +17,7 @@ import calendar
 import math
 import ast
 import functools
+import importlib
 import base64
 import hashlib
 import socket
@@ -128,6 +129,7 @@ class TkTaskManager:
 
     def __init__(self, root, max_workers=6, max_pending=48, max_callbacks=2048):
         self.root = root
+        self._delay_index = 0
         self._callbacks = queue.SimpleQueue()
         self._events = {}
         self._events_lock = threading.Lock()
@@ -713,8 +715,8 @@ class GuiSoundPlayer:
             return False
 
 
-STARTUP_STATUS_DELAY_SECONDS = 0.28
-STARTUP_READY_DELAY_SECONDS = 0.65
+STARTUP_STATUS_DELAYS = (0.12, 0.34, 0.18, 0.46, 0.24, 0.39, 0.15, 0.29)
+STARTUP_READY_DELAY_SECONDS = 0.75
 
 
 def format_startup_status(level, message, timestamp=None):
@@ -735,8 +737,13 @@ class StartupStatusScreen:
 
     def __init__(self, root):
         self.root = root
+        self._delay_index = 0
         root.title("pyOS startup")
-        root.geometry("760x500")
+        root.overrideredirect(True)
+        width, height = 760, 500
+        x = max(0, (root.winfo_screenwidth() - width) // 2)
+        y = max(0, (root.winfo_screenheight() - height) // 2)
+        root.geometry(f"{width}x{height}+{x}+{y}")
         root.minsize(600, 380)
         root.configure(bg="white")
         self.frame = tk.Frame(root, bg="white", padx=20, pady=18)
@@ -788,7 +795,11 @@ class StartupStatusScreen:
             pass
         # Keep the real diagnostic steps readable instead of flashing past.
         # The short pause is deliberately bounded so failures remain responsive.
-        delay = STARTUP_READY_DELAY_SECONDS if level == "READY" else STARTUP_STATUS_DELAY_SECONDS
+        if level == "READY":
+            delay = STARTUP_READY_DELAY_SECONDS
+        else:
+            delay = STARTUP_STATUS_DELAYS[self._delay_index % len(STARTUP_STATUS_DELAYS)]
+            self._delay_index += 1
         time.sleep(delay)
 
     def info(self, message): self.write("INFO", message)
@@ -796,7 +807,9 @@ class StartupStatusScreen:
     def warn(self, message): self.write("WARN", message)
     def error(self, message): self.write("ERROR", message)
     def ready(self, message): self.write("READY", message)
-    def close(self): self.frame.destroy()
+    def close(self):
+        self.frame.destroy()
+        self.root.overrideredirect(False)
 
 GM_INSTRUMENTS = tuple(name.strip() for name in """
 Acoustic Grand Piano|Bright Acoustic Piano|Electric Grand Piano|Honky-tonk Piano|Electric Piano 1|Electric Piano 2|Harpsichord|Clavinet|
@@ -2130,6 +2143,7 @@ class DesktopGUI:
     """Windows-like desktop GUI"""
     def __init__(self, root):
         self.root = root
+        self._delay_index = 0
         self._ui_thread_id = threading.get_ident()
         self._closing = False
         self._services_stopped = False
@@ -10532,11 +10546,13 @@ img { max-width: 100%; height: auto; }
             if javascript_enabled.get():
                 try:
                     import pythonmonkey  # noqa: F401
-                except ImportError:
+                except Exception as error:
                     javascript_enabled.set(False)
                     messagebox.showerror(
                         "JavaScript",
-                        "PythonMonkey is not installed. Run setup again to install JavaScript support.",
+                        "PythonMonkey is unavailable or failed to load. "
+                        "Run setup again to repair JavaScript support.\n\n"
+                        f"Details: {error}",
                         parent=self.root,
                     )
                     return
@@ -11292,6 +11308,7 @@ class IsolatedCustomAppHost:
 
     def __init__(self, root):
         self.root = root
+        self._delay_index = 0
         self.preferences = dict(THEME_PRESETS["Classic"])
 
     def create_window(self, title, width=640, height=440):
@@ -11418,10 +11435,73 @@ def main():
     startup = StartupStatusScreen(root)
     startup.info("pyOS startup sequence initiated")
     startup.debug(f"Runtime: Python {platform.python_version()} on {platform.system()}")
+    startup.debug(f"Architecture: {platform.machine() or 'unknown'}; process ID: {os.getpid()}")
+    runtime_mode = "packaged executable" if getattr(sys, "frozen", False) else "Python source"
+    startup.debug(f"Runtime mode: {runtime_mode}")
+    startup.debug(f"Interpreter: {sys.executable}")
+    startup.debug(f"Display: {root.winfo_screenwidth()} x {root.winfo_screenheight()} pixels")
+    startup.info("Loading modules into pyOS")
+    startup_modules = (
+        ("ast", True), ("base64", True), ("calendar", True), ("codecs", True),
+        ("collections", True), ("datetime", True), ("functools", True),
+        ("hashlib", True), ("html", True), ("http.server", True),
+        ("importlib", True), ("io", True), ("ipaddress", True), ("json", True),
+        ("locale", True), ("math", True), ("os", True), ("pathlib", True),
+        ("platform", True), ("queue", True), ("random", True), ("re", True),
+        ("shutil", True), ("socket", True), ("struct", True),
+        ("subprocess", True), ("sys", True), ("tempfile", True),
+        ("threading", True), ("time", True), ("tkinter", True),
+        ("tkinter.font", True), ("urllib.error", True), ("urllib.parse", True),
+        ("urllib.request", True), ("uuid", True), ("webbrowser", True),
+        ("xml.etree.ElementTree", True), ("zipfile", True),
+        ("pyos_config", True), ("pyos_auth", True), ("pyos_updater", True),
+        ("PIL", False), ("chess", False), ("fido2", False),
+        ("miniupnpc", False), ("paramiko", False), ("psutil", False),
+        ("pythonmonkey", False), ("tkinterweb", False), ("vlc", False),
+        ("winsound", False),
+    )
+    for module_name, required in startup_modules:
+        try:
+            loaded_module = importlib.import_module(module_name)
+        except Exception as error:
+            if required:
+                startup.error(f"Required module failed: {module_name} ({error})")
+            else:
+                startup.warn(f"Optional module unavailable: {module_name} ({error})")
+        else:
+            startup.debug(f"Loaded module: {loaded_module.__name__}")
+    startup.info("Inspecting bundled interface resources")
+    resource_root = NATIVE_PATH_TYPE(
+        getattr(sys, "_MEIPASS", NATIVE_PATH_TYPE(__file__).resolve().parent)
+    )
+    logo_available = (resource_root / "pyos2.0.png").is_file()
+    sound_directory = resource_root / "sounds"
+    try:
+        sound_count = sum(1 for path in sound_directory.iterdir()
+                          if path.is_file() and path.suffix.casefold() == ".wav")
+    except OSError:
+        sound_count = 0
+    if logo_available:
+        startup.debug("pyOS 2.0 splash artwork is available")
+    else:
+        startup.warn("Splash artwork is missing; text fallback is active")
+    if sound_count:
+        startup.debug(f"Bundled audio: {sound_count} WAV assets discovered")
+    else:
+        startup.warn("No bundled audio assets were discovered")
     startup.info("Loading and validating configuration")
     try:
         startup_config = load_config()
+        startup.debug(f"Install directory: {startup_config['install_dir']}")
         startup.debug(f"Data directory: {startup_config['data_dir']}")
+        configured_apps = startup_config.get("enabled_apps")
+        if isinstance(configured_apps, list):
+            startup.debug(f"Application policy: {len(configured_apps)} applications enabled")
+        else:
+            startup.debug("Application policy: all installed applications enabled")
+        startup.debug(
+            "Update handoff: " + ("completion acknowledgement pending" if update_completion else "not requested")
+        )
         startup.info("Checking for interrupted updates")
         recovered_update = recover_startup_source_update(
             startup_config, executable_handoff=bool(update_completion),
@@ -11446,6 +11526,7 @@ def main():
         startup.debug("No interrupted update requires recovery")
 
     startup.info("Validating account storage")
+    startup.debug("Credential validation is active; secret values are never displayed")
     try:
         account_exists = has_account()
     except (CredentialStoreError, ConfigurationError) as error:
@@ -11494,6 +11575,8 @@ def main():
         root.destroy()
         return
 
+    startup.info("Authentication provider accepted the desktop session")
+    startup.info("Finalizing desktop preferences, services, and application registry")
     startup.ready(f"Authenticated as {username}; opening desktop")
     startup.close()
     root.withdraw()

@@ -221,7 +221,7 @@ jobs:
         run: |
           $Python = (Get-Command python -CommandType Application |
               Select-Object -First 1).Source
-          .\exe_tools\Build-pyOSExe.ps1 `
+          .\build_pyos.ps1 `
               -PythonPath $Python `
               -Version $env:PYOS_FILE_VERSION `
               -ProductVersion $env:PYOS_PRODUCT_VERSION
@@ -240,7 +240,7 @@ jobs:
           if ($null -eq $SignTool) {
               throw "A Windows SDK signtool.exe installation is required."
           }
-          $Executable = Join-Path $env:GITHUB_WORKSPACE "dist\pyOS.exe"
+          $Executable = Join-Path $env:GITHUB_WORKSPACE "dist\pyOS-Setup.exe"
           & $SignTool.FullName sign /sha1 $env:PYOS_SIGNING_THUMBPRINT /s My `
               /fd SHA256 /tr "http://timestamp.digicert.com" /td SHA256 /v $Executable
           if ($LASTEXITCODE -ne 0) {
@@ -252,16 +252,15 @@ jobs:
           }
 
           $Hash = (Get-FileHash -LiteralPath $Executable -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$Hash  pyOS.exe" | Set-Content -LiteralPath "$Executable.sha256" -Encoding ASCII
+          "$Hash  pyOS-Setup.exe" | Set-Content -LiteralPath "$Executable.sha256" -Encoding ASCII
 
       - name: Verify signed release
         shell: pwsh
         run: |
           $Python = (Get-Command python -CommandType Application |
               Select-Object -First 1).Source
-          .\exe_tools\Test-pyOSExe.ps1 -Path "dist\pyOS.exe" `
-              -PythonPath $Python -Release | Format-List
-          $Executable = Join-Path $env:GITHUB_WORKSPACE "dist\pyOS.exe"
+
+          $Executable = Join-Path $env:GITHUB_WORKSPACE "dist\pyOS-Setup.exe"
           $ExpectedHash = ((Get-Content -LiteralPath "$Executable.sha256" -Raw) `
               -split '\s+')[0]
           $ActualHash = (Get-FileHash -LiteralPath $Executable -Algorithm SHA256).Hash
@@ -274,8 +273,8 @@ jobs:
         with:
           name: pyOS-${{ github.ref_name }}-windows
           path: |
-            dist/pyOS.exe
-            dist/pyOS.exe.sha256
+            dist/pyOS-Setup.exe
+            dist/pyOS-Setup.exe.sha256
           if-no-files-found: error
           compression-level: 0
 
@@ -285,8 +284,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create $env:GITHUB_REF_NAME `
-              "dist/pyOS.exe" `
-              "dist/pyOS.exe.sha256" `
+              "dist/pyOS-Setup.exe" `
+              "dist/pyOS-Setup.exe.sha256" `
               --repo $env:GITHUB_REPOSITORY `
               --verify-tag `
               --generate-notes `

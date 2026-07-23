@@ -18,6 +18,7 @@ datas = [
     (str(project_root / "LICENSE.md"), "."),
     (str(project_root / "pyos2.0.png"), "."),
     (str(project_root / "sounds"), "sounds"),
+    (str(project_root / "docs"), "docs"),
     (str(project_root / "dist" / "pyOS.exe"), "runtime"),
     (str(project_root / "dist" / "pyOS-cli.exe"), "runtime"),
 ]

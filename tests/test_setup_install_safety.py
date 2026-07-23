@@ -9,8 +9,9 @@ from pyos_config import verify_storage_owner
 
 
 class SetupInstallSafetyTests(unittest.TestCase):
-    def test_bundled_sound_directory_is_an_owned_install_tree(self):
+    def test_bundled_resource_directories_are_owned_install_trees(self):
         self.assertIn("sounds", setup.APPLICATION_TREES)
+        self.assertIn("docs", setup.APPLICATION_TREES)
     def test_setup_requires_a_paramiko_release_after_the_vulnerable_line(self):
         paramiko = [package for package in setup.PYTHON_PACKAGES
                     if package.casefold().startswith("paramiko")]

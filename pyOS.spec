@@ -33,6 +33,7 @@ datas = [
     (project_file("README.md"), "."),
     (project_file("LICENSE.md"), "."),
     (project_file("sounds"), "sounds"),
+    (project_file("docs"), "docs"),
     (icon_path, "."),
 ]
 binaries = []

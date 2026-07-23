@@ -30,7 +30,7 @@ APPLICATION_FILES = (
     "pyOSgui.py", "pyOScli.py", "pyos_config.py", "pyos_auth.py", "pyos_updater.py",
     "setup.py", "README.md", "pyos2.0.png"
 )
-APPLICATION_TREES = ("sounds",)
+APPLICATION_TREES = ("sounds", "docs")
 PYTHON_PACKAGES = (
     "chess>=1.11,<2.0",
     "fido2>=2.2,<3.0",
@@ -64,7 +64,7 @@ INSTALL_MANIFEST = "install_manifest.json"
 MANIFEST_METADATA_PATHS = {OWNERSHIP_MARKER, INSTALL_MANIFEST}
 OWNED_FILE = "file"
 OWNED_TREE = "tree"
-RECURSIVE_OWNED_PATHS = {".venv", "sounds"}
+RECURSIVE_OWNED_PATHS = {".venv", "sounds", "docs"}
 WINDOWS_RESERVED_NAMES = {
     "con", "prn", "aux", "nul", *(f"com{number}" for number in range(1, 10)),
     *(f"lpt{number}" for number in range(1, 10)),

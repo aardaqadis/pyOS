@@ -4,6 +4,8 @@ pyOS is a Python desktop environment containing a graphical desktop, authenticat
 
 <img width="685" height="387" alt="pyOS" src="https://github.com/user-attachments/assets/16bfe9df-7f53-4034-93d6-840e2414adef" />
 
+See the [complete pyOS documentation](docs/README.md) for architecture, installation, building, development, security, updates, and release operations.
+
 ## Install
 
 To get started, either download the source code from the releases page for the latest safe build, or the source code of the latest commit.

@@ -89,7 +89,10 @@ def _path_lock(path, timeout=15.0):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     thread_lock = _thread_lock_for(lock_path)
     with thread_lock:
-        handle = open(lock_path, "a+b")
+        # Keep the Windows lock byte unbuffered. Otherwise one process can lock
+        # byte zero after another process buffers the initialization byte but
+        # before that contender flushes it, causing WinError 32/PermissionError.
+        handle = open(lock_path, "a+b", buffering=0)
         acquired = False
         started = time.monotonic()
         try:
@@ -98,8 +101,9 @@ def _path_lock(path, timeout=15.0):
 
                 handle.seek(0, os.SEEK_END)
                 if handle.tell() == 0:
+                    # Append mode makes concurrent initializers write at the
+                    # current EOF; the unbuffered write completes before lock.
                     handle.write(b"\0")
-                    handle.flush()
                 while not acquired:
                     try:
                         handle.seek(0)
